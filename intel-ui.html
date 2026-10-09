@@ -57,6 +57,13 @@
   .gate { display: inline-block; font-size: 11px; border-radius: 4px; padding: 1px 6px; margin-left: 6px; vertical-align: middle; }
   .gate.served { color: var(--ok); border: 1px solid #2b4a35; }
   .gate.withheld { color: var(--err); border: 1px solid #6b2b2b; background: rgba(248,81,73,.08); }
+  .rev { display: inline-block; font-size: 11px; border-radius: 4px; padding: 1px 6px; vertical-align: middle; }
+  .rev.active { color: var(--ok); border: 1px solid #2b4a35; }
+  .rev.revoked { color: var(--err); border: 1px solid #6b2b2b; background: rgba(248,81,73,.08); }
+  .revbtn { margin-left: 8px; font-size: 11px; padding: 1px 8px; border-radius: 4px; cursor: pointer;
+            background: transparent; color: var(--muted); border: 1px solid var(--border); }
+  .revbtn:hover { color: var(--warn); border-color: var(--warn); }
+  .revbtn:disabled { opacity: .5; cursor: default; }
   .reason { color: var(--muted); font-size: 12px; }
   .mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13px; }
   .msg { padding: 10px 12px; border-radius: 6px; font-size: 14px; margin-top: 12px; display: none; white-space: pre-wrap; }
@@ -124,7 +131,7 @@
         <thead>
           <tr>
             <th style="width:32px"><input type="checkbox" id="chkAll" title="Select all" checked></th>
-            <th>Type</th><th>Value</th><th>Labels</th><th>Confidence</th><th>ID</th><th></th>
+            <th>Type</th><th>Value</th><th>Labels</th><th>Confidence</th><th>Status</th><th>ID</th><th></th>
           </tr>
         </thead>
         <tbody id="tbody"></tbody>
@@ -176,6 +183,25 @@
         (community intel from pullers is never wiped by a save). This is how the server's feed model works.</div>
       <div id="msg" class="msg"></div>
     </div>
+
+    <!-- CSV import (GT team ad-hoc intel) -->
+    <div class="panel">
+      <h2>Import CSV (GT team)</h2>
+      <div class="hint" style="margin:0 0 10px">
+        Upload a CSV with <b>any</b> headers — fuzzy-mapped automatically:
+        <span class="mono">IP_Address / src_ip / Destination → IPv4</span>,
+        <span class="mono">domain / hostname / fqdn → domain</span>,
+        <span class="mono">md5 / sha1 / sha256 / sha512 → file hash</span>,
+        plus optional <span class="mono">label(s)</span> and
+        <span class="mono">confidence</span> columns. Imports <b>append</b>
+        to the manual feed (does not wipe existing rows).
+      </div>
+      <div class="row">
+        <input type="file" id="csvFile" accept=".csv,text/csv,text/plain" style="max-width:320px">
+        <button id="btnCsvImport" class="ghost" disabled>Import CSV</button>
+      </div>
+      <div id="csvMsg" class="msg" style="margin-top:10px"></div>
+    </div>
   </div>
 
 <script>
@@ -200,6 +226,15 @@ async function api(path, opts = {}) {
   });
   let body = null;
   try { body = await res.json(); } catch (e) { /* xml responses have no json */ }
+  return { status: res.status, body };
+}
+
+// Same-origin authenticated request that does NOT force a JSON content-type
+// (used by the CSV upload — the browser sets multipart boundaries for us).
+async function apiRaw(path, opts = {}) {
+  const res = await fetch(base() + path, { ...opts, credentials: "include" });
+  let body = null;
+  try { body = await res.json(); } catch (e) { /* non-json response */ }
   return { status: res.status, body };
 }
 
@@ -354,6 +389,24 @@ function rowElement(o) {
   conf.style.width = "80px";
   cConf.appendChild(conf);
 
+  const cStatus = document.createElement("td");
+  cStatus.className = "status";
+  if (o.kind === "existing") {
+    const st = document.createElement("span");
+    st.className = o.revoked ? "rev revoked" : "rev active";
+    st.textContent = o.revoked ? "revoked" : "active";
+    if (o.revoked_at) st.title = "Revoked: " + o.revoked_at;
+    else if (o.last_seen) st.title = "Last seen: " + o.last_seen;
+    const btn = document.createElement("button");
+    btn.className = "revbtn";
+    btn.textContent = o.revoked ? "Unrevoke" : "Revoke";
+    btn.title = o.revoked
+      ? "Reinstate (served to Vision One again)"
+      : "Mark as false-positive / clean (served as revoked: true)";
+    btn.addEventListener("click", () => toggleRevoke(tr, o.id, !o.revoked, st, btn));
+    cStatus.append(st, " ", btn);
+  }
+
   const cId = document.createElement("td");
   cId.className = "mono"; cId.textContent = o.id || autoId(sel.value, inp.value || "");
   tr.dataset.id = o.id || cId.textContent;
@@ -365,12 +418,42 @@ function rowElement(o) {
   del.addEventListener("click", () => { tr.remove(); refreshCount(); });
   cDel.appendChild(del);
 
-  tr.append(cChk, cType, cVal, cLbl, cConf, cId, cDel);
+  tr.append(cChk, cType, cVal, cLbl, cConf, cStatus, cId, cDel);
   refreshCount();
   return tr;
 }
 
-function syncIdCell(tr) { tr.children[5].textContent = tr.dataset.id; }
+async function toggleRevoke(tr, id, toRevoked, badge, btn) {
+  if (!id) return;
+  btn.disabled = true;
+  try {
+    const r = await api(`/objects/${encodeURIComponent(id)}/revoke`, {
+      method: "POST",
+      body: JSON.stringify({ action: toRevoked ? "revoke" : "unrevoke" }),
+    });
+    if (r.status === 200) {
+      const now = new Date().toISOString().replace("T", " ").slice(0, 19) + "Z";
+      if (toRevoked) {
+        badge.className = "rev revoked"; badge.textContent = "revoked";
+        badge.title = "Revoked: " + now; btn.textContent = "Unrevoke";
+        showMsg(`Revoked ${id} — Vision One will drop it (served as revoked: true).`, true);
+      } else {
+        badge.className = "rev active"; badge.textContent = "active";
+        badge.title = ""; btn.textContent = "Revoke";
+        showMsg(`Reinstated ${id} — served to Vision One again.`, true);
+      }
+      tr.dataset.revoked = toRevoked ? "1" : "";
+    } else {
+      showMsg(`Revoke failed (HTTP ${r.status}): ${r.body && r.body.error}`, false);
+    }
+  } catch (e) {
+    showMsg("Revoke failed: " + e.message, false);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function syncIdCell(tr) { tr.children[6].textContent = tr.dataset.id; }
 
 function syncRow(tr, type, value) {
   const inp = tr.children[2].querySelector("input");
@@ -502,6 +585,38 @@ async function purge() {
   }
 }
 
+async function importCsv() {
+  const fileInput = $("csvFile");
+  const file = fileInput.files[0];
+  if (!file) return;
+  const btn = $("btnCsvImport");
+  const msgEl = $("csvMsg");
+  btn.disabled = true;
+  const fd = new FormData();
+  fd.append("file", file);
+  try {
+    const r = await apiRaw("/feed/import-csv", { method: "POST", body: fd });
+    if (r.status === 200) {
+      const b = r.body || {};
+      let text = `Imported ${b.imported} object(s) from ${file.name}.`;
+      if (b.skipped_total) text += ` ${b.skipped_total} row(s) skipped (no recognizable value).`;
+      msgEl.textContent = text;
+      msgEl.className = "msg ok";
+      fileInput.value = "";
+      await loadFeed();
+    } else {
+      const err = (r.body && r.body.error) || "unknown error";
+      msgEl.textContent = `Import failed (HTTP ${r.status}): ${err}`;
+      msgEl.className = "msg err";
+    }
+  } catch (e) {
+    msgEl.textContent = "Import failed: " + e.message;
+    msgEl.className = "msg err";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Community sources (third-party TAXII / OTX pulls)
 // ---------------------------------------------------------------------------
@@ -599,6 +714,10 @@ $("btnLoad").addEventListener("click", loadFeed);
 $("btnAdd").addEventListener("click", addRow);
 $("btnSave").addEventListener("click", save);
 $("btnPurge").addEventListener("click", purge);
+$("csvFile").addEventListener("change", () => {
+  $("btnCsvImport").disabled = !$("csvFile").files.length;
+});
+$("btnCsvImport").addEventListener("click", importCsv);
 
 init();
 </script>

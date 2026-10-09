@@ -56,6 +56,24 @@ taxii:
     password: 'admin'
 
 # ---------------------------------------------------------------------------
+# INDICATOR LIFECYCLE / TTL (aging & auto-revocation)
+# Dynamic indicators age out. When an object is older than its per-type TTL
+# (measured from last_seen, falling back to first_seen/modified) it is
+# auto-REVOKED — served to Vision One as STIX `revoked: true` so the client
+# drops it — NOT deleted (stays in the DB for audit). IPs expire fast; file
+# hashes stay much longer. Set enabled: false, or a type's days to null, to
+# turn it off. Manual revocation is separate: use the UI or
+# POST /objects/<id>/revoke (action: revoke | unrevoke).
+# ---------------------------------------------------------------------------
+lifecycle:
+  enabled: true
+  sweep_interval: 3600     # seconds between auto-revocation sweeps
+  ipv4_days: 14            # IPs are dynamic — short TTL
+  domain_days: 30          # FQDNs — medium TTL
+  file_days: 180           # file hashes are stable — long TTL
+  indicator_days: 30       # free-form / pattern indicators
+
+# ---------------------------------------------------------------------------
 # INTEL FILTER — the gate between THIS server and Vision One
 #   community -> this server -> [intel_filter] -> Vision One
 #

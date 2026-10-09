@@ -219,8 +219,10 @@ authenticate with it, so you don't re-enter anything until it expires
 Once logged in, the **TAXII Feed Manager** dashboard lets you:
 
 1. **Current feed** — an editable table of everything in the feed. Each row
-   shows a **source badge** (`manual` / `otx` / a puller name) and a **gate
-   badge** (`served` / `withheld`, with the reason on hover).
+   shows a **source badge** (`manual` / `otx` / a puller name), a **gate
+   badge** (`served` / `withheld`, with the reason on hover), and a
+   **Status** cell (`active` / `revoked`) with a **Revoke / Unrevoke** button
+   for marking false positives.
 2. **Add new entry** — pick a type (IPv4 / domain / file hash / indicator),
    type the value. IDs and hash algorithms (MD5/SHA-1/SHA-256) are
    auto-derived, and values are validated.
@@ -241,6 +243,9 @@ Once logged in, the **TAXII Feed Manager** dashboard lets you:
    (it works even while a puller is `enabled: false`, for a one-shot fetch),
    then refreshes the feed table. See
    [Community Sources](#community-sources-pulling-from-otx-or-any-taxii-21-server).
+7. **Import CSV (GT team)** — upload a `.csv` with any headers (fuzzy-mapped
+   to IPv4 / domain / file hash / indicator); appends to the manual feed. See
+   [CSV import](#3-csv-import-gt-team-ad-hoc-intel).
 
 The UI is a single self-contained `intel-ui.html` (no CDN/JS dependencies,
 works offline), served directly by the Flask app. The browser talks to the
@@ -387,6 +392,18 @@ These drive the dashboard login. They are independent of `taxii.auth`.
 | `POST /ui/login` | Body `{"username","password"}` checked against `ui.auth`. On success sets the http-only `taxii2_ui_session` cookie (signed with `security.secret_key`, lifetime `ui.session_ttl`); `401` on bad credentials. |
 | `POST /ui/logout` | Deletes the session cookie. |
 
+### Object lifecycle endpoints
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /objects/<stix_id>/revoke` | Body `{"action":"revoke"}` (default) or `{"action":"unrevoke"}`. Sets/clears the STIX `revoked` flag. A revoked object stays stored and is served to Vision One with `revoked: true` so it can be purged. `404` if the id is unknown, `400` on a bad action. |
+
+### CSV import endpoint
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /feed/import-csv` | GT-team ad-hoc intel. Multipart `file` field (UI) or raw CSV body. Fuzzy header → type mapping, per-value validation, merge (append) as `source='manual'`. Returns `{imported, skipped[], skipped_total}`. `400` if nothing recognizable. See [CSV import](#3-csv-import-gt-team-ad-hoc-intel). |
+
 ### Community source endpoints
 
 | Endpoint | Purpose |
@@ -476,14 +493,26 @@ wrapped in a TAXII 2.1 message.
 | `GET /taxii2/` | API Root + Server Discovery |
 | `GET /taxii2/collections/` | List collections |
 | `GET /taxii2/collections/<id>/` | Collection info (`can_read`) |
-| `GET /taxii2/collections/<id>/objects/` | **Poll STIX 2.1 objects** (supports `?since=`) |
+| `GET /taxii2/collections/<id>/objects/` | **Poll STIX 2.1 objects** (supports `?since=`/`?added_after=`, `?match[type]=`, `?match[id]=`) |
 | `POST /taxii2/collections/<id>/objects/` | Add-objects ack (read-only feed → no-op) |
 | `GET /taxii2/status/<id>/` | Status (reports `complete`) |
 | `GET /taxii2/subscriptions/` | Subscription list (empty) |
 
 Auth is **HTTP Basic** (the TAXII standard) — the same `taxii.auth`
-credentials. `?since=<ISO8601>` returns only objects modified after that
-timestamp, enabling efficient delta polling.
+credentials. `?since=<ISO8601>` (alias `?added_after=`) returns only objects
+modified after that timestamp, enabling efficient delta polling. Standard
+TAXII 2.1 filtering is also supported:
+
+```bash
+# only domains
+curl -u admin:admin 'http://localhost:5000/taxii2/collections/threat-intel/objects/?match[type]=domain-name'
+# only specific objects
+curl -u admin:admin 'http://localhost:5000/taxii2/collections/threat-intel/objects/?match[id]=domain-name--evil-example-com'
+```
+
+> **Revoked objects** are included in the bundle with `revoked: true` (see
+> [Indicator Lifecycle](#indicator-lifecycle-ttl--revocation)) so clients can
+> purge them — they are never silently omitted.
 
 ### Verifying it works (without Vision One)
 
@@ -520,6 +549,55 @@ own (see Step 3). They are optional helpers (all off by default):
 > *replace* mode scoped to `source='manual'`. The OTX and TAXII pullers use
 > *merge* mode (upsert by STIX id, append-only). This keeps your hand-fed
 > intel and pulled community intel independent of each other.
+
+## Indicator Lifecycle (TTL & revocation)
+
+Dynamic indicators age out and are withdrawn cleanly instead of vanishing,
+so Vision One always sees the truth about what it should be matching.
+
+### Auto-revocation (per-type TTL)
+
+Configured under `lifecycle:` (see `config.yaml`). A background sweeper
+(default every `sweep_interval` seconds, plus one sweep at startup) scans for
+objects older than their **per-type TTL** (measured from `last_seen`,
+falling back to `first_seen`/`modified`) and **revokes** them:
+
+| Type | Default TTL | Rationale |
+|------|------------|-----------|
+| `ipv4-addr` | 14 days | IPs are dynamic — rotate fast |
+| `domain-name` | 30 days | FQDNs — medium |
+| `file-hash` | 180 days | Hashes are stable — long |
+| `indicator` | 30 days | free-form / pattern |
+
+A revoked object is **not deleted** — it stays in the DB and is still *served*
+to Vision One, but now with `revoked: true`. TAXII clients use that flag to
+**purge** the indicator from their side, which is exactly how a false positive
+gets cleaned up everywhere at once. Set `lifecycle.enabled: false`, or a type's
+days to `null`, to disable (per type or globally).
+
+> **Revoked vs gated.** The [intel filter](#intel-filter-filtering-between-server-and-vision-one)
+> *withholds* an object entirely (it is not served). TTL **revokes** an object
+> (it is served, but flagged). A community object can be gated *or* revoked;
+> the gate is checked first.
+
+### Manual revocation (false positives)
+
+From the dashboard: each feed row has a **Status** column with a
+**Revoke / Unrevoke** button. Or via API:
+
+```bash
+# Mark an object as a false positive / clean (served to Vision One as revoked: true)
+curl -X POST http://localhost:5000/objects/ipv4-addr--1-2-3-4/revoke \
+  -u admin:admin -H 'Content-Type: application/json' -d '{"action":"revoke"}'
+
+# Reinstate it later
+curl -X POST http://localhost:5000/objects/ipv4-addr--1-2-3-4/revoke \
+  -u admin:admin -H 'Content-Type: application/json' -d '{"action":"unrevoke"}'
+```
+
+Revocation is **sticky**: it survives a web-UI *replace* save (a save that
+doesn't explicitly set `revoked` won't silently reinstate it). Only an
+explicit `unrevoke` clears it.
 
 ## Community Sources (pulling from OTX or any TAXII 2.1 server)
 
@@ -567,6 +645,38 @@ All pulled objects land in the feed tagged with the puller's `name`, then pass
 through the [intel filter](#intel-filter-filtering-between-server-and-vision-one)
 before reaching Vision One. **No community source pulls anything until you
 enable it** — the server ships with all pullers off.
+
+### 3. CSV import (GT-team ad-hoc intel)
+
+For one-off intel uploads that don't fit the other paths. Upload a `.csv` in
+the **Import CSV (GT team)** dashboard panel (or `POST /feed/import-csv`),
+with **any** headers — they are fuzzy-mapped, then each value is validated
+and typed:
+
+| Header contains (case-insensitive) | Mapped to |
+|------------------------------------|-----------|
+| `ip_address`, `src_ip`, `dst_ip`, `destination`, `ip` | `ipv4-addr` (only if a valid IPv4) |
+| `domain`, `hostname`, `host`, `fqdn` | `domain-name` (only if domain-shaped) |
+| `md5`, `sha1`, `sha256`, `sha512`, `hash` | `file-hash` (hex, algo from length) |
+| `indicator`, `value`, `ioc` (free text) | `indicator` |
+| `label` / `tags` | labels (comma-separated) |
+| `confidence` / `conf` | confidence (0–100, default 50) |
+
+A row may carry **several** recognized values (e.g. both `src_ip` and a
+domain) — each valid value becomes its own object. Rows with no
+recognizable value are reported in `skipped`. Import uses **merge** mode
+tagged `source='manual'`, so it **appends** to your manual feed and never
+wipes existing rows (unlike the "Save feed (replace)" button).
+
+```bash
+# Raw CSV body (also accepts a multipart "file" field from the UI)
+curl -X POST http://localhost:5000/feed/import-csv \
+  -u admin:admin -H 'Content-Type: text/csv' \
+  -d 'IP_Address,Destination,labels
+1.2.3.4,evil.example.com,c2
+5.6.7.8,bot.evil.net,apt'
+# -> {"imported": 4, "skipped": [], "skipped_total": 0}
+```
 
 ## Intel Filter (filtering between server and Vision One)
 
@@ -637,14 +747,19 @@ python tests/test_server.py
 This covers all TAXII 2.1 endpoints, ingestion (replace + merge modes),
 authentication (TAXII creds **and** the UI session cookie), subscription
 management, STIX 2.1 object mapping (IP / domain / file-hash / indicator
-patterns), TAXII bundle generation, the OTX poller (init, URL/headers,
+patterns), TAXII bundle generation (including `match[type]`, `match[id]`,
+and `added_after` query filters), the OTX poller (init, URL/headers,
 indicator mapping, and manual-vs-OTX source isolation), the generic
 **third-party TAXII 2.1 puller** (init, headers, fetch-and-merge, state
 persistence, misconfigured handling), the **community source endpoints**
 (`GET /community/pullers`, `POST /community/pull/<name>`), the **UI
 login/logout/session** flow (cookie set, wrong-password 401, session grants
-data access), and the intel gate (private-IP drop, freshness, confidence
-floor, blocklist, and that manual intel is never gated).
+data access), the **intel gate** (private-IP drop, freshness, confidence
+floor, blocklist, and that manual intel is never gated), **manual
+revocation** (`POST /objects/<id>/revoke`, stickiness across saves,
+`revoked: true` in the TAXII bundle) and **TTL auto-revocation** (per-type
+aging sweep), and **CSV import** (fuzzy header mapping, merge-not-replace,
+auth, bad-input handling).
 
 ## Security Considerations
 
@@ -700,10 +815,43 @@ floor, blocklist, and that manual intel is never gated).
   a private IP trips `drop_private_ips`, an old object trips
   `freshness_days`, a low-confidence one trips `min_confidence`, and a
   listed value trips `blocklist`.
+- The object may be **revoked** (TTL auto-revocation or a manual revoke).
+  `GET /objects` shows a `revoked` badge; the TAXII bundle serves it with
+  `revoked: true` so Vision One drops it. Unrevoke to reinstate.
 - The web UI still shows the object (the gate only affects the `/taxii2/`
   feed), so you can confirm it's *stored* but *withheld*. Loosen the relevant
   toggle (or add nothing / remove a blocklist entry), restart, and it's
   served again — nothing was deleted.
+
+## Future Work (deferred — not implemented)
+
+Assessed against a "modern TAXII server" feature list; deferred deliberately
+because they are either off-mission for this single-consumer feed (Vision One)
+or conflict with the offline / low-attack-surface design. Recorded here so
+they are explicit, not forgotten:
+
+- **Excel (.xlsx) import** — CSV is supported; .xlsx would add `openpyxl`
+  (still offline-installable). Do only if the GT team actually ships .xlsx.
+- **Non-TAXII HTTP feed connectors** — Abuse.ch / ThreatFox style pullers
+  (OTX and *any* TAXII 2.1 server are already covered by the generic puller;
+  MISP in particular can be added today as a `taxii_pullers:` entry).
+- **Web scraping** (blogs / GitHub / paste sites, e.g. Playwright) — off-mission
+  for a curated feed; ToS/legal risk; high noise floor.
+- **LLM / NLP extraction** of unstructured text or PDFs into STIX — heavy
+  dependency, contradicts the offline, low-attack-surface direction.
+- **Auto-enrichment** (VirusTotal / WHOIS) — needs external APIs + keys and
+  network egress; revisit only if Vision One consumers want enriched context.
+- **AI/ML scoring & quarantine** — the rule-based intel gate already covers
+  false-positive reduction in an auditable, offline way; an ML layer is a
+  large scope addition with little to gain at this scale.
+- **STIX relationships / threat actors / malware objects** — the store is flat
+  IOCs; a full STIX 2.1 graph (relationships, `malware`, `threat-actor`) is a
+  model-level change.
+- **Collection-based RBAC** (multiple collections, per-client subscriptions)
+  — single collection + single credential set fits one consumer; add when a
+  second SIEM / firewall needs a different view.
+- **`limit` / `offset` pagination** on Get Objects — objects are small; add
+  only if a bundle ever grows too large.
 
 ## License
 

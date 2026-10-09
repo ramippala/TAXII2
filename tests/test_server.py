@@ -7,6 +7,7 @@ Vision One integration, and the OTX community-intel puller.
 
 import sys
 import os
+import io
 import types
 import unittest
 from datetime import datetime, timedelta
@@ -22,7 +23,10 @@ from server import (
     init_db,
     OtxPoller,
     VisionOnePoller,
+    STIXObject,
+    sweep_expired_indicators,
 )
+import server as _server
 
 
 def _reset_db():
@@ -894,6 +898,231 @@ class TestTaxiiServer(unittest.TestCase):
         headers = poller._get_auth_headers()
         self.assertEqual(headers['X-Taxii-Username'], 'vis_user')
         self.assertEqual(headers['X-Taxii-Password'], 'vis_pass')
+
+
+class TestRevocationAndTTL(unittest.TestCase):
+    """Manual revocation, TTL auto-revocation, and TAXII 2.1 match filters."""
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        app.config['TAXII_AUTH'] = {
+            'username': 'test_taxii_user',
+            'password': 'test_taxii_pass',
+        }
+        self.auth = {
+            'X-Taxii-Username': 'test_taxii_user',
+            'X-Taxii-Password': 'test_taxii_pass',
+        }
+
+    def _ingest(self, objs):
+        return self.client.post(
+            '/feed/ingest', json={'stix_objects': objs}, headers=self.auth
+        )
+
+    def _bundle(self, qs=''):
+        r = self.client.get(
+            '/taxii2/collections/threat-intel/objects/' + qs,
+            headers=self.auth,
+        )
+        self.assertEqual(r.status_code, 200)
+        return r.get_json()['content']['content']['objects']
+
+    def test_revoke_object(self):
+        self.assertEqual(self._ingest([_manual_obj('1.2.3.4')]).status_code, 200)
+        # default action = revoke
+        r = self.client.post(
+            '/objects/ipv4-addr--1-2-3-4/revoke', json={}, headers=self.auth
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json()['revoked'])
+        # served in the TAXII bundle with revoked: true
+        objs = self._bundle()
+        self.assertEqual(len(objs), 1)
+        self.assertTrue(objs[0]['revoked'])
+
+    def test_unrevoke_object(self):
+        self._ingest([_manual_obj('5.6.7.8')])
+        self.client.post(
+            '/objects/ipv4-addr--5-6-7-8/revoke', json={'action': 'revoke'},
+            headers=self.auth,
+        )
+        r = self.client.post(
+            '/objects/ipv4-addr--5-6-7-8/revoke', json={'action': 'unrevoke'},
+            headers=self.auth,
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.get_json()['revoked'])
+        objs = self._bundle()
+        self.assertFalse(objs[0]['revoked'])
+
+    def test_revoke_no_auth(self):
+        self._ingest([_manual_obj('9.8.7.6')])
+        r = self.client.post('/objects/ipv4-addr--9-8-7-6/revoke', json={})
+        self.assertEqual(r.status_code, 401)
+
+    def test_revoke_unknown_object(self):
+        r = self.client.post(
+            '/objects/ipv4-addr--0-0-0-0/revoke', json={}, headers=self.auth
+        )
+        self.assertEqual(r.status_code, 404)
+
+    def test_revoke_bad_action(self):
+        self._ingest([_manual_obj('4.3.2.1')])
+        r = self.client.post(
+            '/objects/ipv4-addr--4-3-2-1/revoke', json={'action': 'nope'},
+            headers=self.auth,
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_revoke_sticky_across_replace_ingest(self):
+        """A UI save (replace) must not silently reinstate a revoked object."""
+        self._ingest([_manual_obj('2.2.2.2')])
+        self.client.post(
+            '/objects/ipv4-addr--2-2-2-2/revoke', json={'action': 'revoke'},
+            headers=self.auth,
+        )
+        # save again WITHOUT a revoked flag -> stays revoked
+        self._ingest([_manual_obj('2.2.2.2')])
+        objs = self._bundle()
+        self.assertEqual(len(objs), 1)
+        self.assertTrue(objs[0]['revoked'])
+
+    def test_objects_endpoint_reports_revoked(self):
+        self._ingest([_manual_obj('3.3.3.3')])
+        self.client.post(
+            '/objects/ipv4-addr--3-3-3-3/revoke', json={}, headers=self.auth
+        )
+        r = self.client.get('/objects', headers=self.auth)
+        o = r.get_json()['objects'][0]
+        self.assertTrue(o['revoked'])
+        self.assertIsNotNone(o['revoked_at'])
+
+    def test_ttl_sweep_auto_revokes_expired(self):
+        """An IP older than ipv4_days is auto-revoked (served revoked:true)."""
+        old = datetime.utcnow() - timedelta(days=30)  # > default 14d
+        self._ingest([_manual_obj('6.6.6.6')])
+        # backdate the row past its TTL
+        session = _server.create_session()
+        try:
+            row = session.query(STIXObject).filter_by(
+                stix_id='ipv4-addr--6-6-6-6').first()
+            row.last_seen = old
+            row.first_seen = old
+            session.commit()
+        finally:
+            session.close()
+        newly = sweep_expired_indicators()
+        self.assertEqual(newly, 1)
+        objs = self._bundle()
+        self.assertEqual(len(objs), 1)
+        self.assertTrue(objs[0]['revoked'])
+
+    def test_ttl_sweep_keeps_fresh_objects(self):
+        self._ingest([_manual_obj('8.8.8.8')])  # fresh -> untouched
+        self.assertEqual(sweep_expired_indicators(), 0)
+        objs = self._bundle()
+        self.assertFalse(objs[0]['revoked'])
+
+    def test_match_type_filter(self):
+        self._ingest([
+            _manual_obj('1.1.1.1'),
+            {'id': 'domain-name--a-b-c', 'type': 'domain-name',
+             'object': {'domain-name': {'value': 'a.b.c'}}, 'labels': [], 'confidence': 50},
+        ])
+        objs = self._bundle('?match%5Btype%5D=domain-name')  # match[type]=domain-name
+        self.assertEqual(len(objs), 1)
+        self.assertEqual(objs[0]['type'], 'domain-name')
+        objs = self._bundle('?match%5Btype%5D=ipv4-addr')
+        self.assertEqual(len(objs), 1)
+        self.assertEqual(objs[0]['type'], 'ipv4-addr')
+
+    def test_match_id_filter(self):
+        self._ingest([
+            _manual_obj('1.1.1.1'),
+            _manual_obj('2.2.2.2'),
+        ])
+        objs = self._bundle('?match%5Bid%5D=ipv4-addr--1-1-1-1')
+        self.assertEqual(len(objs), 1)
+        self.assertEqual(objs[0]['id'], 'ipv4-addr--1-1-1-1')
+
+    def test_added_after_param(self):
+        self._ingest([_manual_obj('7.7.7.7')])
+        future = (datetime.utcnow() + timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        objs = self._bundle('?added_after=' + future)
+        self.assertEqual(len(objs), 0)  # nothing modified after "now+1d"
+
+
+class TestCsvImport(unittest.TestCase):
+    """GT-team CSV upload with fuzzy header mapping."""
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        app.config['TAXII_AUTH'] = {
+            'username': 'test_taxii_user',
+            'password': 'test_taxii_pass',
+        }
+        self.auth = {
+            'X-Taxii-Username': 'test_taxii_user',
+            'X-Taxii-Password': 'test_taxii_pass',
+        }
+
+    def _post_csv(self, text):
+        return self.client.post(
+            '/feed/import-csv', data={'file': (io.BytesIO(text.encode('utf-8')), 'intel.csv')},
+            headers=self.auth,
+        )
+
+    def test_fuzzy_headers(self):
+        """IP_Address / Destination / malicious_domain / sha256 all map.
+
+        Rows carrying both an IP and a domain yield ONE object per value.
+        """
+        csv_text = (
+            "IP_Address,Destination,malicious_domain,sha256,labels,confidence\n"
+            "1.2.3.4,,evil.example.com,,c2,90\n"
+            ",5.6.7.8,bot.evil.net,,apt,80\n"
+            ",,,abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789,mw,70\n"
+            "999.1.1.1,,,,,99\n"  # invalid IP -> skipped
+        )
+        r = self._post_csv(csv_text)
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertEqual(body['imported'], 5)  # 2+2+1 objects; row 4 skipped
+        self.assertEqual(body['skipped_total'], 1)
+        # verify stored types
+        r = self.client.get('/objects', headers=self.auth)
+        by_type = {}
+        for o in r.get_json()['objects']:
+            by_type.setdefault(o['type'], []).append(o['value'])
+        self.assertEqual(by_type['ipv4-addr'], ['1.2.3.4', '5.6.7.8'])
+        self.assertEqual(by_type['domain-name'], ['evil.example.com', 'bot.evil.net'])
+        self.assertEqual(by_type['file-hash'],
+                         ['abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'])
+
+    def test_import_merges_not_replaces(self):
+        """CSV import (merge) must not wipe existing manual rows."""
+        self.client.post('/feed/ingest', json={'stix_objects': [_manual_obj('9.9.9.9')]},
+                         headers=self.auth)
+        r = self._post_csv("ip\n1.1.1.1\n")
+        self.assertEqual(r.status_code, 200)
+        r = self.client.get('/objects', headers=self.auth)
+        values = {o['value'] for o in r.get_json()['objects']}
+        self.assertEqual(values, {'9.9.9.9', '1.1.1.1'})
+
+    def test_import_no_auth(self):
+        r = self.client.post('/feed/import-csv', data={'file': (io.BytesIO(b'ip\n1.1.1.1'), 'a.csv')})
+        self.assertEqual(r.status_code, 401)
+
+    def test_import_empty_csv(self):
+        r = self._post_csv("")
+        self.assertEqual(r.status_code, 400)
+
+    def test_import_no_recognizable_rows(self):
+        r = self._post_csv("foo,bar\nhello,world\n")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('no recognizable rows', r.get_json()['error'])
 
 
 if __name__ == '__main__':

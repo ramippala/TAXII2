@@ -15,6 +15,8 @@ Architecture:
 """
 
 import base64
+import csv
+import io
 import ipaddress
 import json
 import logging
@@ -148,6 +150,7 @@ class STIXObject(Base):
     first_seen = Column(DateTime, nullable=True)
     last_seen = Column(DateTime, nullable=True)
     revoked = Column(Boolean, default=False)
+    revoked_at = Column(DateTime, nullable=True)   # when it was revoked (UTC)
     created = Column(DateTime, default=datetime.utcnow)
     modified = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -201,10 +204,17 @@ def init_db() -> None:
     insp = inspect(engine)
     if 'stix_objects' in insp.get_table_names():
         cols = {c['name'] for c in insp.get_columns('stix_objects')}
+        # Databases created before these columns existed (idempotent).
         if 'source' not in cols:
             with engine.begin() as conn:
                 conn.execute(text('ALTER TABLE stix_objects ADD COLUMN source VARCHAR'))
             logger.info("Migrated stix_objects: added 'source' column")
+        if 'revoked_at' not in cols:
+            with engine.begin() as conn:
+                conn.execute(
+                    text('ALTER TABLE stix_objects ADD COLUMN revoked_at DATETIME')
+                )
+            logger.info("Migrated stix_objects: added 'revoked_at' column")
     logger.info("Database initialized")
 
 
@@ -235,6 +245,7 @@ def rehydrate_memory() -> int:
                     ip_address=row.ip_address,
                     domain=row.domain,
                     source=row.source or 'manual',
+                    revoked=bool(row.revoked),
                 )
             count = len(memory_store)
     finally:
@@ -242,6 +253,98 @@ def rehydrate_memory() -> int:
     if count:
         logger.info("Rehydrated %s object(s) from database into memory", count)
     return count
+
+
+# ---------------------------------------------------------------------------
+# Indicator TTL / auto-revocation (lifecycle & aging)
+# ---------------------------------------------------------------------------
+# Per-type time-to-live: dynamic indicators age out and are auto-REVOKED
+# (served to Vision One as STIX revoked: true, so clients purge them) rather
+# than deleted. IPs expire fast, file hashes stay much longer. Set
+# lifecycle.enabled: false (or a type's days to null) to disable.
+
+LIFECYCLE_CFG = CONFIG.get('lifecycle', {}) or {}
+LIFECYCLE_ENABLED = bool(LIFECYCLE_CFG.get('enabled', True))
+LIFECYCLE_SWEEP_INTERVAL = int(LIFECYCLE_CFG.get('sweep_interval', 3600))  # seconds
+# days, by type class (null = no TTL for that type)
+LIFECYCLE_TTL_DAYS: Dict[str, Optional[int]] = {
+    'ipv4-addr': LIFECYCLE_CFG.get('ipv4_days', 14),
+    'domain-name': LIFECYCLE_CFG.get('domain_days', 30),
+    'file-hash': LIFECYCLE_CFG.get('file_days', 180),
+    'indicator': LIFECYCLE_CFG.get('indicator_days', 30),
+}
+
+
+def _ttl_days_for(object_type: str) -> Optional[int]:
+    """TTL in days for an object type, or None (no TTL)."""
+    days = LIFECYCLE_TTL_DAYS.get(object_type, None)
+    if isinstance(days, int) and days > 0:
+        return days
+    return None
+
+
+def sweep_expired_indicators(now: Optional[datetime] = None) -> int:
+    """Auto-revoke objects past their per-type TTL.
+
+    Revoked (not deleted) objects stay in the DB and are *served* with
+    ``revoked: true`` so TAXII clients (Vision One) can drop them. Returns
+    the number of newly revoked objects.
+    """
+    if not LIFECYCLE_ENABLED:
+        return 0
+    now = now or datetime.utcnow()
+    session = create_session()
+    try:
+        rows = session.query(STIXObject).filter_by(revoked=False).all()
+        newly = 0
+        for row in rows:
+            days = _ttl_days_for(row.object_type or '')
+            if days is None:
+                continue
+            anchor = row.last_seen or row.first_seen or row.modified
+            if anchor is None:
+                continue
+            if (now - anchor) > timedelta(days=days):
+                row.revoked = True
+                row.revoked_at = now
+                with memory_lock:
+                    obj = memory_store.get(row.stix_id)
+                    if obj is not None:
+                        obj.revoked = True
+                newly += 1
+        if newly:
+            session.commit()
+            logger.info(
+                "TTL sweep auto-revoked %s expired indicator(s)", newly
+            )
+        return newly
+    except Exception as exc:
+        session.rollback()
+        logger.error("TTL sweep failed: %s", exc)
+        return 0
+    finally:
+        session.close()
+
+
+def start_ttl_sweeper() -> None:
+    """Background thread that periodically auto-revokes expired objects."""
+    if not LIFECYCLE_ENABLED:
+        return
+
+    def _loop() -> None:
+        while True:
+            try:
+                time.sleep(LIFECYCLE_SWEEP_INTERVAL)
+                sweep_expired_indicators()
+            except Exception:  # pragma: no cover - best-effort loop guard
+                pass
+
+    thread = threading.Thread(target=_loop, name='TtlSweeper', daemon=True)
+    thread.start()
+    logger.info(
+        "TTL sweeper started (interval=%ss, ttl_days=%s)",
+        LIFECYCLE_SWEEP_INTERVAL, LIFECYCLE_TTL_DAYS,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +416,8 @@ class ThreatIntel:
     hash_value: Optional[str] = None
     ip_address: Optional[str] = None
     domain: Optional[str] = None
-    source: str = 'manual'  # 'manual' (web UI / API) | 'otx' (OTX puller) | ...
+    source: str = 'manual'
+    revoked: bool = False  # once revoked -> served as STIX revoked: true
 
     def to_stix_object(self) -> Dict[str, Any]:
         """Convert to a STIX 2.1-flavoured object dict (see generate_taxii_bundle)."""
@@ -341,7 +445,7 @@ class ThreatIntel:
             "type": self.object_type,
             "created": now,
             "modified": now,
-            "revoked": False,
+            "revoked": bool(self.revoked),
             "labels": labels,
             "confidence": confidence,
             "object": obj_dict,
@@ -603,6 +707,7 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
             batch_ids = [o.get('id') for o in stix_objects if o.get('id')]
             if mode == 'merge':
                 # Upsert: keep manual and other-source rows, update matching ids.
+                preserved_revoked = {}
                 if batch_ids:
                     existing = {
                         row.stix_id: row
@@ -615,6 +720,12 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
             else:
                 # Replace: wipe only the manual feed; community-sourced rows
                 # survive so a UI save cannot delete pulled intel.
+                preserved_revoked = {
+                    r.stix_id: bool(r.revoked)
+                    for r in session.query(STIXObject.stix_id, STIXObject.revoked).filter_by(
+                        source=source
+                    ).all()
+                }
                 session.query(STIXObject).filter_by(source=source).delete()
                 for s in [s for s in memory_store if memory_store[s].source == source]:
                     memory_store.pop(s, None)
@@ -635,6 +746,23 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                 confidence = int(obj_dict.get('confidence', 0) or 0)
                 fields = _extract_object_fields(obj_type, object_dict)
 
+                existing_row = existing.get(stix_id)
+                # Revocation is sticky. An explicit "revoked" in the payload
+                # wins; otherwise a previously-revoked object (merge: its
+                # existing row, replace: captured before the delete) stays
+                # revoked. Only the revoke endpoint (action=unrevoke) can
+                # reinstate an object.
+                _raw_revoked = (
+                    obj_dict.get('revoked', object_dict.get('revoked'))
+                )
+                if _raw_revoked is None:
+                    if existing_row is not None:
+                        revoked = bool(existing_row.revoked)
+                    else:
+                        revoked = preserved_revoked.get(stix_id, False)
+                else:
+                    revoked = bool(_raw_revoked)
+
                 memory_store[stix_id] = ThreatIntel(
                     stix_id=stix_id,
                     object_type=obj_type,
@@ -646,6 +774,7 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                     ip_address=fields['ip_address'],
                     domain=fields['domain'],
                     source=source,
+                    revoked=revoked,
                 )
 
                 row = existing.get(stix_id)
@@ -659,6 +788,7 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                     row.ip_address = fields['ip_address']
                     row.domain = fields['domain']
                     row.last_seen = now
+                    row.revoked = revoked  # sticky (see above); keeps first revoked_at
                 else:
                     row = STIXObject(
                         id=stix_id,
@@ -674,7 +804,8 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                         source=source,
                         first_seen=now,
                         last_seen=now,
-                        revoked=False,
+                        revoked=revoked,
+                        revoked_at=now if revoked else None,
                     )
                     existing[stix_id] = row
                     session.add(row)
@@ -736,7 +867,7 @@ def threat_intel_to_stix21(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
         'spec_version': '2.1',
         'created': now,
         'modified': now,
-        'revoked': False,
+        'revoked': bool(obj.revoked),
     }
 
     if obj.object_type == 'ipv4-addr' and obj.ip_address:
@@ -955,25 +1086,38 @@ def gate_verdict(obj: ThreatIntel, row: 'STIXObject') -> Dict[str, Any]:
     }
 
 
-def build_stix_bundle(since: Optional[str] = None) -> Dict[str, Any]:
-    """Build a STIX 2.1 bundle of the current feed (optionally modified since).
+def build_stix_bundle(since: Optional[str] = None,
+                      match_types: Optional[List[str]] = None,
+                      match_ids: Optional[List[str]] = None,
+                      added_after: Optional[str] = None) -> Dict[str, Any]:
+    """Build a STIX 2.1 bundle of the current feed (optionally filtered).
 
-    Applies the community-intel gate: objects whose ``source`` is in
-    ``FILTER_COMMUNITY_SOURCES`` (default: the OTX puller) are withheld when
-    ``community_intel_reason`` returns a reason. Manual intel always passes.
-    """
+    TAXII 2.1 Get Objects parameters:
+      * ``since`` / ``added_after``: only objects modified after this
+        ISO-8601 timestamp (``added_after`` is the spec name; ``since`` is
+        accepted for back-compat).
+      * ``match_types``: ``match[type]`` - only these STIX object types.
+      * ``match_ids``: ``match[id]`` - only these exact object ids.
+
+    Revoked objects are INCLUDED but rendered with ``revoked: true`` (clients
+    purge them); they are never silently dropped."""
     session = create_session()
     try:
         q = session.query(STIXObject)
-        if since:
+        cutoff = since or added_after
+        if cutoff:
             try:
-                since_dt = datetime.fromisoformat(since.replace('Z', ''))
-                q = q.filter(STIXObject.modified >= since_dt)
+                cutoff_dt = datetime.fromisoformat(cutoff.replace('Z', ''))
+                q = q.filter(STIXObject.modified >= cutoff_dt)
             except ValueError:
                 pass
+        if match_ids:
+            q = q.filter(STIXObject.stix_id.in_(match_ids))
         rows = q.all()
     finally:
         session.close()
+
+    type_filter = ({str(t) for t in match_types} if match_types else None)
 
     objects: List[Dict[str, Any]] = []
     withheld = 0
@@ -981,6 +1125,9 @@ def build_stix_bundle(since: Optional[str] = None) -> Dict[str, Any]:
         for row in rows:
             obj = memory_store.get(row.stix_id)
             if obj is None:
+                continue
+            # match[type] - filter on the stored type we would render.
+            if type_filter is not None and row.object_type not in type_filter:
                 continue
             # Community-intel gate (manual intel is never gated).
             verdict = gate_verdict(obj, row)
@@ -1176,7 +1323,17 @@ def taxii_objects(collection_id: str):
         # Add Objects: this is a read-only feed; acknowledge as a no-op.
         return _taxii_response(_last_status())
 
-    bundle = build_stix_bundle(since=request.args.get('since'))
+    # TAXII 2.1 Get Objects query parameters (section 5.3):
+    #   since / added_after  -> only objects modified after the timestamp
+    #   match[type]          -> only these STIX object types
+    #   match[id]            -> only these exact object ids
+    # (?since= kept as an accepted alias of added_after.)
+    since = request.args.get('since') or request.args.get('added_after')
+    match_types = [t for t in request.args.getlist('match[type]') if t]
+    match_ids = [i for i in request.args.getlist('match[id]') if i]
+    bundle = build_stix_bundle(
+        since=since, match_types=match_types, match_ids=match_ids
+    )
     return _taxii_response(_taxii_message(collection_id, bundle))
 
 
@@ -1269,6 +1426,9 @@ def list_objects():
                 'gated': verdict['gated'],
                 'gate_reason': verdict['reason'],
                 'gate_reason_label': verdict['reason_label'],
+                'revoked': bool(row.revoked),
+                'revoked_at': row.revoked_at.isoformat() + 'Z' if row.revoked_at else None,
+                'last_seen': row.last_seen.isoformat() + 'Z' if row.last_seen else None,
             })
 
     withheld_count = sum(1 for o in objects if o['gated'])
@@ -1278,6 +1438,55 @@ def list_objects():
         'served_count': len(objects) - withheld_count,
         'withheld_count': withheld_count,
     }), 200
+
+
+@app.route('/objects/<stix_id>/revoke', methods=['POST'])
+def revoke_object(stix_id: str):
+    """POST /objects/<stix_id>/revoke — revoke or reinstate an object.
+
+    Body: {"action": "revoke"} (default) or {"action": "unrevoke"}. Revoking
+    sets STIX ``revoked: true`` (still served, so clients drop it); unrevoking
+    reinstates it. Revocation is the manual side of the indicator lifecycle.
+    """
+    if not _request_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+    action = str(data.get('action', 'revoke') or 'revoke').lower()
+    if action not in ('revoke', 'unrevoke'):
+        return jsonify({'error': 'action must be "revoke" or "unrevoke"'}), 400
+
+    session = create_session()
+    try:
+        row = session.query(STIXObject).filter_by(stix_id=stix_id).first()
+        if row is None:
+            return jsonify({'error': f'Object not found: {stix_id}'}), 404
+        now = datetime.utcnow()
+        if action == 'revoke':
+            if row.revoked:
+                return jsonify({'id': stix_id, 'revoked': True, 'changed': False})
+            row.revoked = True
+            row.revoked_at = now
+        else:
+            if not row.revoked:
+                return jsonify({'id': stix_id, 'revoked': False, 'changed': False})
+            row.revoked = False
+            row.revoked_at = None
+        session.commit()
+        with memory_lock:
+            obj = memory_store.get(stix_id)
+            if obj is not None:
+                obj.revoked = bool(row.revoked)
+        logger.info(
+            "Object %s %s via %s (source=%s)",
+            stix_id, action, request.remote_addr, row.source,
+        )
+        return jsonify({'id': stix_id, 'revoked': bool(row.revoked), 'changed': True})
+    except Exception as exc:
+        session.rollback()
+        logger.error("Revoke error: %s", exc)
+        return jsonify({'error': str(exc)}), 500
+    finally:
+        session.close()
 
 
 @app.route('/ui', methods=['GET'])
@@ -1634,6 +1843,177 @@ def _is_valid_ipv4(value: str) -> bool:
         return all(0 <= int(o) <= 255 for o in value.split('.'))
     except (ValueError, AttributeError):
         return False
+
+
+# ---------------------------------------------------------------------------
+# CSV import (GT-team ad-hoc intel uploads) with fuzzy header mapping
+# ---------------------------------------------------------------------------
+# Accepts a CSV with ANY reasonable headers ("IP_Address", "src_ip",
+# "Destination", "domain", "malicious_domain", ...) and maps them to our
+# STIX object types by fuzzy matching + value validation.
+
+# (normalized-header-contains -> column role), first match wins
+_CSV_HEADER_RULES: List[Tuple[str, str]] = [
+    ('indicator', 'indicator'), ('ioc', 'indicator'), ('value', 'indicator'),
+    ('sha512', 'hash'), ('sha1', 'hash'), ('sha256', 'hash'),
+    ('md5', 'hash'), ('hash', 'hash'),
+    ('label', 'label'),
+    ('domain', 'domain'), ('host', 'domain'), ('fqdn', 'domain'),
+    ('srcip', 'ip'), ('dstip', 'ip'), ('ip', 'ip'), ('dest', 'ip'),
+    ('name', 'name'),
+    ('description', 'description'), ('desc', 'description'),
+    ('confidence', 'confidence'), ('conf', 'confidence'),
+]
+
+_HASH_LEN_ALGO = {32: 'md5', 40: 'sha1', 64: 'sha256', 128: 'sha512'}
+
+
+def _csv_classify_header(header: str) -> str:
+    """Fuzzy-map a header cell to a column role."""
+    norm = re.sub(r'[^a-z0-9]', '', (header or '').lower())
+    for token, role in _CSV_HEADER_RULES:
+        if token in norm:
+            return role
+    return 'ignore'
+
+
+def _guess_hash_algo(value: str) -> str:
+    return _HASH_LEN_ALGO.get(len(value), 'sha256')
+
+
+def parse_csv_intel(text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Parse CSV text into (stix_objects, skipped_rows).
+
+    Headers are fuzzy-mapped; values are validated (IPv4 octets, domain
+    shape, hash length) and re-classified when needed. Returns STIX
+    ingest payloads ready for ``ingest_objects(..., source='manual')``.
+    """
+    try:
+        reader = csv.DictReader(io.StringIO(text or ''))
+        rows = list(reader)
+    except Exception:
+        return [], [{'error': 'could not parse CSV'}]
+
+    if not rows or not reader.fieldnames:
+        return [], [{'error': 'empty CSV (no header row found)'}]
+
+    # Resolve column roles from the header row. A role may span several
+    # columns (e.g. both "src_ip" and "dst_ip"); each recognized column is
+    # remembered and the row loop takes the first valid value per role.
+    roles: Dict[str, str] = {}
+    for h in reader.fieldnames:
+        role = _csv_classify_header(h)
+        if role != 'ignore':
+            roles[h] = role
+
+    objects: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    # Emit one object per recognizable value column in a row (a row can carry
+    # both an IP and a domain).
+    value_roles = ('ip', 'domain', 'hash', 'indicator')
+    for idx, raw in enumerate(rows, start=2):  # row 1 = header
+        labels: List[str] = []
+        confidence = 50
+        for h, role in roles.items():
+            cell = (raw.get(h) or '').strip()
+            if not cell:
+                continue
+            if role == 'label':
+                labels.extend(x.strip() for x in cell.split(',') if x.strip())
+            elif role == 'confidence':
+                try:
+                    confidence = max(0, min(100, int(float(cell))))
+                except ValueError:
+                    pass
+
+        emitted = False
+        for vrole in value_roles:
+            for h, r2 in roles.items():
+                if r2 != vrole:
+                    continue
+                cell = (raw.get(h) or '').strip()
+                if not cell:
+                    continue
+                if vrole == 'ip' and _is_valid_ipv4(cell):
+                    value, otype, algo = cell, 'ipv4-addr', 'ipv4'
+                elif vrole == 'domain' and _DOMAIN_RE.match(cell):
+                    value, otype, algo = cell, 'domain-name', 'domain'
+                elif vrole == 'hash' and re.fullmatch(
+                        r'[0-9a-fA-F]+', cell) and len(cell) in _HASH_LEN_ALGO:
+                    value, otype, algo = cell.lower(), 'file-hash', _guess_hash_algo(cell)
+                elif vrole == 'indicator':
+                    value, otype, algo = cell, 'indicator', 'indicator'
+                else:
+                    continue
+                if otype == 'ipv4-addr':
+                    obj_id = 'ipv4-addr--' + value.replace('.', '-')
+                    obj = {'ipv4-addr': {'value': value}}
+                elif otype == 'domain-name':
+                    obj_id = 'domain-name--' + value.replace('.', '-')
+                    obj = {'domain-name': {'value': value}}
+                elif otype == 'file-hash':
+                    obj_id = 'file-hash--' + value[:16]
+                    obj = {'hash_value': {'algorithm': algo, 'value': value}}
+                else:
+                    obj_id = 'indicator--' + value[:16]
+                    obj = {'indicator': {'value': value}}
+                row_labels = [algo] if otype == 'file-hash' else list(labels)
+                objects.append({
+                    'id': obj_id,
+                    'type': otype,
+                    'object': obj,
+                    'labels': row_labels,
+                    'confidence': confidence,
+                })
+                emitted = True
+                # do NOT break — every valid column of this role yields
+                # its own object (e.g. src_ip AND dst_ip in one row).
+        if not emitted:
+            skipped.append({'row': idx, 'error': 'no recognizable value'})
+    return objects, skipped
+
+
+@app.route('/feed/import-csv', methods=['POST'])
+def import_csv_data():
+    """POST /feed/import-csv — GT-team CSV upload with fuzzy headers.
+
+    Form field ``file`` (multipart) or raw CSV body. Merges in as
+    ``source='manual'`` (append-only upsert — does NOT wipe existing rows),
+    so the web UI "replace" semantics are not disturbed.
+    """
+    if not _request_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    text = None
+    if 'file' in request.files:
+        f = request.files['file']
+        if not f or not f.filename:
+            return jsonify({'error': 'no file provided'}), 400
+        text = f.read().decode('utf-8-sig', errors='replace')
+    else:
+        text = request.get_data(as_text=True)
+    if not text or not text.strip():
+        return jsonify({'error': 'empty CSV'}), 400
+    try:
+        objects, skipped = parse_csv_intel(text)
+    except Exception as exc:
+        logger.error("CSV import error: %s", exc)
+        return jsonify({'error': str(exc)}), 500
+    if not objects:
+        return jsonify({
+            'imported': 0,
+            'skipped': skipped[:50],
+            'error': 'no recognizable rows (check headers/values)',
+        }), 400
+    try:
+        added = ingest_objects(objects, mode='merge', source='manual')
+    except Exception as exc:
+        logger.error("CSV ingest error: %s", exc)
+        return jsonify({'error': str(exc)}), 500
+    return jsonify({
+        'imported': added,
+        'skipped': skipped[:50],
+        'skipped_total': len(skipped),
+    }), 200
 
 
 # OTX indicator type -> (our object type, hash algorithm if any)
@@ -2209,6 +2589,11 @@ def main() -> None:
     # Restore ingested intel that persisted in the DB so the feed is complete
     # even on the first poll after a restart.
     rehydrate_memory()
+
+    # Auto-revoke any indicators that expired while the server was down,
+    # then start the periodic TTL sweeper.
+    sweep_expired_indicators()
+    start_ttl_sweeper()
 
     if otx_poller.enabled and otx_poller.base_url:
         otx_poller.start()
