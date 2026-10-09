@@ -154,7 +154,7 @@ database:
   url: sqlite:///taxii_feed.db
 
 security:
-  secret_key: ${FLASK_SECRET:-dev-secret-key-change-in-production}
+  secret_key: ${FLASK_SECRET}
 
 taxii:
   collection_id: 'threat-intel'          # collection Vision One polls
@@ -821,9 +821,9 @@ domain/UPN/group allow-lists, and session-cookie issuance on success).
 - Use **HTTPS/TLS** for production deployments (configurable via reverse proxy).
 - **Set a strong `ui.auth` password** and change it from the default
   `admin`/`admin` — anyone who knows it can manage the feed and trigger pulls.
-- **Set `FLASK_SECRET`** (via `security.secret_key` / env) — the UI session
-  cookie is signed with it; an unset/dev value lets a forged cookie
-  authenticate to the data endpoints.
+- **Set `FLASK_SECRET`** (in `.env`; it's required — no default) — the UI
+  session cookie is signed with it; an unset value leaves cookies unsigned
+  and lets a forged cookie authenticate to the data endpoints.
 - Use strong, unique passwords and store them hashed.
 - **SSO:** assign the Entra app to a specific group (not "all users") so only
   authorized operators can sign in; set `sso.redirect_uri` to match the
@@ -860,7 +860,7 @@ Rules:
 |----------|---------|-------------|
 | `TAXII_CONFIG` | `./config.yaml` | Path to configuration file |
 | `TAXII_ENV_FILE` | `./.env` (next to server.py) | Path to the .env file |
-| `FLASK_SECRET` | `dev-secret-key-change-in-production` | Flask secret key (signs UI session + SSO state cookies) |
+| `FLASK_SECRET` | *(required, no default)* | Flask secret key (signs UI session + SSO state cookies) — set in `.env` |
 | `DATABASE_URL` | `sqlite:///taxii_feed.db` | Database connection URL |
 | `SSO_CLIENT_SECRET` | *(empty)* | Microsoft Entra client secret (referenced by `sso.client_secret` in config.yaml) |
 

@@ -508,9 +508,12 @@ memory_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = CONFIG.get('security', {}).get(
-    'secret_key', 'dev-secret-key-change-in-production'
-)
+_flask_secret = str(CONFIG.get('security', {}).get('secret_key', '') or '')
+if not _flask_secret:
+    print('WARNING: FLASK_SECRET is not set — set it in .env (see '
+          '.env.example). Session cookies will not be signable until then.',
+          file=sys.stderr)
+app.config['SECRET_KEY'] = _flask_secret
 _taxii_auth_cfg = CONFIG.get('taxii', {}).get('auth', {}) or {}
 app.config['TAXII_AUTH'] = {
     'username': _taxii_auth_cfg.get('username') or '',

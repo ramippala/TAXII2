@@ -32,7 +32,9 @@ database:
 
 security:
   auth_required: false
-  secret_key: ${FLASK_SECRET:-dev-secret-key-change-in-production}
+  # Set FLASK_SECRET in the .env file (see .env.example) — required.
+  # No fallback default: an empty secret means unsignable session cookies.
+  secret_key: ${FLASK_SECRET}
 
 logging:
   level: INFO
