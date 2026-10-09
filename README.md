@@ -49,7 +49,7 @@ Vision One (see [Intel Filter](#intel-filter-filtering-between-server-and-vision
 ### Components
 
 1. **Flask REST API (TAXII 2 Server)** — Hosts TAXII 2.1 protocol endpoints and custom REST endpoints for feed management, UI login/session, community-source control, auth, subscriptions, and health.
-2. **Web UI dashboard** — Single self-contained `intel-ui.html` behind a login (`ui.auth`). Shows the current feed with per-row **source** and **gate** badges, plus **search / type & status filters / pagination** (15 per page), a **withheld-by-filter** panel, a **community sources** panel (status + "Pull now"), and manual intel entry/publish. Serves all intel (the gate only affects what Vision One gets).
+2. **Web UI dashboard** — Single self-contained `intel-ui.html` behind a login (`ui.auth`). Organized into three tabs: **Feed** (the current feed with per-row **source** and **gate** badges, **search / type & status filters / pagination**, withheld-by-filter panel, and manual entry/publish), **Community sources** (puller status + "Pull now", with the same **search + pagination**), and **Import CSV** (GT-team ad-hoc import). Serves all intel (the gate only affects what Vision One gets).
 3. **STIX 2.1 Store** — Stores threat intelligence objects (IPs, file hashes, domains, indicators) in SQLite with an in-memory store for fast polling. Every object carries a `source` tag (`manual` | `otx` | a `taxii_pullers` name) so manual and community intel coexist. Puller sync state (`last_sync`, `last_added`) is persisted in a `puller_state` table so delta pulls survive restarts.
 4. **OTX Community Puller** — Background thread that periodically pulls indicators (IPv4, domains, file hashes) from **AlienVault OTX** public pulses and merges them into the feed tagged `source='otx'`. Off by default; can also be fired on demand from the UI.
 5. **Third-party TAXII 2.1 Pullers** — One generic puller per `taxii_pullers:` entry. Polls `GET {api_root}collections/{collection}/objects/?since=` from any TAXII 2.1 server (Basic auth, `application/taxii+json;version=2.1`), maps STIX 2.1 objects into the feed in merge mode tagged with the puller's `name`. Off by default per entry.
@@ -218,7 +218,10 @@ authenticate with it, so you don't re-enter anything until it expires
 > accept **either** the UI session cookie **or** the TAXII credentials
 > (`X-Taxii-*` headers or HTTP Basic), so curl workflows keep working.
 
-Once logged in, the **TAXII Feed Manager** dashboard lets you:
+Once logged in, the **TAXII Feed Manager** dashboard opens on the **Feed** tab.
+Use the top tabs to switch between **Feed**, **Community sources**, and
+**Import CSV** (each is a deep link — the URL hash updates, so
+`#sources` / `#import` open that tab directly). On the **Feed** tab you can:
 
 1. **Current feed** — an editable table of everything in the feed. Each row
    shows a **source badge** (`manual` / `otx` / a puller name), a **gate
@@ -260,6 +263,11 @@ Once logged in, the **TAXII Feed Manager** dashboard lets you:
 7. **Import CSV (GT team)** — upload a `.csv` with any headers (fuzzy-mapped
    to IPv4 / domain / file hash / indicator); appends to the manual feed. See
    [CSV import](#3-csv-import-gt-team-ad-hoc-intel).
+
+> Items **6 (Community sources)** and **7 (Import CSV)** live on their own
+> tabs, not the Feed tab. The **Community sources** tab has the same
+> client-side **search** (name / kind / collection) and **pagination** as the
+> feed table, so a long list of pullers stays navigable.
 
 The UI is a single self-contained `intel-ui.html` (no CDN/JS dependencies,
 works offline), served directly by the Flask app. The browser talks to the
