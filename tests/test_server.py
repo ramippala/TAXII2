@@ -1319,6 +1319,71 @@ class TestSso(unittest.TestCase):
         self.assertIn('not authorized', r.get_data(as_text=True))
 
 
+class TestDotenv(unittest.TestCase):
+    """Minimal .env loader: parsing, precedence, missing file, path override."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, 'test.env')
+        # Keys the tests touch, saved/restored so nothing leaks between tests.
+        self._keys = ('TEST_DOTENV_A', 'TEST_DOTENV_B', 'TEST_DOTENV_C',
+                      'TAXII_ENV_FILE', 'TEST_DOTENV_OVERRIDE')
+        self._saved = {k: os.environ.pop(k, None) for k in self._keys}
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def _write(self, text):
+        with open(self.path, 'w', encoding='utf-8') as fh:
+            fh.write(text)
+
+    def _load(self):
+        _server._load_dotenv(_server.Path(self.path))
+
+    def test_parses_values_comments_and_quotes(self):
+        self._write(
+            '# a comment line\n'
+            '\n'
+            'TEST_DOTENV_A=plain\n'
+            'TEST_DOTENV_B="double quoted"\n'
+            "TEST_DOTENV_C='single quoted'\n"
+            '   # indented comment\n'
+        )
+        self._load()
+        self.assertEqual(os.environ['TEST_DOTENV_A'], 'plain')
+        self.assertEqual(os.environ['TEST_DOTENV_B'], 'double quoted')
+        self.assertEqual(os.environ['TEST_DOTENV_C'], 'single quoted')
+
+    def test_process_env_always_wins(self):
+        self._write('TEST_DOTENV_A=from-file\n')
+        os.environ['TEST_DOTENV_A'] = 'from-env'
+        self._load()
+        self.assertEqual(os.environ['TEST_DOTENV_A'], 'from-env')
+
+    def test_missing_file_is_noop(self):
+        # Should not raise, and should not set anything.
+        _server._load_dotenv(_server.Path(self.tmp.name) / 'does-not-exist.env')
+        self.assertNotIn('TEST_DOTENV_A', os.environ)
+
+    def test_dotenv_path_default_and_override(self):
+        # Default: .env next to server.py (repo root), unless TAXII_ENV_FILE.
+        self._write('TEST_DOTENV_A=x\n')
+        os.environ['TAXII_ENV_FILE'] = self.path
+        try:
+            self.assertEqual(str(_server._dotenv_path()), self.path)
+        finally:
+            del os.environ['TAXII_ENV_FILE']
+        default = str(_server._dotenv_path())
+        self.assertTrue(default.endswith(os.path.join('TAXII', '.env')))
+        self.assertFalse(default.startswith(self.tmp.name))
+
+
 class _FakeJwkClient:
     """Stand-in for jwt.PyJWKClient: returns the local public key for any token."""
 

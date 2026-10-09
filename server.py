@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 import urllib.error
@@ -62,6 +63,38 @@ CONFIG_PATH = Path(os.environ.get('TAXII_CONFIG', str(Path(__file__).parent / 'c
 _ENV_VAR_RE = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}')
 
 
+def _dotenv_path() -> Path:
+    """Where the app looks for .env: $TAXII_ENV_FILE, else ./.env next to server.py."""
+    return Path(os.environ.get('TAXII_ENV_FILE', str(Path(__file__).resolve().parent / '.env')))
+
+
+def _load_dotenv(path: Path) -> None:
+    """Load KEY=VALUE lines from a .env file into the process environment.
+
+    Minimal on purpose (no python-dotenv, stays offline/zero-dep).
+    - Process env vars ALWAYS win: existing keys are never overwritten.
+    - Blank lines and '#' comments are skipped; a missing file is a no-op.
+    - Values may be wrapped in single or double quotes.
+    """
+    try:
+        if not path.is_file():
+            return
+        with open(path, 'r', encoding='utf-8-sig') as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, _, value = line.partition('=')
+                key = key.strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                    value = value[1:-1]
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError as exc:
+        print(f'WARNING: could not read .env file {path}: {exc}', file=sys.stderr)
+
+
 def _resolve_value(value: Any) -> Any:
     """Resolve ${ENV_VAR} and ${ENV_VAR:-default} placeholders in config values."""
     if isinstance(value, str):
@@ -77,7 +110,13 @@ def _resolve_value(value: Any) -> Any:
 
 
 def load_config() -> Dict[str, Any]:
-    """Load configuration from YAML file."""
+    """Load configuration from YAML file.
+
+    A .env file is loaded into the environment first (if present) so that
+    ${ENV_VAR} / ${ENV_VAR:-default} placeholders below resolve against it.
+    Process env vars always take precedence over .env values.
+    """
+    _load_dotenv(_dotenv_path())
     with open(CONFIG_PATH, 'r') as fh:
         raw = yaml.safe_load(fh) or {}
     return _resolve_value(raw)

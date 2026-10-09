@@ -286,12 +286,13 @@ uses a signed short-lived `state` cookie + PKCE to stop CSRF/replay.
 3. **Certificates & secrets → New client secret** → copy the value.
 4. **Overview** → note the Application (client) ID and Tenant ID.
 5. **Users and groups** (the enterprise app) → add the group of allowed users.
-6. In `config.yaml`, set `sso.enabled: true`, `tenant`, `client_id`,
-   `client_secret`, and `redirect_uri` (must exactly match one from step 2),
-   then restart the server.
+6. In `config.yaml`, set `sso.enabled: true`, `tenant`, `client_id`, and
+   `redirect_uri` (must exactly match one from step 2). Put the client
+   secret in `.env` (see `.env.example`), then restart the server.
 
-> Keep `client_secret` out of git — point it at an env var
-> (`${SSO_CLIENT_SECRET:-}`) or fill it in on the host.
+> Keep `client_secret` out of git — config.yaml references
+> `${SSO_CLIENT_SECRET:-}`, which is filled from the `.env` file
+> (git-ignored) or the process environment (which always wins).
 
 ### SSO endpoints
 
@@ -835,12 +836,33 @@ domain/UPN/group allow-lists, and session-cookie issuance on success).
 
 ## Environment Variables
 
+### `.env` file (recommended for secrets)
+
+`server.py` loads a `.env` file at startup (built-in minimal loader — no
+`python-dotenv` dependency). Copy the template and fill it in:
+
+```bash
+cp .env.example .env
+# edit .env: set FLASK_SECRET and (for SSO) SSO_CLIENT_SECRET
+```
+
+Rules:
+
+- **Location:** `.env` next to `server.py`, or point `TAXII_ENV_FILE` at a
+  different path.
+- **Process env always wins** over `.env` — `export FOO=...` in your shell
+  (or a systemd `Environment=`) still overrides the file.
+- A missing `.env` is fine; `${VAR:-default}` fallbacks in `config.yaml` apply.
+- `.env` is **git-ignored**. The committed `.env.example` holds the keys
+  with empty values + comments; real values live only on the host.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TAXII_CONFIG` | `./config.yaml` | Path to configuration file |
+| `TAXII_ENV_FILE` | `./.env` (next to server.py) | Path to the .env file |
 | `FLASK_SECRET` | `dev-secret-key-change-in-production` | Flask secret key (signs UI session + SSO state cookies) |
 | `DATABASE_URL` | `sqlite:///taxii_feed.db` | Database connection URL |
-| `SSO_CLIENT_SECRET` | *(empty)* | Microsoft Entra client secret, if you reference `${SSO_CLIENT_SECRET}` in `config.yaml` |
+| `SSO_CLIENT_SECRET` | *(empty)* | Microsoft Entra client secret (referenced by `sso.client_secret` in config.yaml) |
 
 ## Troubleshooting
 

@@ -154,8 +154,8 @@ ui:
 #   3. Overview -> note the Application (client) ID and Tenant ID.
 #   4. (Access) Enterprise application for this app -> Users and groups ->
 #      Add users/groups = the group of allowed operators.
-#   5. Fill in client_id / tenant / client_secret / redirect_uri below, set
-#      enabled: true, restart the server.
+#   5. Fill in client_id / tenant / redirect_uri below, put client_secret
+#      in the .env file (see .env.example), set enabled: true, restart.
 #
 # redirect_uri must EXACTLY match one registered in the app (scheme, host,
 # port, path). For local testing use the http://localhost:5000 one.
@@ -164,7 +164,7 @@ sso:
   enabled: false
   tenant: 'common'              # your tenant ID (GUID) or name; 'common' = any org tenant
   client_id: ''                 # Application (client) ID from the app registration
-  client_secret: ''             # client secret VALUE (or ${SSO_CLIENT_SECRET:-})
+  client_secret: '${SSO_CLIENT_SECRET:-}'   # put the value in .env (see .env.example)
   redirect_uri: 'http://localhost:5000/ui/sso/callback'
   # issuer: ''                  # optional explicit ID-token issuer (default: auto)
   # allowed_domains: ['contoso.com']   # only these UPN/email domains
