@@ -1,0 +1,127 @@
+# TAXII Server Configuration
+server:
+  host: '0.0.0.0'
+  port: 5000
+  debug: false
+  cors_origins: ['*']
+
+database:
+  # --- Development default: in-process SQLite (zero setup, single writer) ---
+  url: sqlite:///taxii_feed.db
+
+  # --- PRODUCTION: point at a real database instead of SQLite. ---
+  # Recommended: PostgreSQL (best concurrent read/write — Vision One polls
+  # while the poller/ingest writes). MariaDB/MySQL is a fine alternative if
+  # that's your org standard.
+  #
+  #   PostgreSQL  (pip install psycopg2-binary):
+  #   url: postgresql+psycopg2://${DB_USER}:${DB_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+  #
+  #   MariaDB/MySQL (pip install PyMySQL):
+  #   url: mysql+pymysql://${DB_USER}:${DB_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+  #
+  # ${VAR:-default} placeholders are resolved from the environment at
+  # startup, so keep credentials in env vars, not in this file.
+  #
+  # url: postgresql+psycopg2://taxii:CHANGE_ME@localhost:5432/taxii_feed
+  #
+  # Connection pool (only used for server databases, ignored by SQLite):
+  pool_size: 5
+  max_overflow: 10
+  connection_timeout: 30
+
+security:
+  auth_required: false
+  secret_key: ${FLASK_SECRET:-dev-secret-key-change-in-production}
+
+logging:
+  level: INFO
+  format: '[%(asctime)s] %(levelname)s: %(message)s'
+
+taxii:
+  protocol_version: '2.1'
+  response_format: 'STIX_JSON'
+  max_objects: 10000
+  bundle_id: 'Bundle-{timestamp}'
+  # === The ONE place Vision One is configured on THIS server ===
+  # Trend Micro Vision One is a TAXII 2.1 CLIENT. It polls this server's
+  #   http://<this-server>:5000/taxii2/
+  # using the HTTP Basic credentials below (username + password).
+  # Collection id:  threat-intel
+  collection_id: 'threat-intel'
+  collection_title: 'Custom Threat Intelligence Feed'
+  # TAXII client credentials (HTTP Basic) — enter these in Vision One
+  auth:
+    username: 'admin'
+    password: 'admin'
+
+# ---------------------------------------------------------------------------
+# INTEL FILTER — the gate between THIS server and Vision One
+#   OTX -> this server -> [intel_filter] -> Vision One
+#
+# This is a READ-TIME gate applied only to the /taxii2/ collection that
+# Vision One polls. Every object stays stored in the DB (auditable); the
+# filter only decides what Vision One is actually served, to reduce false
+# positives. It applies to COMMUNITY-sourced intel only (see
+# community_sources) — your manually-fed intel (web UI / API, source
+# 'manual') always passes. The web UI shows all stored intel regardless.
+#
+# All four rules below are toggles. Defaults = private-IP drop ON and a
+# 30-day freshness window ON; confidence floor OFF; blocklist empty.
+# ---------------------------------------------------------------------------
+intel_filter:
+  # Which source tags are "community" and therefore gated. Manual is never
+  # gated no matter what. (Add more if you later pull other communities.)
+  community_sources: ['otx']
+
+  # 1) Drop non-routable / special-use IPv4 addresses (10/8, 172.16/12,
+  #    192.168/16, 127/8, 169.254/16, 0/8, 240/4, mapped-v6, CGNAT, reserved).
+  #    These dominate OTX honeypot feeds and are the top source of noise.
+  drop_private_ips: true
+
+  # 2) Freshness window: withhold community objects last seen/modified more
+  #    than N days ago. Set null (or omit) to disable.
+  freshness_days: 30
+
+  # 3) Confidence floor: withhold community objects below this confidence.
+  #    Set null to disable. (OTX community objects default to confidence 70.)
+  min_confidence: null
+
+  # 4) Explicit blocklist: exact values to always withhold (case-insensitive
+  #    match on IP / domain / hash / name). E.g. your internal ranges or
+  #    example.com. Leave empty to disable.
+  blocklist: []
+    # - '10.20.0.0/8'   # NOTE: single values today, not CIDR — see README
+    # - 'example.com'
+
+# ---------------------------------------------------------------------------
+# OPTIONAL background pollers — BOTH are off by default. Neither of these is
+# how Vision One works; Vision One polls /taxii2/ on its own (see taxii.auth).
+#
+# 1) otx: pulls community threat intel FROM AlienVault OTX (public pulses /
+#    indicators) into this feed, in merge mode tagged source='otx'.
+#    It never wipes your manual/web-UI intel, and a UI save never wipes
+#    OTX intel. Data flow: OTX -> this server -> Vision One.
+# 2) self_check (formerly "vision_one"): a self-test that polls this
+#    server's OWN /feed endpoint to confirm it stays reachable. Not Vision One.
+# ---------------------------------------------------------------------------
+
+otx:
+  enabled: false               # set true to start pulling community intel from OTX
+  base_url: 'https://otx.alienvault.com'   # OTX API base (no trailing slash)
+  api_key: ''                  # optional free OTX API key (raises rate limits)
+  poll_interval: 300           # seconds between poll cycles (5 min)
+  max_pulses: 25               # recently-updated pulses inspected per poll
+  min_indicator_count: 1       # skip pulses with fewer indicators than this
+  max_indicators_per_pulse: 1000
+  max_indicators_per_poll: 5000
+  object_types: ['ipv4-addr', 'domain-name', 'file-hash']
+
+self_check:
+  enabled: false
+  base_url: 'http://127.0.0.1:5000'
+  poll_interval: 60
+
+subscriptions:
+  max_per_client: 10
+  timeout: 300

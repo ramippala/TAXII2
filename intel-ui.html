@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TAXII Feed Manager</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #1a2129; --panel2: #212a35;
+    --border: #2e3a48; --text: #d8e1ea; --muted: #8b98a5;
+    --accent: #2f81f7; --ok: #3fb950; --warn: #d29922; --err: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    padding: 24px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px; margin-bottom: 16px;
+  }
+  .panel h2 {
+    font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--muted); margin: 0 0 12px;
+  }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  label { font-size: 13px; color: var(--muted); margin-right: 6px; }
+  input, select {
+    background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; font-size: 14px; outline: none;
+  }
+  input:focus, select:focus { border-color: var(--accent); }
+  input[type=text], input[type=password] { min-width: 220px; }
+  button {
+    background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+    padding: 8px 16px; font-size: 14px; cursor: pointer;
+  }
+  button:hover { filter: brightness(1.1); }
+  button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  button.danger { background: var(--err); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+  tr:last-child td { border-bottom: 0; }
+  .type { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--border); }
+  .type.ipv4-addr { color: #58a6ff; }
+  .type.domain-name { color: #d2a8ff; }
+  .type.file-hash { color: #ffa657; }
+  .type.indicator { color: var(--warn); }
+  .src { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; margin-left: 6px; vertical-align: middle; }
+  .src.otx { color: #58a6ff; border-color: #2b4a6b; }
+  .src.manual { color: var(--ok); border-color: #2b4a35; }
+  .gate { display: inline-block; font-size: 11px; border-radius: 4px; padding: 1px 6px; margin-left: 6px; vertical-align: middle; }
+  .gate.served { color: var(--ok); border: 1px solid #2b4a35; }
+  .gate.withheld { color: var(--err); border: 1px solid #6b2b2b; background: rgba(248,81,73,.08); }
+  .reason { color: var(--muted); font-size: 12px; }
+  .mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13px; }
+  .msg { padding: 10px 12px; border-radius: 6px; font-size: 14px; margin-top: 12px; display: none; white-space: pre-wrap; }
+  .msg.ok { display: block; background: rgba(63,185,80,.12); border: 1px solid rgba(63,185,80,.4); color: var(--ok); }
+  .msg.err { display: block; background: rgba(248,81,73,.12); border: 1px solid rgba(248,81,73,.4); color: var(--err); }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  td .del { background: transparent; color: var(--err); border: 0; padding: 0 4px; font-size: 15px; cursor: pointer; }
+  .count { color: var(--muted); font-size: 13px; }
+  input[type=checkbox] { accent-color: var(--accent); width: 16px; height: 16px; }
+</style>
+</head>
+<body>
+  <h1>TAXII Feed Manager</h1>
+  <div class="sub">Feed STIX 2.1 threat intel (IP / domain / file hash) into the TAXII server</div>
+
+  <!-- Auth -->
+  <div class="panel">
+    <h2>Server</h2>
+    <div class="row">
+      <div>
+        <label for="base">Server</label>
+        <input type="text" id="base" value="">
+      </div>
+      <div>
+        <label for="user">Username</label>
+        <input type="text" id="user" placeholder="TAXII username" autocomplete="off">
+      </div>
+      <div>
+        <label for="pass">Password</label>
+        <input type="password" id="pass" placeholder="TAXII password" autocomplete="off">
+      </div>
+      <button id="btnTest" class="ghost">Connect</button>
+    </div>
+    <div class="hint">Server is pre-filled with this page's origin. Credentials are the
+      <span class="mono">taxii.auth</span> values from config.yaml — sent only as
+      <span class="mono">X-Taxii-*</span> headers to this server.</div>
+  </div>
+
+  <!-- Current feed -->
+  <div class="panel">
+    <h2>Current feed</h2>
+    <div class="row" style="margin-bottom:12px">
+      <button id="btnLoad" class="ghost">Load current feed</button>
+      <button id="btnAdd" class="ghost">+ Add new entry</button>
+      <span class="count" id="feedCount"></span>
+    </div>
+    <table id="table" style="display:none">
+      <thead>
+        <tr>
+          <th style="width:32px"><input type="checkbox" id="chkAll" title="Select all" checked></th>
+          <th>Type</th><th>Value</th><th>Labels</th><th>Confidence</th><th>ID</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <div class="hint" id="emptyHint">No entries yet. Load the current feed, or add new entries below.</div>
+  </div>
+
+  <!-- Withheld by filter (community intel gated before Vision One) -->
+  <div class="panel" id="withheldPanel" style="display:none">
+    <h2>Withheld by filter</h2>
+    <div class="hint" style="margin:0 0 10px">
+      Community-sourced objects (e.g. OTX) the intel filter is keeping
+      <b>out of Vision One</b>. These are still stored and shown in the feed
+      above; nothing is deleted. Loosen the matching rule in
+      <span class="mono">config.yaml</span> → <span class="mono">intel_filter:</span>
+      to release one, then restart the server.
+    </div>
+    <table id="withheldTable">
+      <thead>
+        <tr><th>Type</th><th>Value</th><th>Reason</th><th>Source</th></tr>
+      </thead>
+      <tbody id="withheldBody"></tbody>
+    </table>
+  </div>
+
+  <!-- Save -->
+  <div class="panel">
+    <h2>Publish</h2>
+    <div class="row">
+      <button id="btnSave">Save feed (replace)</button>
+      <button id="btnPurge" class="danger">Purge all</button>
+    </div>
+    <div class="hint">Saving replaces the entire feed with the <b>checked</b> entries below
+      (unchecked entries are removed). This is how the server's feed model works.</div>
+    <div id="msg" class="msg"></div>
+  </div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+
+// Server field defaults to this page's origin when served by the TAXII server.
+$("base").value = location.origin;
+
+function authHeaders() {
+  return {
+    "X-Taxii-Username": $("user").value.trim(),
+    "X-Taxii-Password": $("pass").value,
+  };
+}
+
+function base() {
+  return $("base").value.replace(/\/+$/, "");
+}
+
+function showMsg(text, ok) {
+  const m = $("msg");
+  m.className = "msg " + (ok ? "ok" : "err");
+  m.textContent = text;
+}
+
+function autoId(type, value) {
+  if (type === "ipv4-addr") return "ipv4-addr--" + value.replace(/\./g, "-");
+  if (type === "domain-name") return "domain-name--" + value.replace(/\./g, "-");
+  if (type === "file-hash") return "file-hash--" + value.slice(0, 16);
+  return "indicator--" + value.slice(0, 16);
+}
+
+// Build the per-type STIX payload the server expects.
+function buildObject(type, value) {
+  if (type === "ipv4-addr") return { "ipv4-addr": { value } };
+  if (type === "domain-name") return { "domain-name": { value } };
+  if (type === "file-hash") return { hash_value: { algorithm: hashAlgo(value), value } };
+  return { indicator: { value } };
+}
+
+function hashAlgo(v) {
+  return { 32: "md5", 40: "sha1", 64: "sha256" }[v.length] || "sha256";
+}
+
+function validateValue(type, value) {
+  if (!value) return "Value is required";
+  if (type === "ipv4-addr" && !/^\d{1,3}(\.\d{1,3}){3}$/.test(value))
+    return "Not a valid IPv4 address";
+  if (type === "domain-name" && !/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(value))
+    return "Not a valid FQDN (e.g. evil.example.com)";
+  if (type === "file-hash" && !/^[0-9a-f]{32}|^[0-9a-f]{40}|^[0-9a-f]{64}$/i.test(value))
+    return "Not a valid MD5/SHA-1/SHA-256 hash";
+  return null;
+}
+
+function rowElement(o) {
+  const tr = document.createElement("tr");
+
+  const cChk = document.createElement("td");
+  const chk = document.createElement("input");
+  chk.type = "checkbox"; chk.checked = true; chk.dataset.kind = o.kind || "new";
+  cChk.appendChild(chk);
+
+  const cType = document.createElement("td");
+  const sel = document.createElement("select");
+  ["ipv4-addr", "domain-name", "file-hash", "indicator"].forEach(t => {
+    const op = document.createElement("option");
+    op.value = t; op.textContent = t;
+    if (o.type === t) op.selected = true;
+    sel.appendChild(op);
+  });
+  sel.addEventListener("change", () => syncRow(tr, sel.value, $("val-" + tr.dataset.idx) ? $("val-" + tr.dataset.idx).value : cVal.textContent));
+  cType.appendChild(sel);
+
+  // Source + gate badges (only for loaded "existing" rows; new rows are manual/served).
+  if (o.kind === "existing") {
+    const src = o.source || "manual";
+    const srcSpan = document.createElement("span");
+    srcSpan.className = "src " + src; srcSpan.textContent = src;
+    cType.appendChild(srcSpan);
+    const gate = document.createElement("span");
+    if (o.gated) {
+      gate.className = "gate withheld"; gate.textContent = "withheld";
+      gate.title = o.gate_reason_label || "";
+    } else {
+      gate.className = "gate served"; gate.textContent = "served";
+    }
+    cType.appendChild(gate);
+  }
+
+  const cVal = document.createElement("td");
+  const inp = document.createElement("input");
+  inp.type = "text"; inp.value = o.value || o.name || ""; inp.placeholder = "value";
+  inp.style.minWidth = "240px";
+  inp.addEventListener("input", () => { if (tr.dataset.newId) { tr.dataset.id = autoId(sel.value, inp.value.trim()); syncIdCell(tr); } });
+  cVal.appendChild(inp);
+
+  const cLbl = document.createElement("td");
+  const lbl = document.createElement("input");
+  lbl.type = "text"; lbl.value = (o.labels || []).join(", "); lbl.placeholder = "comma,separated";
+  lbl.style.minWidth = "160px";
+  cLbl.appendChild(lbl);
+
+  const cConf = document.createElement("td");
+  const conf = document.createElement("input");
+  conf.type = "number"; conf.min = 0; conf.max = 100; conf.value = o.confidence ?? 0;
+  conf.style.width = "80px";
+  cConf.appendChild(conf);
+
+  const cId = document.createElement("td");
+  cId.className = "mono"; cId.textContent = o.id || autoId(sel.value, inp.value || "");
+  tr.dataset.id = o.id || cId.textContent;
+  tr.dataset.newId = o.kind === "new" ? "1" : "";
+
+  const cDel = document.createElement("td");
+  const del = document.createElement("button");
+  del.className = "del"; del.textContent = "\u00d7"; del.title = "Remove entry";
+  del.addEventListener("click", () => { tr.remove(); refreshCount(); });
+  cDel.appendChild(del);
+
+  tr.append(cChk, cType, cVal, cLbl, cConf, cId, cDel);
+  refreshCount();
+  return tr;
+}
+
+function syncIdCell(tr) {
+  const cells = tr.children;
+  cells[5].textContent = tr.dataset.id;
+}
+
+function syncRow(tr, type, value) {
+  // When type changes on a new row, regenerate the id and keep the value.
+  const inp = tr.children[2].querySelector("input");
+  if (tr.dataset.newId) { tr.dataset.id = autoId(type, (value || inp.value).trim()); syncIdCell(tr); }
+}
+
+function refreshCount() {
+  const rows = document.querySelectorAll("#tbody tr");
+  const checked = document.querySelectorAll("#tbody tr input[type=checkbox]:checked").length;
+  $("feedCount").textContent = rows.length ? `${checked} of ${rows.length} selected` : "";
+  $("table").style.display = rows.length ? "table" : "none";
+  $("emptyHint").style.display = rows.length ? "none" : "block";
+}
+
+function collectRows() {
+  const out = [];
+  document.querySelectorAll("#tbody tr").forEach(tr => {
+    const chk = tr.children[0].querySelector("input");
+    if (!chk.checked) return;
+    const type = tr.children[1].querySelector("select").value;
+    const value = tr.children[2].querySelector("input").value.trim();
+    const labels = tr.children[3].querySelector("input").value.split(",").map(s => s.trim()).filter(Boolean);
+    const confidence = parseInt(tr.children[4].querySelector("input").value || "0", 10);
+    out.push({ id: tr.dataset.id, type, value, labels, confidence, name: null });
+  });
+  return out;
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(base() + path, {
+    ...opts,
+    headers: { "Content-Type": "application/json", ...authHeaders(), ...(opts.headers || {}) },
+  });
+  let body = null;
+  try { body = await res.json(); } catch (e) { /* xml responses have no json */ }
+  return { status: res.status, body };
+}
+
+async function connect() {
+  try {
+    const r = await api("/health");
+    if (r.status === 200) showMsg(`Connected. Objects in feed: ${r.body.objects_count} | DB: ${r.body.database}`, true);
+    else showMsg(`Unexpected status ${r.status}`, false);
+  } catch (e) {
+    showMsg("Cannot reach server: " + e.message, false);
+  }
+}
+
+async function loadFeed() {
+  try {
+    const r = await api("/objects");
+    if (r.status !== 200) { showMsg(`Load failed (HTTP ${r.status}) — check credentials`, false); return; }
+    $("tbody").innerHTML = "";
+    const objects = r.body.objects || [];
+    objects.forEach(o => {
+      const kind = "existing";
+      let value = o.value;
+      if (o.type === "file-hash" && !value) value = o.id; // fallback display
+      $("tbody").appendChild(rowElement({ ...o, value, kind }));
+    });
+    refreshCount();
+    renderWithheld(objects);
+    const wh = r.body.withheld_count || 0;
+    showMsg(
+      `Loaded ${r.body.count} object(s): ${r.body.served_count} served to Vision One, ` +
+      `${wh} withheld by the filter. Uncheck entries to drop them on save.`,
+      true
+    );
+  } catch (e) {
+    showMsg("Load failed: " + e.message, false);
+  }
+}
+
+function renderWithheld(objects) {
+  const body = $("withheldBody");
+  const panel = $("withheldPanel");
+  body.innerHTML = "";
+  const withheld = objects.filter(o => o.gated);
+  if (!withheld.length) { panel.style.display = "none"; return; }
+  panel.style.display = "block";
+  withheld.forEach(o => {
+    const tr = document.createElement("tr");
+
+    const t = document.createElement("td");
+    const typeSpan = document.createElement("span");
+    typeSpan.className = "type " + o.type; typeSpan.textContent = o.type;
+    t.appendChild(typeSpan);
+
+    const v = document.createElement("td");
+    v.className = "mono"; v.textContent = o.value || o.id;
+
+    const reason = document.createElement("td");
+    reason.className = "reason";
+    reason.textContent = o.gate_reason_label || o.gate_reason || "withheld";
+
+    const src = document.createElement("td");
+    const srcSpan = document.createElement("span");
+    srcSpan.className = "src " + (o.source || "otx"); srcSpan.textContent = o.source || "otx";
+    src.appendChild(srcSpan);
+
+    tr.append(t, v, reason, src);
+    body.appendChild(tr);
+  });
+}
+
+function addRow() {
+  const o = { type: "ipv4-addr", value: "", labels: [], confidence: 0, kind: "new", id: "ipv4-addr--" };
+  const tr = rowElement(o);
+  tr.dataset.newId = "1";
+  $("tbody").appendChild(tr);
+  refreshCount();
+  tr.children[2].querySelector("input").focus();
+}
+
+async function save() {
+  const rows = collectRows();
+  // Validate before sending.
+  for (const r of rows) {
+    const err = validateValue(r.type, r.value);
+    if (err) { showMsg(`Invalid entry: ${r.type} "${r.value}" — ${err}`, false); return; }
+  }
+  const stix_objects = rows.map(r => {
+    const obj = {
+      id: r.id,
+      type: r.type,
+      object: buildObject(r.type, r.value),
+      labels: r.labels,
+      confidence: r.confidence,
+    };
+    if (r.type === "indicator" && r.name) obj.name = r.name;
+    return obj;
+  });
+
+  try {
+    const r = await api("/feed/ingest", { method: "POST", body: JSON.stringify({ stix_objects }) });
+    if (r.status === 200) {
+      showMsg(`Feed updated: ${r.body.objects_count} object(s) stored.`, true);
+      // Refresh the "existing" markers so ids/confidence come from the server.
+      await loadFeed();
+    } else {
+      showMsg(`Save failed (HTTP ${r.status}): ${r.body && r.body.error || "unknown error"}`, false);
+    }
+  } catch (e) {
+    showMsg("Save failed: " + e.message, false);
+  }
+}
+
+async function purge() {
+  if (!confirm("Purge ALL intel from the feed (memory + database)?")) return;
+  try {
+    const r = await api("/feed/purge", { method: "DELETE" });
+    if (r.status === 200) {
+      $("tbody").innerHTML = "";
+      refreshCount();
+      showMsg("Feed purged.", true);
+    } else {
+      showMsg(`Purge failed (HTTP ${r.status})`, false);
+    }
+  } catch (e) {
+    showMsg("Purge failed: " + e.message, false);
+  }
+}
+
+// Keep "select all" in sync
+$("chkAll").addEventListener("change", (e) => {
+  document.querySelectorAll("#tbody tr input[type=checkbox]").forEach(c => c.checked = e.target.checked);
+  refreshCount();
+});
+document.addEventListener("change", (e) => {
+  if (e.target.matches && e.target.matches("#tbody input[type=checkbox]")) refreshCount();
+});
+
+$("btnTest").addEventListener("click", connect);
+$("btnLoad").addEventListener("click", loadFeed);
+$("btnAdd").addEventListener("click", addRow);
+$("btnSave").addEventListener("click", save);
+$("btnPurge").addEventListener("click", purge);
+</script>
+</body>
+</html>

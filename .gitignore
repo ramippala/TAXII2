@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cob]
+*$pytest_cache*
+
+# Virtual environments
+venv/
+ENV/
+.env
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database
+*.db
+*.sqlite
+
+# Logs
+*.log
+logs/
+
+# Testing
+.coverage
+.htmlcov/
+.pytest_cache/
+
+# Temporary files
+*.tmp
+*.temp
