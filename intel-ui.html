@@ -195,10 +195,12 @@
         plus optional <span class="mono">label(s)</span> and
         <span class="mono">confidence</span> columns. Imports <b>append</b>
         to the manual feed (does not wipe existing rows).
+        New here? <b>Download the sample CSV</b>, edit the values, and upload it back.
       </div>
       <div class="row">
         <input type="file" id="csvFile" accept=".csv,text/csv,text/plain" style="max-width:320px">
         <button id="btnCsvImport" class="ghost" disabled>Import CSV</button>
+        <button id="btnCsvSample" class="ghost" title="Download a ready-to-edit template with all header styles">Download sample CSV</button>
       </div>
       <div id="csvMsg" class="msg" style="margin-top:10px"></div>
     </div>
@@ -617,6 +619,35 @@ async function importCsv() {
   }
 }
 
+// Generates a ready-to-edit template covering every supported header style.
+// Pure client-side (Blob) — works offline, no server asset.
+function downloadCsvSample() {
+  const header = "IP_Address,Destination,malicious_domain,md5,sha1,sha256,labels,confidence";
+  const examples = [
+    // one value per row; fill only the column matching the intel kind.
+    // The hash examples below are real (hash of the empty string) — replace
+    // them with the real IOCs.
+    "203.0.113.10,,,,,,c2,90",
+    ",198.51.100.23,,,,,,",
+    ",,badexample.com,,,,c2,90",
+    ",,,d41d8cd98f00b204e9800998ecf8427e,,,,",
+    ",,,,da39a3ee5e6b4b0d3255bfef95601890afd80709,,malware,80",
+    ",,,,,e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,apt,70",
+  ];
+  const csv = [header].concat(examples).join("\n") + "\n";
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "taxii-feed-import-sample.csv";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  $("csvMsg").textContent = "Sample CSV downloaded — edit the values and upload it back.";
+  $("csvMsg").className = "msg ok";
+}
+
 // ---------------------------------------------------------------------------
 // Community sources (third-party TAXII / OTX pulls)
 // ---------------------------------------------------------------------------
@@ -718,6 +749,7 @@ $("csvFile").addEventListener("change", () => {
   $("btnCsvImport").disabled = !$("csvFile").files.length;
 });
 $("btnCsvImport").addEventListener("click", importCsv);
+$("btnCsvSample").addEventListener("click", downloadCsvSample);
 
 init();
 </script>
