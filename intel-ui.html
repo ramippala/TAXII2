@@ -79,6 +79,14 @@
   .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
   td .del { background: transparent; color: var(--err); border: 0; padding: 0 4px; font-size: 15px; cursor: pointer; }
   .count { color: var(--muted); font-size: 13px; }
+  .feedtools { display: flex; gap: 8px; align-items: center; margin: 0 0 10px; flex-wrap: wrap; }
+  .feedtools input[type=search] { flex: 1; min-width: 200px; }
+  .feedtools select { min-width: 130px; }
+  .currange { color: var(--muted); font-size: 12px; margin-left: auto; white-space: nowrap; }
+  .pager { display: flex; gap: 6px; align-items: center; margin-top: 10px; }
+  .pager button { font-size: 13px; padding: 2px 10px; }
+  .pager button:disabled { opacity: .4; }
+  .pager #pgInfo { color: var(--muted); font-size: 12px; }
   input[type=checkbox] { accent-color: var(--accent); width: 16px; height: 16px; }
   .pill { display:inline-block; font-size:11px; border-radius:999px; padding:1px 8px; border:1px solid var(--border); }
   .pill.on { color: var(--ok); border-color:#2b4a35; }
@@ -139,17 +147,39 @@
       <div class="row" style="margin-bottom:12px">
         <button id="btnLoad" class="ghost">Load current feed</button>
         <button id="btnAdd" class="ghost">+ Add new entry</button>
-        <span class="count" id="feedCount"></span>
+      </div>
+      <div class="feedtools">
+        <input type="search" id="feedSearch" placeholder="Search value, label, type or ID…" autocomplete="off">
+        <select id="feedType" title="Filter by type">
+          <option value="">All types</option>
+          <option>ipv4-addr</option>
+          <option>domain-name</option>
+          <option>file-hash</option>
+          <option>indicator</option>
+        </select>
+        <select id="feedStatus" title="Filter by status">
+          <option value="">All statuses</option>
+          <option value="active">Active</option>
+          <option value="revoked">Revoked</option>
+        </select>
+        <span class="currange mono" id="feedRange"></span>
       </div>
       <table id="table" style="display:none">
         <thead>
           <tr>
-            <th style="width:32px"><input type="checkbox" id="chkAll" title="Select all" checked></th>
+            <th style="width:32px"><input type="checkbox" id="chkAll" title="Select all matching" checked></th>
             <th>Type</th><th>Value</th><th>Labels</th><th>Confidence</th><th>Status</th><th>ID</th><th></th>
           </tr>
         </thead>
         <tbody id="tbody"></tbody>
       </table>
+      <div class="pager" id="feedPager">
+        <button id="pgFirst" class="ghost" title="First page">«</button>
+        <button id="pgPrev" class="ghost" title="Previous page">‹</button>
+        <span class="mono" id="pgInfo"></span>
+        <button id="pgNext" class="ghost" title="Next page">›</button>
+        <button id="pgLast" class="ghost" title="Last page">»</button>
+      </div>
       <div class="hint" id="emptyHint">No entries yet. Load the current feed, or add new entries below.</div>
     </div>
 
@@ -224,6 +254,16 @@
 "use strict";
 
 let SSO_ENABLED = false;
+
+// --- Current feed model (single source of truth for the table) ---
+// All loaded objects live here; the table renders only the current page of
+// the filtered view. Edits write back into this array so nothing is lost
+// across page turns, and Save reads from it (never a filtered DOM slice).
+let feedData = [];          // every loaded object, in server order
+let newRows = [];           // "+ Add new entry" rows (not yet on the server)
+let feedPage = 1;
+const FEED_PAGE_SIZE = 15;
+let feedFilter = { q: "", type: "", status: "" };
 
 const $ = (id) => document.getElementById(id);
 
@@ -343,10 +383,14 @@ async function doLogin() {
 
 async function doLogout() {
   try { await api("/ui/logout", { method: "POST" }); } catch (e) {}
+  feedData = [];
+  newRows = [];
+  feedFilter = { q: "", type: "", status: "" };
+  feedPage = 1;
   $("tbody").innerHTML = "";
   $("withheldBody").innerHTML = "";
   $("pullerBody").innerHTML = "";
-  refreshCount();
+  renderFeed();
   showLogin();
 }
 
@@ -370,7 +414,6 @@ function rowElement(o) {
     if (o.type === t) op.selected = true;
     sel.appendChild(op);
   });
-  sel.addEventListener("change", () => syncRow(tr, sel.value, cVal.textContent));
   cType.appendChild(sel);
 
   // Source + gate badges (only for loaded "existing" rows; new rows are manual/served).
@@ -435,11 +478,26 @@ function rowElement(o) {
   const cDel = document.createElement("td");
   const del = document.createElement("button");
   del.className = "del"; del.textContent = "\u00d7"; del.title = "Remove entry";
-  del.addEventListener("click", () => { tr.remove(); refreshCount(); });
+  del.addEventListener("click", () => removeRow(tr));
   cDel.appendChild(del);
 
   tr.append(cChk, cType, cVal, cLbl, cConf, cStatus, cId, cDel);
-  refreshCount();
+  tr.dataset.key = o._key || o.id;
+  // Keep the model in sync as the user edits, then re-render (updates the
+  // count and applies the active filter/page). 'change' fires on blur/commit,
+  // so typing never loses focus.
+  const sync = () => { syncToModel(tr); renderFeed(); };
+  chk.addEventListener("change", sync);
+  sel.addEventListener("change", () => {
+    if (tr.dataset.newId) { tr.dataset.id = autoId(sel.value, inp.value.trim()); syncIdCell(tr); }
+    sync();
+  });
+  // New rows: keep the generated STIX id in sync with the typed value live
+  // (textContent-only, no re-render, so typing never loses focus).
+  inp.addEventListener("input", () => { if (tr.dataset.newId) { tr.dataset.id = autoId(sel.value, inp.value.trim()); syncIdCell(tr); } });
+  inp.addEventListener("change", sync);
+  lbl.addEventListener("change", sync);
+  conf.addEventListener("change", sync);
   return tr;
 }
 
@@ -463,6 +521,15 @@ async function toggleRevoke(tr, id, toRevoked, badge, btn) {
         showMsg(`Reinstated ${id} — served to Vision One again.`, true);
       }
       tr.dataset.revoked = toRevoked ? "1" : "";
+      // Reflect in the model so the Status filter + counts update at once.
+      const mi = feedData.findIndex(o => o.id === id);
+      if (mi >= 0) {
+        feedData[mi] = Object.assign({}, feedData[mi], {
+          revoked: toRevoked,
+          revoked_at: toRevoked ? now : null,
+        });
+      }
+      renderFeed();
     } else {
       showMsg(`Revoke failed (HTTP ${r.status}): ${r.body && r.body.error}`, false);
     }
@@ -475,32 +542,108 @@ async function toggleRevoke(tr, id, toRevoked, badge, btn) {
 
 function syncIdCell(tr) { tr.children[6].textContent = tr.dataset.id; }
 
-function syncRow(tr, type, value) {
-  const inp = tr.children[2].querySelector("input");
-  if (tr.dataset.newId) { tr.dataset.id = autoId(type, (value || inp.value).trim()); syncIdCell(tr); }
+// Read a row's editable fields from its DOM into a plain object.
+function rowFromTr(tr) {
+  return {
+    _key: tr.dataset.key || tr.dataset.id || "",
+    id: tr.dataset.id || "",
+    type: tr.children[1].querySelector("select").value,
+    value: tr.children[2].querySelector("input").value.trim(),
+    labels: tr.children[3].querySelector("input").value.split(",").map(s => s.trim()).filter(Boolean),
+    confidence: parseInt(tr.children[4].querySelector("input").value || "0", 10),
+    checked: tr.children[0].querySelector("input").checked,
+  };
 }
 
-function refreshCount() {
-  const rows = document.querySelectorAll("#tbody tr");
-  const checked = document.querySelectorAll("#tbody tr input[type=checkbox]:checked").length;
-  $("feedCount").textContent = rows.length ? `${checked} of ${rows.length} selected` : "";
-  $("table").style.display = rows.length ? "table" : "none";
-  $("emptyHint").style.display = rows.length ? "none" : "block";
+function matches(o, f) {
+  if (f.type && o.type !== f.type) return false;
+  if (f.status === "active" && o.revoked) return false;
+  if (f.status === "revoked" && !o.revoked) return false;
+  if (f.q) {
+    const hay = (o.value + " " + (o.labels || []).join(" ") + " " + o.type + " " + o.id).toLowerCase();
+    if (!hay.includes(f.q)) return false;
+  }
+  return true;
 }
 
-function collectRows() {
-  const out = [];
-  document.querySelectorAll("#tbody tr").forEach(tr => {
-    const chk = tr.children[0].querySelector("input");
-    if (!chk.checked) return;
-    const type = tr.children[1].querySelector("select").value;
-    const value = tr.children[2].querySelector("input").value.trim();
-    const labels = tr.children[3].querySelector("input").value.split(",").map(s => s.trim()).filter(Boolean);
-    const confidence = parseInt(tr.children[4].querySelector("input").value || "0", 10);
-    out.push({ id: tr.dataset.id, type, value, labels, confidence, name: null });
-  });
-  return out;
+function feedMatched() {
+  return feedData.filter(o => matches(o, feedFilter));
 }
+
+function filteredData() {
+  return feedMatched().concat(newRows.filter(o => matches(o, feedFilter)));
+}
+
+// Write an editable row's DOM values back into its model entry.
+function syncToModel(tr) {
+  const rec = rowFromTr(tr);
+  if (tr.dataset.newId) {
+    const ni = newRows.findIndex(n => n._key === tr.dataset.key);
+    if (ni >= 0) newRows[ni] = rec; else newRows.push(rec);
+    return;
+  }
+  const i = feedData.findIndex(o => o.id === tr.dataset.id);
+  if (i >= 0) {
+    rec._key = tr.dataset.id;
+    feedData[i] = Object.assign({}, feedData[i], rec);
+  }
+}
+
+function removeRow(tr) {
+  if (tr.dataset.newId) {
+    const ni = newRows.findIndex(n => n._key === tr.dataset.key);
+    if (ni >= 0) newRows.splice(ni, 1);
+  } else {
+    const i = feedData.findIndex(o => o.id === tr.dataset.id);
+    if (i >= 0) feedData.splice(i, 1);
+  }
+  renderFeed();
+}
+
+// Render the current page of the filtered feed; hide the table if empty.
+function renderFeed() {
+  const filtered = filteredData();
+  const totalPages = Math.max(1, Math.ceil(filtered.length / FEED_PAGE_SIZE));
+  feedPage = Math.min(Math.max(1, feedPage), totalPages);
+  const start = (feedPage - 1) * FEED_PAGE_SIZE;
+  const slice = filtered.slice(start, start + FEED_PAGE_SIZE);
+
+  const tbody = $("tbody");
+  tbody.innerHTML = "";
+  slice.forEach(o => tbody.appendChild(rowElement(o)));
+
+  $("table").style.display = filtered.length ? "table" : "none";
+  $("feedPager").style.display = filtered.length ? "flex" : "none";
+  $("emptyHint").style.display = filtered.length ? "none" : "block";
+
+  const pages = totalPages;
+  const info = filtered.length
+    ? `${start + 1}–${start + slice.length} of ${filtered.length}` +
+      (feedFilter.q || feedFilter.type || feedFilter.status ? ` (filtered from ${feedData.length + newRows.length})` : "")
+    : "no matches";
+  $("pgInfo").textContent = `Page ${feedPage} / ${pages} · ${info}`;
+  $("pgFirst").disabled = feedPage <= 1;
+  $("pgPrev").disabled = feedPage <= 1;
+  $("pgNext").disabled = feedPage >= pages;
+  $("pgLast").disabled = feedPage >= pages;
+
+  const matching = feedMatched();
+  const mChecked = matching.filter(o => o.checked).length;
+  const nChecked = newRows.filter(o => o.checked).length;
+  $("feedRange").textContent = matching.length
+    ? `matching ${matching.length} — ${mChecked} selected` + (newRows.length ? ` · +${nChecked} new` : "")
+    : "";
+  updateChkAll();
+}
+
+function updateChkAll() {
+  const matching = feedMatched();
+  $("chkAll").checked = matching.length > 0 && matching.every(o => o.checked);
+  $("chkAll").indeterminate = matching.some(o => o.checked) && !matching.every(o => o.checked);
+}
+
+function refreshCount() { renderFeed(); }
+function setFeedPage(p) { feedPage = p; renderFeed(); }
 
 async function loadFeed() {
   try {
@@ -510,14 +653,20 @@ async function loadFeed() {
       else showMsg(`Load failed (HTTP ${r.status})`, false);
       return;
     }
-    $("tbody").innerHTML = "";
     const objects = r.body.objects || [];
-    objects.forEach(o => {
-      let value = o.value;
-      if (o.type === "file-hash" && !value) value = o.id; // fallback display
-      $("tbody").appendChild(rowElement({ ...o, value, kind: "existing" }));
-    });
-    refreshCount();
+    feedData = objects.map(o => ({
+      ...o,
+      value: (o.type === "file-hash" && !o.value) ? o.id : (o.value || ""), // fallback display
+      kind: "existing",
+      checked: true,
+    }));
+    newRows = [];
+    feedFilter = { q: "", type: "", status: "" };
+    feedPage = 1;
+    $("feedSearch").value = "";
+    $("feedType").value = "";
+    $("feedStatus").value = "";
+    renderFeed();
     renderWithheld(objects);
     const wh = r.body.withheld_count || 0;
     showMsg(
@@ -556,18 +705,26 @@ function renderWithheld(objects) {
   });
 }
 
+let newSeq = 0;
 function addRow() {
-  const o = { type: "ipv4-addr", value: "", labels: [], confidence: 0, kind: "new", id: "ipv4-addr--" };
-  const tr = rowElement(o);
-  tr.dataset.newId = "1";
-  $("tbody").appendChild(tr);
-  refreshCount();
-  tr.children[2].querySelector("input").focus();
+  const k = "new-" + (++newSeq);
+  newRows.push({ _key: k, id: "ipv4-addr--", type: "ipv4-addr", value: "", labels: [], confidence: 0, checked: true, kind: "new" });
+  // New rows are added after the loaded objects, so jump to the last page
+  // (where the new row lives) — otherwise it would be off-screen on a big feed.
+  feedPage = Math.ceil(filteredData().length / FEED_PAGE_SIZE);
+  renderFeed();
+  const inp = document.querySelector(`#tbody tr[data-key="${k}"] td:nth-child(3) input`);
+  if (inp) inp.focus();
 }
 
 async function save() {
-  const rows = collectRows();
+  // Read from the model (the full set), never a filtered/paged DOM slice,
+  // so saving can never silently drop rows hidden by the current filter/page.
+  const rows = feedData.filter(o => o.checked)
+    .concat(newRows.filter(o => o.checked))
+    .map(o => ({ id: o.id, type: o.type, value: o.value, labels: o.labels || [], confidence: o.confidence ?? 0, name: o.name || null }));
   for (const r of rows) {
+    if (r.type === "indicator") continue; // patterns are free-form
     const err = validateValue(r.type, r.value);
     if (err) { showMsg(`Invalid entry: ${r.type} "${r.value}" — ${err}`, false); return; }
   }
@@ -594,8 +751,9 @@ async function purge() {
   try {
     const r = await api("/feed/purge", { method: "DELETE" });
     if (r.status === 200) {
-      $("tbody").innerHTML = "";
-      refreshCount();
+      feedData = [];
+      newRows = [];
+      renderFeed();
       showMsg("Feed purged.", true);
     } else {
       showMsg(`Purge failed (HTTP ${r.status})`, false);
@@ -748,11 +906,9 @@ async function pullNow(name, btn, result) {
 // ---------------------------------------------------------------------------
 
 $("chkAll").addEventListener("change", (e) => {
-  document.querySelectorAll("#tbody tr input[type=checkbox]").forEach(c => c.checked = e.target.checked);
-  refreshCount();
-});
-document.addEventListener("change", (e) => {
-  if (e.target.matches && e.target.matches("#tbody input[type=checkbox]")) refreshCount();
+  const v = e.target.checked;
+  feedData.forEach(o => { if (matches(o, feedFilter)) o.checked = v; });
+  renderFeed();
 });
 
 $("btnLogin").addEventListener("click", doLogin);
@@ -764,6 +920,30 @@ $("btnLoad").addEventListener("click", loadFeed);
 $("btnAdd").addEventListener("click", addRow);
 $("btnSave").addEventListener("click", save);
 $("btnPurge").addEventListener("click", purge);
+
+// Current feed: search + type/status filters + pagination (client-side).
+$("feedSearch").addEventListener("input", () => {
+  feedFilter.q = $("feedSearch").value.trim().toLowerCase();
+  feedPage = 1;
+  renderFeed();
+});
+$("feedType").addEventListener("change", () => {
+  feedFilter.type = $("feedType").value;
+  feedPage = 1;
+  renderFeed();
+});
+$("feedStatus").addEventListener("change", () => {
+  feedFilter.status = $("feedStatus").value;
+  feedPage = 1;
+  renderFeed();
+});
+$("pgFirst").addEventListener("click", () => setFeedPage(1));
+$("pgPrev").addEventListener("click", () => setFeedPage(feedPage - 1));
+$("pgNext").addEventListener("click", () => setFeedPage(feedPage + 1));
+$("pgLast").addEventListener("click", () => {
+  const pages = Math.max(1, Math.ceil(filteredData().length / FEED_PAGE_SIZE));
+  setFeedPage(pages);
+});
 $("csvFile").addEventListener("change", () => {
   $("btnCsvImport").disabled = !$("csvFile").files.length;
 });

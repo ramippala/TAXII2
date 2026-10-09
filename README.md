@@ -49,7 +49,7 @@ Vision One (see [Intel Filter](#intel-filter-filtering-between-server-and-vision
 ### Components
 
 1. **Flask REST API (TAXII 2 Server)** — Hosts TAXII 2.1 protocol endpoints and custom REST endpoints for feed management, UI login/session, community-source control, auth, subscriptions, and health.
-2. **Web UI dashboard** — Single self-contained `intel-ui.html` behind a login (`ui.auth`). Shows the current feed with per-row **source** and **gate** badges, a **withheld-by-filter** panel, a **community sources** panel (status + "Pull now"), and manual intel entry/publish. Serves all intel (the gate only affects what Vision One gets).
+2. **Web UI dashboard** — Single self-contained `intel-ui.html` behind a login (`ui.auth`). Shows the current feed with per-row **source** and **gate** badges, plus **search / type & status filters / pagination** (15 per page), a **withheld-by-filter** panel, a **community sources** panel (status + "Pull now"), and manual intel entry/publish. Serves all intel (the gate only affects what Vision One gets).
 3. **STIX 2.1 Store** — Stores threat intelligence objects (IPs, file hashes, domains, indicators) in SQLite with an in-memory store for fast polling. Every object carries a `source` tag (`manual` | `otx` | a `taxii_pullers` name) so manual and community intel coexist. Puller sync state (`last_sync`, `last_added`) is persisted in a `puller_state` table so delta pulls survive restarts.
 4. **OTX Community Puller** — Background thread that periodically pulls indicators (IPv4, domains, file hashes) from **AlienVault OTX** public pulses and merges them into the feed tagged `source='otx'`. Off by default; can also be fired on demand from the UI.
 5. **Third-party TAXII 2.1 Pullers** — One generic puller per `taxii_pullers:` entry. Polls `GET {api_root}collections/{collection}/objects/?since=` from any TAXII 2.1 server (Basic auth, `application/taxii+json;version=2.1`), maps STIX 2.1 objects into the feed in merge mode tagged with the puller's `name`. Off by default per entry.
@@ -225,13 +225,25 @@ Once logged in, the **TAXII Feed Manager** dashboard lets you:
    badge** (`served` / `withheld`, with the reason on hover), and a
    **Status** cell (`active` / `revoked`) with a **Revoke / Unrevoke** button
    for marking false positives.
+   - **Search** — filters rows by value, label, type, or ID as you type.
+   - **Type / Status filters** — narrow to one type and/or active/revoked.
+   - **Pagination** — 15 rows per page (first/prev/next/last) so a large
+     feed never runs the page down.
+   All of this is **client-side**: the full feed loads once and is filtered +
+   paged in the browser (no server round-trips, works offline). Edits and
+   deletes write back to the in-memory model, so nothing is lost across page
+   turns. **Save reads the whole feed, not the visible page**, so filtering or
+   paging can never silently drop rows on save. "Select all" acts on every
+   *matching* row (all pages), not just the current one.
 2. **Add new entry** — pick a type (IPv4 / domain / file hash / indicator),
    type the value. IDs and hash algorithms (MD5/SHA-1/SHA-256) are
-   auto-derived, and values are validated.
-3. **Save feed (replace)** — publishes the checked rows. Because manual ingest
-   is *replace* scoped to `source='manual'`, it only affects your manual
-   intel — community (pulled) intel is untouched. Load first and uncheck rows
-   you want to drop.
+   auto-derived, and values are validated. New rows are added on the last page
+   (and that page is shown) so they're never off-screen.
+3. **Save feed (replace)** — publishes the checked rows (the full set,
+   regardless of the current filter/page). Because manual ingest is *replace*
+   scoped to `source='manual'`, it only affects your manual intel — community
+   (pulled) intel is untouched. Uncheck rows you want to drop; the view resets
+   to the full list after a save.
 4. **Purge all** — wipes the feed with a confirmation.
 5. **Withheld by filter** — a panel listing every community object the
    [intel filter](#intel-filter-filtering-between-server-and-vision-one) is
