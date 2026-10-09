@@ -10,7 +10,10 @@ import os
 import io
 import types
 import unittest
+import urllib.parse
 from datetime import datetime, timedelta
+
+import jwt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -1123,6 +1126,210 @@ class TestCsvImport(unittest.TestCase):
         r = self._post_csv("foo,bar\nhello,world\n")
         self.assertEqual(r.status_code, 400)
         self.assertIn('no recognizable rows', r.get_json()['error'])
+
+
+class TestSso(unittest.TestCase):
+    """Microsoft Entra ID OIDC SSO: PKCE redirect, state/nonce, JWT
+    validation (real RS256 with a local key), allow-lists, cookie issue.
+
+    Only the network calls (code exchange) are mocked; token signature
+    verification runs for real against a locally generated RSA key.
+    """
+
+    _SSO_KEYS = ('SSO_ENABLED', 'SSO_TENANT', 'SSO_CLIENT_ID', 'SSO_CLIENT_SECRET',
+                 'SSO_REDIRECT_URI', 'SSO_AUTH_ENDPOINT', 'SSO_ISSUER',
+                 'SSO_ALLOW_DOMAINS', 'SSO_ALLOW_UPNS', 'SSO_ALLOW_GROUPS',
+                 '_sso_jwks_client')
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        app.config['TAXII_AUTH'] = {
+            'username': 'test_taxii_user', 'password': 'test_taxii_pass',
+        }
+        self._saved = {k: getattr(_server, k) for k in self._SSO_KEYS}
+        _server.SSO_ENABLED = True
+        _server.SSO_TENANT = 'test-tenant'
+        _server.SSO_CLIENT_ID = 'test-client-id'
+        _server.SSO_CLIENT_SECRET = 'test-secret'
+        _server.SSO_REDIRECT_URI = 'http://localhost:5000/ui/sso/callback'
+        _server.SSO_AUTH_ENDPOINT = (
+            'https://login.microsoftonline.com/test-tenant/oauth2/v2.0/authorize')
+        _server.SSO_ISSUER = ''
+        _server.SSO_ALLOW_DOMAINS = ()
+        _server.SSO_ALLOW_UPNS = set()
+        _server.SSO_ALLOW_GROUPS = set()
+
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self._priv = priv
+        self._pub = priv.public_key()
+        _server._sso_jwks_client = _FakeJwkClient(self._pub)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(_server, k, v)
+
+    def _id_token(self, **claims):
+        base = {
+            'iss': 'https://login.microsoftonline.com/test-tenant/v2.0',
+            'aud': 'test-client-id',
+            'exp': datetime.utcnow() + timedelta(minutes=5),
+            'iat': datetime.utcnow(),
+            'sub': 'user-sub-123',
+            'nonce': 'nonce-abc',
+            'preferred_username': 'jdoe@contoso.com',
+        }
+        base.update(claims)
+        return jwt.encode(base, self._priv, algorithm='RS256')
+
+    def _set_oauth_cookie(self, state, nonce, code_verifier):
+        token = _server._sso_oauth_state_token(
+            {'state': state, 'nonce': nonce, 'code_verifier': code_verifier})
+        # The Flask test client drops a manual Cookie header; set_cookie()
+        # is the supported way to send cookies.
+        self.client.set_cookie('taxii2_ui_sso', token, domain='localhost')
+
+    def test_sso_disabled_404(self):
+        _server.SSO_ENABLED = False
+        self.assertEqual(self.client.get('/ui/sso').status_code, 404)
+        self.assertEqual(self.client.get('/ui/sso/callback').status_code, 404)
+
+    def test_session_reports_sso(self):
+        body = self.client.get('/ui/session').get_json()
+        self.assertIn('sso', body)
+        self.assertTrue(body['sso']['enabled'])
+
+    def test_sso_start_redirects_with_pkce(self):
+        r = self.client.get('/ui/sso')
+        self.assertEqual(r.status_code, 302)
+        loc = r.headers['Location']
+        self.assertTrue(loc.startswith(_server.SSO_AUTH_ENDPOINT))
+        for frag in ('client_id=test-client-id', 'response_type=code',
+                     'code_challenge_method=S256', 'response_mode=query'):
+            self.assertIn(frag, loc)
+        # oauth state cookie present
+        set_cookies = [h for h in r.headers.getlist('Set-Cookie')
+                       if h.startswith('taxii2_ui_sso=')]
+        self.assertEqual(len(set_cookies), 1)
+        raw = set_cookies[0].split(';', 1)[0].split('=', 1)[1]
+        oauth = _server._oauth_state_serializer.loads(raw, max_age=600)
+        self.assertIn('state', loc)
+        # PKCE: challenge must equal S256(verifier)
+        import base64, hashlib
+        expected = base64.urlsafe_b64encode(
+            hashlib.sha256(oauth['code_verifier'].encode()).digest()
+        ).rstrip(b'=').decode()
+        self.assertIn('code_challenge=' + urllib.parse.quote(expected), loc)
+
+    def test_callback_rejects_state_mismatch(self):
+        self._set_oauth_cookie('state-A', 'nonce-abc', 'verifier-1')
+        r = self.client.get('/ui/sso/callback?code=abc&state=state-B')
+        self.assertEqual(r.status_code, 401)
+        self.assertIn('state mismatch', r.get_data(as_text=True))
+
+    def test_callback_rejects_missing_state_cookie(self):
+        r = self.client.get('/ui/sso/callback?code=abc&state=state-A')
+        self.assertEqual(r.status_code, 401)
+
+    def test_callback_happy_path_sets_session(self):
+        import unittest.mock
+        tok = self._id_token()
+        with unittest.mock.patch.object(
+                _server, '_sso_exchange_code',
+                return_value={'id_token': tok}) as exch:
+            self._set_oauth_cookie('state-X', 'nonce-abc', 'verifier-X')
+            r = self.client.get(
+                '/ui/sso/callback?code=authcode123&state=state-X',
+            )
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(r.headers['Location'], '/')
+        exch.assert_called_once_with('authcode123', 'verifier-X')
+        set_cookies = [h for h in r.headers.getlist('Set-Cookie')]
+        sess = [h for h in set_cookies if h.startswith('taxii2_ui_session=')]
+        self.assertEqual(len(sess), 1)
+        payload = _server._session_serializer.loads(
+            sess[0].split(';', 1)[0].split('=', 1)[1])
+        self.assertEqual(payload['user'], 'jdoe@contoso.com')
+
+    def test_callback_rejects_bad_signature_audience(self):
+        import unittest.mock
+        tok = self._id_token(aud='some-other-app')  # wrong audience
+        with unittest.mock.patch.object(
+                _server, '_sso_exchange_code',
+                return_value={'id_token': tok}):
+            self._set_oauth_cookie('s1', 'nonce-abc', 'v')
+            r = self.client.get(
+                '/ui/sso/callback?code=c&state=s1',
+            )
+        self.assertEqual(r.status_code, 401)
+        self.assertIn('token validation failed', r.get_data(as_text=True))
+
+    def test_callback_rejects_nonce_mismatch(self):
+        import unittest.mock
+        tok = self._id_token(nonce='different-nonce')
+        with unittest.mock.patch.object(
+                _server, '_sso_exchange_code',
+                return_value={'id_token': tok}):
+            self._set_oauth_cookie('s2', 'nonce-abc', 'v')
+            r = self.client.get(
+                '/ui/sso/callback?code=c&state=s2',
+            )
+        self.assertEqual(r.status_code, 401)
+        self.assertIn('token validation failed', r.get_data(as_text=True))
+
+    def test_allowlist_domain(self):
+        _server.SSO_ALLOW_DOMAINS = ('contoso.com',)
+        ok, _ = _server._sso_user_allowed({'preferred_username': 'jdoe@contoso.com'})
+        self.assertTrue(ok)
+        ok, reason = _server._sso_user_allowed({'preferred_username': 'eve@evil.com'})
+        self.assertFalse(ok)
+        self.assertEqual(reason, 'domain not allowed')
+
+    def test_allowlist_upn(self):
+        _server.SSO_ALLOW_UPNS = {'jdoe@contoso.com'}
+        ok, _ = _server._sso_user_allowed({'preferred_username': 'jdoe@contoso.com'})
+        self.assertTrue(ok)
+        ok, _ = _server._sso_user_allowed({'preferred_username': 'other@contoso.com'})
+        self.assertFalse(ok)
+
+    def test_allowlist_groups(self):
+        _server.SSO_ALLOW_GROUPS = {'group-object-1'}
+        ok, _ = _server._sso_user_allowed(
+            {'preferred_username': 'jdoe@contoso.com',
+             'groups': ['group-object-1', 'other']})
+        self.assertTrue(ok)
+        ok, reason = _server._sso_user_allowed(
+            {'preferred_username': 'jdoe@contoso.com', 'groups': ['other']})
+        self.assertFalse(ok)
+        self.assertEqual(reason, 'not in an allowed Entra group')
+
+    def test_allowlist_callback_denial(self):
+        import unittest.mock
+        _server.SSO_ALLOW_UPNS = {'onlythis@contoso.com'}
+        tok = self._id_token(preferred_username='jdoe@contoso.com')
+        with unittest.mock.patch.object(
+                _server, '_sso_exchange_code',
+                return_value={'id_token': tok}):
+            self._set_oauth_cookie('s3', 'nonce-abc', 'v')
+            r = self.client.get(
+                '/ui/sso/callback?code=c&state=s3',
+            )
+        self.assertEqual(r.status_code, 401)
+        self.assertIn('not authorized', r.get_data(as_text=True))
+
+
+class _FakeJwkClient:
+    """Stand-in for jwt.PyJWKClient: returns the local public key for any token."""
+
+    def __init__(self, public_key):
+        self._pub = public_key
+
+    def get_signing_key_from_jwt(self, token):
+        import types
+        key = types.SimpleNamespace()
+        key.key = self._pub
+        return key
 
 
 if __name__ == '__main__':

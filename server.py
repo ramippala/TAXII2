@@ -16,6 +16,7 @@ Architecture:
 
 import base64
 import csv
+import hashlib
 import io
 import ipaddress
 import json
@@ -25,6 +26,7 @@ import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
@@ -34,7 +36,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
-from flask import Flask, Response, jsonify, request, send_from_directory
+from flask import (Flask, Response, jsonify, make_response, redirect,
+                   request, send_from_directory)
 from flask_cors import CORS
 from sqlalchemy import (
     Boolean,
@@ -561,6 +564,282 @@ def _request_allowed() -> bool:
     if _validate_taxii_auth(user, pw):
         return True
     return _ui_session_valid()
+
+
+# ---------------------------------------------------------------------------
+# SSO — Microsoft Entra ID (Azure AD) via OIDC Authorization Code + PKCE
+# ---------------------------------------------------------------------------
+# Optional, OFF by default (sso.enabled: false). When enabled, the UI offers
+# "Sign in with Microsoft". Local username/password login remains as a
+# fallback so the box is never locked out if the IdP is unreachable.
+#
+# Flow: browser -> /ui/sso -> Microsoft /oauth2/v2.0/authorize (user picks an
+# account; Entra app assignment restricts to your tenant group) -> Microsoft
+# redirects to /ui/sso/callback?code=...&state=... -> THIS server exchanges
+# the code for a token server-side (egress to login.microsoftonline.com only),
+# validates the ID-token JWT (JWKS signature + iss/aud/exp/nonce), applies the
+# allow-list, then issues the SAME taxii2_ui_session cookie as local login.
+#
+# Only `requests`, `jwt`, `cryptography` (already required) are used.
+
+try:  # SSO-only dependencies; the server boots without them when SSO is off.
+    import jwt
+except ImportError:  # pragma: no cover - depends on optional install
+    jwt = None
+
+try:
+    import requests as _http_requests
+except ImportError:  # pragma: no cover - depends on optional install
+    _http_requests = None
+
+SSO_CFG = CONFIG.get('sso', {}) or {}
+SSO_ENABLED = bool(SSO_CFG.get('enabled', False))
+SSO_TENANT = str(SSO_CFG.get('tenant', 'common') or 'common')
+SSO_CLIENT_ID = str(SSO_CFG.get('client_id', '') or '')
+SSO_CLIENT_SECRET = str(SSO_CFG.get('client_secret', '') or '')
+SSO_REDIRECT_URI = str(SSO_CFG.get('redirect_uri', '') or '')
+SSO_AUTH_ENDPOINT = str(
+    SSO_CFG.get('authorization_endpoint',
+               f'https://login.microsoftonline.com/{SSO_TENANT}/oauth2/v2.0/authorize')
+)
+SSO_TOKEN_ENDPOINT = str(
+    SSO_CFG.get('token_endpoint',
+               f'https://login.microsoftonline.com/{SSO_TENANT}/oauth2/v2.0/token')
+)
+SSO_JWKS_ENDPOINT = str(
+    SSO_CFG.get('jwks_uri',
+               f'https://login.microsoftonline.com/{SSO_TENANT}/discovery/v2.0/keys')
+)
+# Expected issuer (validated on the ID token). Empty = auto (use JWKS host).
+SSO_ISSUER = str(SSO_CFG.get('issuer', '') or '')
+SSO_ALLOW_DOMAINS = tuple(d.lower() for d in (SSO_CFG.get('allowed_domains') or []) if d)
+SSO_ALLOW_UPNS = set(u.lower() for u in (SSO_CFG.get('allowed_upns') or []) if u)
+SSO_ALLOW_GROUPS = set(g for g in (SSO_CFG.get('allowed_groups') or []) if g)
+SSO_SCOPES = 'openid profile email'
+
+# Short-lived signed cookie that carries the OAuth temp state (CSRF + PKCE).
+_oauth_state_serializer = URLSafeTimedSerializer(
+    _ui_secret, salt='taxii2-ui-sso'
+)
+_oauth_state_cookie = 'taxii2_ui_sso'
+
+# Cached JWKS client (fetches + caches Microsoft's signing keys, rotates).
+_sso_jwks_client = None
+
+
+def _sso_jwks():
+    global _sso_jwks_client
+    if _sso_jwks_client is None:
+        _sso_jwks_client = jwt.PyJWKClient(SSO_JWKS_ENDPOINT)
+    return _sso_jwks_client
+
+
+def _sso_expected_issuer() -> str:
+    if SSO_ISSUER:
+        return SSO_ISSUER
+    # Fall back to the tenant discovery issuer.
+    return f'https://login.microsoftonline.com/{SSO_TENANT}/v2.0'
+
+
+def _sso_user_allowed(claims: Dict[str, Any]) -> Tuple[bool, str]:
+    """Apply the SSO allow-list. Returns (allowed, reason).
+
+    Entra app assignment is the primary gate (only assigned users can even
+    sign in). These server-side checks are defense-in-depth:
+      * allowed_domains  -> email/preferred_username domain must be listed
+      * allowed_upns     -> full UPN/email must be listed (exact)
+      * allowed_groups   -> token 'groups' claim must intersect (if present)
+    With all allow-lists empty, any valid tenant user passes (assignment-only).
+    """
+    email = str(
+        claims.get('preferred_username') or claims.get('upn')
+        or claims.get('email') or ''
+    ).lower()
+    domain = email.split('@')[-1] if '@' in email else ''
+
+    if SSO_ALLOW_UPNS and email not in SSO_ALLOW_UPNS:
+        return False, 'not in allowed users'
+    if SSO_ALLOW_DOMAINS and domain not in SSO_ALLOW_DOMAINS:
+        return False, 'domain not allowed'
+    if SSO_ALLOW_GROUPS:
+        groups = claims.get('groups') or []
+        if not (set(str(g) for g in groups) & SSO_ALLOW_GROUPS):
+            return False, 'not in an allowed Entra group'
+    return True, ''
+
+
+def _sso_validate_id_token(token: str, expected_nonce: str) -> Dict[str, Any]:
+    """Validate the ID-token JWT against Microsoft's JWKS. Returns claims.
+
+    Raises jwt.InvalidTokenError (or subclass) on any failure.
+    """
+    signing_key = _sso_jwks().get_signing_key_from_jwt(token)
+    claims = jwt.decode(
+        token,
+        signing_key.key,
+        algorithms=['RS256'],
+        audience=SSO_CLIENT_ID,
+        issuer=_sso_expected_issuer(),
+        options={'require': ['exp', 'iss', 'aud', 'sub']},
+    )
+    # Nonce binds the token to this login attempt (replay protection).
+    if expected_nonce and claims.get('nonce') != expected_nonce:
+        raise jwt.InvalidTokenError('nonce mismatch')
+    return claims
+
+
+def _sso_exchange_code(code: str, code_verifier: str) -> Dict[str, Any]:
+    """Exchange the authorization code for tokens (server-side)."""
+    data = {
+        'client_id': SSO_CLIENT_ID,
+        'client_secret': SSO_CLIENT_SECRET,
+        'code': code,
+        'redirect_uri': SSO_REDIRECT_URI,
+        'grant_type': 'authorization_code',
+        'code_verifier': code_verifier,
+        'scope': SSO_SCOPES,
+    }
+    resp = _http_requests.post(
+        SSO_TOKEN_ENDPOINT, data=data, timeout=30,
+        headers={'Content-Type': 'application/x-www-form-urlencoded'},
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _sso_oauth_state_token(payload: Dict[str, Any]) -> str:
+    return _oauth_state_serializer.dumps(payload)
+
+
+def _sso_read_oauth_state() -> Optional[Dict[str, Any]]:
+    raw = request.cookies.get(_oauth_state_cookie)
+    if not raw:
+        return None
+    try:
+        return _oauth_state_serializer.loads(raw, max_age=600)
+    except BadSignature:
+        return None
+
+
+def _sso_deps_ok() -> bool:
+    return jwt is not None and _http_requests is not None
+
+
+@app.route('/ui/sso', methods=['GET'])
+def ui_sso_start():
+    """GET /ui/sso — begin the Microsoft OIDC login (Authorization Code + PKCE)."""
+    if not SSO_ENABLED:
+        return jsonify({'error': 'SSO is not enabled'}), 404
+    if not _sso_deps_ok():
+        logger.error("SSO enabled but PyJWT/requests are not installed")
+        return jsonify({'error': 'SSO dependencies missing'}), 500
+    state = uuid.uuid4().hex
+    nonce = uuid.uuid4().hex
+    code_verifier = uuid.uuid4().hex + uuid.uuid4().hex  # 64+ chars
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode('utf-8')).digest()
+    ).rstrip(b'=').decode('ascii')
+
+    params = {
+        'client_id': SSO_CLIENT_ID,
+        'response_type': 'code',
+        'redirect_uri': SSO_REDIRECT_URI,
+        'scope': SSO_SCOPES,
+        'state': state,
+        'nonce': nonce,
+        'code_challenge': code_challenge,
+        'code_challenge_method': 'S256',
+        'response_mode': 'query',
+    }
+    sep = '&' if '?' in SSO_AUTH_ENDPOINT else '?'
+    resp = redirect(SSO_AUTH_ENDPOINT + sep + urllib.parse.urlencode(params))
+    # Carry the temp state in a short-lived signed cookie (CSRF + PKCE binding).
+    resp.set_cookie(
+        _oauth_state_cookie,
+        _sso_oauth_state_token({'state': state, 'nonce': nonce,
+                                'code_verifier': code_verifier}),
+        max_age=600, httponly=True, samesite='Lax',
+    )
+    return resp
+
+
+@app.route('/ui/sso/callback', methods=['GET'])
+def ui_sso_callback():
+    """GET /ui/sso/callback — Microsoft redirects here with ?code=...&state=..."""
+    if not SSO_ENABLED:
+        return jsonify({'error': 'SSO is not enabled'}), 404
+    if not _sso_deps_ok():
+        return _ui_sso_fail('SSO dependencies missing on the server')
+
+    error = request.args.get('error')
+    if error:
+        return _ui_sso_fail(f'Microsoft returned an error: {error} '
+                            f'{request.args.get("error_description", "")}')
+
+    oauth = _sso_read_oauth_state()
+    state = request.args.get('state', '')
+    if not oauth or not state or oauth.get('state') != state:
+        return _ui_sso_fail('state mismatch (possible CSRF) — please retry')
+
+    code = request.args.get('code', '')
+    if not code:
+        return _ui_sso_fail('missing authorization code — please retry')
+
+    try:
+        tokens = _sso_exchange_code(code, oauth.get('code_verifier', ''))
+    except Exception as exc:
+        logger.error("SSO token exchange failed: %s", exc)
+        return _ui_sso_fail('token exchange failed — please retry')
+
+    id_token = tokens.get('id_token')
+    if not id_token:
+        return _ui_sso_fail('no ID token returned — please retry')
+
+    try:
+        claims = _sso_validate_id_token(id_token, oauth.get('nonce', ''))
+    except jwt.InvalidTokenError as exc:
+        logger.warning("SSO ID token rejected: %s", exc)
+        return _ui_sso_fail('token validation failed — please retry')
+
+    allowed, reason = _sso_user_allowed(claims)
+    if not allowed:
+        logger.info("SSO login denied for %s: %s",
+                    claims.get('preferred_username'), reason)
+        return _ui_sso_fail(f'not authorized to sign in ({reason})')
+
+    username = str(
+        claims.get('preferred_username') or claims.get('upn')
+        or claims.get('email') or claims.get('sub')
+    )
+    resp = redirect('/')
+    resp.set_cookie(
+        'taxii2_ui_session', _session_cookie(username),
+        max_age=_ui_session_ttl, httponly=True, samesite='Lax',
+    )
+    resp.delete_cookie(_oauth_state_cookie)
+    logger.info("SSO login successful for %s", username)
+    return resp
+
+
+def _ui_sso_fail(message: str) -> Response:
+    """Render a small inline error and point back at the login form."""
+    resp = make_response(
+        f'<!doctype html><meta charset="utf-8">'
+        f'<title>Sign-in failed</title><body style="font-family:system-ui;max-width:520px;'
+        f'margin:80px auto;padding:0 16px"><h2>Sign-in failed</h2>'
+        f'<p>{message}</p><p><a href="/">Return to login</a></p></body>',
+        401,
+    )
+    resp.headers['Content-Type'] = 'text/html; charset=utf-8'
+    return resp
+
+
+def sso_public_info() -> Dict[str, Any]:
+    """Small payload for the UI to decide whether to show the SSO button."""
+    return {
+        'enabled': SSO_ENABLED,
+        'provider': 'Microsoft Entra ID',
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1637,7 +1916,11 @@ def add_subscription(client_id: str):
 def ui_session():
     """GET /ui/session — report whether the current cookie is a valid login."""
     user = _session_user()
-    return jsonify({'authenticated': user is not None, 'user': user or None}), 200
+    return jsonify({
+        'authenticated': user is not None,
+        'user': user or None,
+        'sso': sso_public_info(),
+    }), 200
 
 
 @app.route('/ui/login', methods=['POST'])

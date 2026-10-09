@@ -86,6 +86,8 @@ Dependencies:
 | SQLAlchemy 2.0.18 | ORM / database |
 | Werkzeug 3.0.2 | Password hashing & URL utilities |
 | pyyaml 6.0.1 | Configuration (YAML) |
+| PyJWT 2.15.1 | SSO — verify the Microsoft ID-token JWT (only used when `sso.enabled`) |
+| cryptography 50.0.2 | SSO — RSA key handling for ID-token signature verification |
 | psycopg2-binary *(optional)* | PostgreSQL driver — only if you use a Postgres `database.url` |
 | PyMySQL *(optional)* | MariaDB/MySQL driver — only if you use a MySQL `database.url` |
 
@@ -250,6 +252,55 @@ Once logged in, the **TAXII Feed Manager** dashboard lets you:
 The UI is a single self-contained `intel-ui.html` (no CDN/JS dependencies,
 works offline), served directly by the Flask app. The browser talks to the
 server over same-origin requests carrying the session cookie.
+
+## SSO — Microsoft Entra ID (Azure AD) sign-in
+
+Optional, **OFF by default** (`sso.enabled: false`). When enabled, the login
+page adds a **"Sign in with Microsoft"** button (OIDC **Authorization Code +
+PKCE**) on top of the existing username/password login, which stays as a
+fallback so the box is never locked out if the IdP is unreachable. A
+successful SSO sign-in issues the **same** `taxii2_ui_session` cookie as a
+local login, so everything downstream (dashboard, cookie-auth on the data
+endpoints) is unchanged.
+
+**Security model (two layers):**
+1. **Primary** — assign the Entra app to a tenant **group** in the Azure
+   portal (Enterprise application → Users and groups). Only assigned users can
+   even reach the sign-in screen. This is the main control.
+2. **Optional server-side allow-list** — `sso.allowed_domains`,
+   `sso.allowed_upns`, `sso.allowed_groups` (defense-in-depth). Leave empty to
+   rely on Entra assignment alone.
+
+**Egress:** only `login.microsoftonline.com` is contacted — the *browser* for
+the sign-in screen, and this *server* to exchange the code for a token and to
+fetch/validate the signing keys (JWKS). The ID token is verified server-side
+(RS256 signature, `iss`, `aud`, `exp`, and a per-login `nonce`), and the flow
+uses a signed short-lived `state` cookie + PKCE to stop CSRF/replay.
+
+**Setup:**
+1. Azure portal → **App registrations → New registration** (single tenant).
+2. **Authentication → Web** → add redirect URIs:
+   - `http://localhost:5000/ui/sso/callback` (local HTTP testing — Microsoft
+     allows `http://localhost` so you *can* test against the local server),
+   - `https://<live-host>/ui/sso/callback` (production, HTTPS required).
+3. **Certificates & secrets → New client secret** → copy the value.
+4. **Overview** → note the Application (client) ID and Tenant ID.
+5. **Users and groups** (the enterprise app) → add the group of allowed users.
+6. In `config.yaml`, set `sso.enabled: true`, `tenant`, `client_id`,
+   `client_secret`, and `redirect_uri` (must exactly match one from step 2),
+   then restart the server.
+
+> Keep `client_secret` out of git — point it at an env var
+> (`${SSO_CLIENT_SECRET:-}`) or fill it in on the host.
+
+### SSO endpoints
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /ui/sso` | Begin the OIDC flow — 302 to Microsoft's authorize URL with PKCE; sets a short-lived signed state cookie. `404` when disabled. |
+| `GET /ui/sso/callback` | Microsoft redirects here (`?code=&state=`). Exchanges the code, validates the ID token, applies the allow-list, then 302 to `/` with the session cookie. `404` when disabled. |
+
+`GET /ui/session` also returns `{..., "sso": {"enabled": bool, "provider": "Microsoft Entra ID"}}` so the UI shows the button only when SSO is on.
 
 ## Feeding Intel: API (curl)
 
@@ -758,8 +809,11 @@ data access), the **intel gate** (private-IP drop, freshness, confidence
 floor, blocklist, and that manual intel is never gated), **manual
 revocation** (`POST /objects/<id>/revoke`, stickiness across saves,
 `revoked: true` in the TAXII bundle) and **TTL auto-revocation** (per-type
-aging sweep), and **CSV import** (fuzzy header mapping, merge-not-replace,
-auth, bad-input handling).
+aging sweep), **CSV import** (fuzzy header mapping, merge-not-replace,
+auth, bad-input handling), and **SSO** (Microsoft Entra OIDC: PKCE
+authorize redirect + challenge math, signed-state CSRF rejection, real
+RS256 ID-token validation against a local key for signature/audience/nonce,
+domain/UPN/group allow-lists, and session-cookie issuance on success).
 
 ## Security Considerations
 
@@ -770,6 +824,11 @@ auth, bad-input handling).
   cookie is signed with it; an unset/dev value lets a forged cookie
   authenticate to the data endpoints.
 - Use strong, unique passwords and store them hashed.
+- **SSO:** assign the Entra app to a specific group (not "all users") so only
+  authorized operators can sign in; set `sso.redirect_uri` to match the
+  registered redirect URI exactly; keep `client_secret` out of version
+  control (env var); and require **HTTPS** for the production redirect URI.
+  Local `http://localhost` is only for testing.
 - Set `debug: false` in production.
 - Rate-limit ingestion requests if needed.
 - Disable CORS (`flask_cors`) only for trusted origins.
@@ -779,8 +838,9 @@ auth, bad-input handling).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TAXII_CONFIG` | `./config.yaml` | Path to configuration file |
-| `FLASK_SECRET` | `dev-secret-key-change-in-production` | Flask secret key |
+| `FLASK_SECRET` | `dev-secret-key-change-in-production` | Flask secret key (signs UI session + SSO state cookies) |
 | `DATABASE_URL` | `sqlite:///taxii_feed.db` | Database connection URL |
+| `SSO_CLIENT_SECRET` | *(empty)* | Microsoft Entra client secret, if you reference `${SSO_CLIENT_SECRET}` in `config.yaml` |
 
 ## Troubleshooting
 

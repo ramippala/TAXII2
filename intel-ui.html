@@ -41,6 +41,13 @@
   }
   button:hover { filter: brightness(1.1); }
   button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  button.sso { background: #fff; color: #1a1a1a; border: 1px solid var(--border);
+               display: flex; align-items: center; justify-content: center; gap: 8px; }
+  button.sso:hover { border-color: #8a8a8a; }
+  .sso-divider { display: flex; align-items: center; gap: 10px; color: var(--muted);
+                 font-size: 12px; margin: 12px 0; }
+  .sso-divider::before, .sso-divider::after { content: ""; height: 1px; flex: 1;
+                                              background: var(--border); }
   button.danger { background: var(--err); }
   button:disabled { opacity: .45; cursor: not-allowed; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
@@ -98,6 +105,13 @@
     <div class="login-card">
       <h1>Sign in</h1>
       <div class="sub" style="margin-bottom:18px">Enter your dashboard credentials to manage the feed.</div>
+      <div id="ssoWrap" style="display:none">
+        <button id="btnSso" class="btn sso">
+          <svg width="16" height="16" viewBox="0 0 21 21" aria-hidden="true"><path fill="#f35325" d="M1 1h9v9H1z"/><path fill="#81bc06" d="M11 1h9v9h-9z"/><path fill="#05a6f0" d="M1 11h9v9H1z"/><path fill="#ffba08" d="M11 11h9v9h-9z"/></svg>
+          Sign in with Microsoft
+        </button>
+        <div class="sso-divider"><span>or</span></div>
+      </div>
       <div class="field">
         <label for="loginUser">Username</label>
         <input type="text" id="loginUser" autocomplete="username">
@@ -209,6 +223,8 @@
 <script>
 "use strict";
 
+let SSO_ENABLED = false;
+
 const $ = (id) => document.getElementById(id);
 
 function base() { return location.origin; }
@@ -273,10 +289,11 @@ function validateValue(type, value) {
 // Auth / session
 // ---------------------------------------------------------------------------
 
-function showLogin() {
+function showLogin(ssoEnabled) {
   $("loginPanel").style.display = "block";
   $("dashboard").style.display = "none";
   $("loginErr").textContent = "";
+  $("ssoWrap").style.display = (ssoEnabled ?? SSO_ENABLED) ? "block" : "none";
 }
 
 function showDashboard(user) {
@@ -288,15 +305,16 @@ function showDashboard(user) {
 async function init() {
   try {
     const r = await api("/ui/session");
+    SSO_ENABLED = !!(r.body && r.body.sso && r.body.sso.enabled);
     if (r.status === 200 && r.body && r.body.authenticated) {
       showDashboard(r.body.user);
       loadFeed();
       loadPullers();
     } else {
-      showLogin();
+      showLogin(SSO_ENABLED);
     }
   } catch (e) {
-    showLogin();
+    showLogin(SSO_ENABLED);
   }
 }
 
@@ -740,6 +758,7 @@ document.addEventListener("change", (e) => {
 $("btnLogin").addEventListener("click", doLogin);
 $("loginPass").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
 $("loginUser").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
+$("btnSso").addEventListener("click", () => { location.href = "/ui/sso"; });
 $("btnLogout").addEventListener("click", doLogout);
 $("btnLoad").addEventListener("click", loadFeed);
 $("btnAdd").addEventListener("click", addRow);

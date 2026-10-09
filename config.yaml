@@ -129,6 +129,49 @@ ui:
   session_ttl: 43200        # session lifetime, seconds (default 12 h)
 
 # ---------------------------------------------------------------------------
+# SSO — Microsoft Entra ID (Azure AD) via OIDC. OFF by default.
+#
+# When enabled, the login page shows "Sign in with Microsoft" (Authorization
+# Code + PKCE). Local username/password (ui.auth above) stays as a fallback.
+#
+# Egress: only login.microsoftonline.com is contacted (the browser for the
+# sign-in screen; this server to exchange the code + fetch the signing keys).
+#
+# Access control (two layers):
+#   1. PRIMARY  — assign the Entra app to a tenant group in the Azure portal
+#      (App registration -> Enterprise application -> Users and groups).
+#      Only assigned users can even reach the sign-in screen.
+#   2. OPTIONAL — server-side allow-lists below (defense-in-depth). Leave the
+#      lists empty to rely on Entra assignment alone.
+#
+# Setup (Azure portal):
+#   1. App registrations -> New registration. Name it; Supported account
+#      types = "Single tenant". Under Authentication -> Add a platform -> Web
+#      -> Redirect URI, add BOTH:
+#         http://localhost:5000/ui/sso/callback   (local HTTP testing)
+#         https://<live-host>/ui/sso/callback     (production, HTTPS required)
+#   2. Certificates & secrets -> New client secret -> copy the VALUE.
+#   3. Overview -> note the Application (client) ID and Tenant ID.
+#   4. (Access) Enterprise application for this app -> Users and groups ->
+#      Add users/groups = the group of allowed operators.
+#   5. Fill in client_id / tenant / client_secret / redirect_uri below, set
+#      enabled: true, restart the server.
+#
+# redirect_uri must EXACTLY match one registered in the app (scheme, host,
+# port, path). For local testing use the http://localhost:5000 one.
+# ---------------------------------------------------------------------------
+sso:
+  enabled: false
+  tenant: 'common'              # your tenant ID (GUID) or name; 'common' = any org tenant
+  client_id: ''                 # Application (client) ID from the app registration
+  client_secret: ''             # client secret VALUE (or ${SSO_CLIENT_SECRET:-})
+  redirect_uri: 'http://localhost:5000/ui/sso/callback'
+  # issuer: ''                  # optional explicit ID-token issuer (default: auto)
+  # allowed_domains: ['contoso.com']   # only these UPN/email domains
+  # allowed_upns: ['jdoe@contoso.com'] # or exact UPNs
+  # allowed_groups: ['<entra-group-object-id>'] # must match a token 'groups' claim
+
+# ---------------------------------------------------------------------------
 # OPTIONAL background pollers — off by default. Neither is how Vision One
 # works; Vision One polls /taxii2/ on its own (see taxii.auth).
 #
