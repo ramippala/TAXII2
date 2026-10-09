@@ -44,7 +44,7 @@
   button.danger { background: var(--err); }
   button:disabled { opacity: .45; cursor: not-allowed; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
   th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
   tr:last-child td { border-bottom: 0; }
   .type { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--border); }
@@ -52,8 +52,7 @@
   .type.domain-name { color: #d2a8ff; }
   .type.file-hash { color: #ffa657; }
   .type.indicator { color: var(--warn); }
-  .src { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; margin-left: 6px; vertical-align: middle; }
-  .src.otx { color: #58a6ff; border-color: #2b4a6b; }
+  .src { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; margin-left: 6px; vertical-align: middle; white-space: nowrap; }
   .src.manual { color: var(--ok); border-color: #2b4a35; }
   .gate { display: inline-block; font-size: 11px; border-radius: 4px; padding: 1px 6px; margin-left: 6px; vertical-align: middle; }
   .gate.served { color: var(--ok); border: 1px solid #2b4a35; }
@@ -67,83 +66,116 @@
   td .del { background: transparent; color: var(--err); border: 0; padding: 0 4px; font-size: 15px; cursor: pointer; }
   .count { color: var(--muted); font-size: 13px; }
   input[type=checkbox] { accent-color: var(--accent); width: 16px; height: 16px; }
+  .pill { display:inline-block; font-size:11px; border-radius:999px; padding:1px 8px; border:1px solid var(--border); }
+  .pill.on { color: var(--ok); border-color:#2b4a35; }
+  .pill.off { color: var(--muted); }
+  /* login card */
+  .login-wrap { max-width: 400px; margin: 8vh auto 0; }
+  .login-card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 24px; }
+  .login-card h1 { font-size: 18px; }
+  .login-card .field { margin-bottom: 14px; }
+  .login-card input { width: 100%; min-width: 0; }
+  .login-card .btn { width: 100%; margin-top: 4px; }
+  .login-err { color: var(--err); font-size: 13px; margin-top: 10px; min-height: 18px; }
+  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+  .topbar .who { color: var(--muted); font-size: 13px; }
+  .puller-result { font-size: 12px; color: var(--muted); margin-top: 4px; }
 </style>
 </head>
 <body>
   <h1>TAXII Feed Manager</h1>
-  <div class="sub">Feed STIX 2.1 threat intel (IP / domain / file hash) into the TAXII server</div>
+  <div class="sub">Feed STIX 2.1 threat intel, pull from community TAXII sources, and gate what reaches Vision One</div>
 
-  <!-- Auth -->
-  <div class="panel">
-    <h2>Server</h2>
-    <div class="row">
-      <div>
-        <label for="base">Server</label>
-        <input type="text" id="base" value="">
+  <!-- ============ LOGIN (shown when not authenticated) ============ -->
+  <div id="loginPanel" class="login-wrap" style="display:none">
+    <div class="login-card">
+      <h1>Sign in</h1>
+      <div class="sub" style="margin-bottom:18px">Enter your dashboard credentials to manage the feed.</div>
+      <div class="field">
+        <label for="loginUser">Username</label>
+        <input type="text" id="loginUser" autocomplete="username">
       </div>
-      <div>
-        <label for="user">Username</label>
-        <input type="text" id="user" placeholder="TAXII username" autocomplete="off">
+      <div class="field">
+        <label for="loginPass">Password</label>
+        <input type="password" id="loginPass" autocomplete="current-password">
       </div>
-      <div>
-        <label for="pass">Password</label>
-        <input type="password" id="pass" placeholder="TAXII password" autocomplete="off">
-      </div>
-      <button id="btnTest" class="ghost">Connect</button>
+      <button id="btnLogin" class="btn">Sign in</button>
+      <div class="login-err" id="loginErr"></div>
     </div>
-    <div class="hint">Server is pre-filled with this page's origin. Credentials are the
-      <span class="mono">taxii.auth</span> values from config.yaml — sent only as
-      <span class="mono">X-Taxii-*</span> headers to this server.</div>
   </div>
 
-  <!-- Current feed -->
-  <div class="panel">
-    <h2>Current feed</h2>
-    <div class="row" style="margin-bottom:12px">
-      <button id="btnLoad" class="ghost">Load current feed</button>
-      <button id="btnAdd" class="ghost">+ Add new entry</button>
-      <span class="count" id="feedCount"></span>
-    </div>
-    <table id="table" style="display:none">
-      <thead>
-        <tr>
-          <th style="width:32px"><input type="checkbox" id="chkAll" title="Select all" checked></th>
-          <th>Type</th><th>Value</th><th>Labels</th><th>Confidence</th><th>ID</th><th></th>
-        </tr>
-      </thead>
-      <tbody id="tbody"></tbody>
-    </table>
-    <div class="hint" id="emptyHint">No entries yet. Load the current feed, or add new entries below.</div>
-  </div>
+  <!-- ============ DASHBOARD (shown after login) ============ -->
+  <div id="dashboard" style="display:none">
 
-  <!-- Withheld by filter (community intel gated before Vision One) -->
-  <div class="panel" id="withheldPanel" style="display:none">
-    <h2>Withheld by filter</h2>
-    <div class="hint" style="margin:0 0 10px">
-      Community-sourced objects (e.g. OTX) the intel filter is keeping
-      <b>out of Vision One</b>. These are still stored and shown in the feed
-      above; nothing is deleted. Loosen the matching rule in
-      <span class="mono">config.yaml</span> → <span class="mono">intel_filter:</span>
-      to release one, then restart the server.
+    <div class="topbar">
+      <span class="who" id="whoami">Signed in</span>
+      <button id="btnLogout" class="ghost">Log out</button>
     </div>
-    <table id="withheldTable">
-      <thead>
-        <tr><th>Type</th><th>Value</th><th>Reason</th><th>Source</th></tr>
-      </thead>
-      <tbody id="withheldBody"></tbody>
-    </table>
-  </div>
 
-  <!-- Save -->
-  <div class="panel">
-    <h2>Publish</h2>
-    <div class="row">
-      <button id="btnSave">Save feed (replace)</button>
-      <button id="btnPurge" class="danger">Purge all</button>
+    <!-- Current feed -->
+    <div class="panel">
+      <h2>Current feed</h2>
+      <div class="row" style="margin-bottom:12px">
+        <button id="btnLoad" class="ghost">Load current feed</button>
+        <button id="btnAdd" class="ghost">+ Add new entry</button>
+        <span class="count" id="feedCount"></span>
+      </div>
+      <table id="table" style="display:none">
+        <thead>
+          <tr>
+            <th style="width:32px"><input type="checkbox" id="chkAll" title="Select all" checked></th>
+            <th>Type</th><th>Value</th><th>Labels</th><th>Confidence</th><th>ID</th><th></th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+      <div class="hint" id="emptyHint">No entries yet. Load the current feed, or add new entries below.</div>
     </div>
-    <div class="hint">Saving replaces the entire feed with the <b>checked</b> entries below
-      (unchecked entries are removed). This is how the server's feed model works.</div>
-    <div id="msg" class="msg"></div>
+
+    <!-- Withheld by filter (community intel gated before Vision One) -->
+    <div class="panel" id="withheldPanel" style="display:none">
+      <h2>Withheld by filter</h2>
+      <div class="hint" style="margin:0 0 10px">
+        Community-sourced objects the intel filter is keeping <b>out of Vision One</b>.
+        These are still stored and shown in the feed above; nothing is deleted. Loosen the
+        matching rule in <span class="mono">config.yaml</span> → <span class="mono">intel_filter:</span>
+        to release one, then restart the server.
+      </div>
+      <table id="withheldTable">
+        <thead><tr><th>Type</th><th>Value</th><th>Reason</th><th>Source</th></tr></thead>
+        <tbody id="withheldBody"></tbody>
+      </table>
+    </div>
+
+    <!-- Community sources (pull from third-party TAXII servers / OTX) -->
+    <div class="panel">
+      <h2>Community sources</h2>
+      <div class="hint" style="margin:0 0 10px">
+        Pull STIX intel from community sources into the feed. Configure them under
+        <span class="mono">otx:</span> and <span class="mono">taxii_pullers:</span> in
+        <span class="mono">config.yaml</span>. "Pull now" runs a one-shot fetch (works even when a
+        puller is disabled) — new objects appear in the feed and are gated like any community intel.
+      </div>
+      <table id="pullerTable" style="display:none">
+        <thead>
+          <tr><th>Source</th><th>Kind</th><th>Enabled</th><th>Running</th><th>Last sync</th><th>Last added</th><th>Status</th><th></th></tr>
+        </thead>
+        <tbody id="pullerBody"></tbody>
+      </table>
+      <div class="hint" id="pullerHint">No community sources configured yet.</div>
+    </div>
+
+    <!-- Save -->
+    <div class="panel">
+      <h2>Publish</h2>
+      <div class="row">
+        <button id="btnSave">Save feed (replace)</button>
+        <button id="btnPurge" class="danger">Purge all</button>
+      </div>
+      <div class="hint">Saving replaces the entire <b>manual</b> feed with the checked entries below
+        (community intel from pullers is never wiped by a save). This is how the server's feed model works.</div>
+      <div id="msg" class="msg"></div>
+    </div>
   </div>
 
 <script>
@@ -151,24 +183,24 @@
 
 const $ = (id) => document.getElementById(id);
 
-// Server field defaults to this page's origin when served by the TAXII server.
-$("base").value = location.origin;
-
-function authHeaders() {
-  return {
-    "X-Taxii-Username": $("user").value.trim(),
-    "X-Taxii-Password": $("pass").value,
-  };
-}
-
-function base() {
-  return $("base").value.replace(/\/+$/, "");
-}
+function base() { return location.origin; }
 
 function showMsg(text, ok) {
   const m = $("msg");
   m.className = "msg " + (ok ? "ok" : "err");
   m.textContent = text;
+}
+
+// All data calls use the signed session cookie (set by /ui/login).
+async function api(path, opts = {}) {
+  const res = await fetch(base() + path, {
+    ...opts,
+    credentials: "include",
+    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+  });
+  let body = null;
+  try { body = await res.json(); } catch (e) { /* xml responses have no json */ }
+  return { status: res.status, body };
 }
 
 function autoId(type, value) {
@@ -178,7 +210,6 @@ function autoId(type, value) {
   return "indicator--" + value.slice(0, 16);
 }
 
-// Build the per-type STIX payload the server expects.
 function buildObject(type, value) {
   if (type === "ipv4-addr") return { "ipv4-addr": { value } };
   if (type === "domain-name") return { "domain-name": { value } };
@@ -201,6 +232,73 @@ function validateValue(type, value) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Auth / session
+// ---------------------------------------------------------------------------
+
+function showLogin() {
+  $("loginPanel").style.display = "block";
+  $("dashboard").style.display = "none";
+  $("loginErr").textContent = "";
+}
+
+function showDashboard(user) {
+  $("loginPanel").style.display = "none";
+  $("dashboard").style.display = "block";
+  if (user) $("whoami").textContent = "Signed in as " + user;
+}
+
+async function init() {
+  try {
+    const r = await api("/ui/session");
+    if (r.status === 200 && r.body && r.body.authenticated) {
+      showDashboard(r.body.user);
+      loadFeed();
+      loadPullers();
+    } else {
+      showLogin();
+    }
+  } catch (e) {
+    showLogin();
+  }
+}
+
+async function doLogin() {
+  $("loginErr").textContent = "";
+  $("btnLogin").disabled = true;
+  try {
+    const r = await api("/ui/login", {
+      method: "POST",
+      body: JSON.stringify({ username: $("loginUser").value.trim(), password: $("loginPass").value }),
+    });
+    if (r.status === 200) {
+      showDashboard(r.body && r.body.user);
+      $("loginPass").value = "";
+      loadFeed();
+      loadPullers();
+    } else {
+      $("loginErr").textContent = (r.body && r.body.error) || "Invalid credentials";
+    }
+  } catch (e) {
+    $("loginErr").textContent = "Cannot reach server: " + e.message;
+  } finally {
+    $("btnLogin").disabled = false;
+  }
+}
+
+async function doLogout() {
+  try { await api("/ui/logout", { method: "POST" }); } catch (e) {}
+  $("tbody").innerHTML = "";
+  $("withheldBody").innerHTML = "";
+  $("pullerBody").innerHTML = "";
+  refreshCount();
+  showLogin();
+}
+
+// ---------------------------------------------------------------------------
+// Feed (manual intel)
+// ---------------------------------------------------------------------------
+
 function rowElement(o) {
   const tr = document.createElement("tr");
 
@@ -217,14 +315,15 @@ function rowElement(o) {
     if (o.type === t) op.selected = true;
     sel.appendChild(op);
   });
-  sel.addEventListener("change", () => syncRow(tr, sel.value, $("val-" + tr.dataset.idx) ? $("val-" + tr.dataset.idx).value : cVal.textContent));
+  sel.addEventListener("change", () => syncRow(tr, sel.value, cVal.textContent));
   cType.appendChild(sel);
 
   // Source + gate badges (only for loaded "existing" rows; new rows are manual/served).
   if (o.kind === "existing") {
     const src = o.source || "manual";
     const srcSpan = document.createElement("span");
-    srcSpan.className = "src " + src; srcSpan.textContent = src;
+    srcSpan.className = "src " + (src === "manual" ? "manual" : "otx");
+    srcSpan.textContent = src;
     cType.appendChild(srcSpan);
     const gate = document.createElement("span");
     if (o.gated) {
@@ -271,13 +370,9 @@ function rowElement(o) {
   return tr;
 }
 
-function syncIdCell(tr) {
-  const cells = tr.children;
-  cells[5].textContent = tr.dataset.id;
-}
+function syncIdCell(tr) { tr.children[5].textContent = tr.dataset.id; }
 
 function syncRow(tr, type, value) {
-  // When type changes on a new row, regenerate the id and keep the value.
   const inp = tr.children[2].querySelector("input");
   if (tr.dataset.newId) { tr.dataset.id = autoId(type, (value || inp.value).trim()); syncIdCell(tr); }
 }
@@ -304,46 +399,27 @@ function collectRows() {
   return out;
 }
 
-async function api(path, opts = {}) {
-  const res = await fetch(base() + path, {
-    ...opts,
-    headers: { "Content-Type": "application/json", ...authHeaders(), ...(opts.headers || {}) },
-  });
-  let body = null;
-  try { body = await res.json(); } catch (e) { /* xml responses have no json */ }
-  return { status: res.status, body };
-}
-
-async function connect() {
-  try {
-    const r = await api("/health");
-    if (r.status === 200) showMsg(`Connected. Objects in feed: ${r.body.objects_count} | DB: ${r.body.database}`, true);
-    else showMsg(`Unexpected status ${r.status}`, false);
-  } catch (e) {
-    showMsg("Cannot reach server: " + e.message, false);
-  }
-}
-
 async function loadFeed() {
   try {
     const r = await api("/objects");
-    if (r.status !== 200) { showMsg(`Load failed (HTTP ${r.status}) — check credentials`, false); return; }
+    if (r.status !== 200) {
+      if (r.status === 401) { showLogin(); }
+      else showMsg(`Load failed (HTTP ${r.status})`, false);
+      return;
+    }
     $("tbody").innerHTML = "";
     const objects = r.body.objects || [];
     objects.forEach(o => {
-      const kind = "existing";
       let value = o.value;
       if (o.type === "file-hash" && !value) value = o.id; // fallback display
-      $("tbody").appendChild(rowElement({ ...o, value, kind }));
+      $("tbody").appendChild(rowElement({ ...o, value, kind: "existing" }));
     });
     refreshCount();
     renderWithheld(objects);
     const wh = r.body.withheld_count || 0;
     showMsg(
       `Loaded ${r.body.count} object(s): ${r.body.served_count} served to Vision One, ` +
-      `${wh} withheld by the filter. Uncheck entries to drop them on save.`,
-      true
-    );
+      `${wh} withheld by the filter. Uncheck entries to drop them on save.`, true);
   } catch (e) {
     showMsg("Load failed: " + e.message, false);
   }
@@ -358,24 +434,20 @@ function renderWithheld(objects) {
   panel.style.display = "block";
   withheld.forEach(o => {
     const tr = document.createElement("tr");
-
     const t = document.createElement("td");
     const typeSpan = document.createElement("span");
     typeSpan.className = "type " + o.type; typeSpan.textContent = o.type;
     t.appendChild(typeSpan);
-
     const v = document.createElement("td");
     v.className = "mono"; v.textContent = o.value || o.id;
-
     const reason = document.createElement("td");
     reason.className = "reason";
     reason.textContent = o.gate_reason_label || o.gate_reason || "withheld";
-
     const src = document.createElement("td");
     const srcSpan = document.createElement("span");
-    srcSpan.className = "src " + (o.source || "otx"); srcSpan.textContent = o.source || "otx";
+    srcSpan.className = "src " + ((o.source || "otx") === "manual" ? "manual" : "otx");
+    srcSpan.textContent = o.source || "otx";
     src.appendChild(srcSpan);
-
     tr.append(t, v, reason, src);
     body.appendChild(tr);
   });
@@ -392,28 +464,19 @@ function addRow() {
 
 async function save() {
   const rows = collectRows();
-  // Validate before sending.
   for (const r of rows) {
     const err = validateValue(r.type, r.value);
     if (err) { showMsg(`Invalid entry: ${r.type} "${r.value}" — ${err}`, false); return; }
   }
   const stix_objects = rows.map(r => {
-    const obj = {
-      id: r.id,
-      type: r.type,
-      object: buildObject(r.type, r.value),
-      labels: r.labels,
-      confidence: r.confidence,
-    };
+    const obj = { id: r.id, type: r.type, object: buildObject(r.type, r.value), labels: r.labels, confidence: r.confidence };
     if (r.type === "indicator" && r.name) obj.name = r.name;
     return obj;
   });
-
   try {
     const r = await api("/feed/ingest", { method: "POST", body: JSON.stringify({ stix_objects }) });
     if (r.status === 200) {
       showMsg(`Feed updated: ${r.body.objects_count} object(s) stored.`, true);
-      // Refresh the "existing" markers so ids/confidence come from the server.
       await loadFeed();
     } else {
       showMsg(`Save failed (HTTP ${r.status}): ${r.body && r.body.error || "unknown error"}`, false);
@@ -439,7 +502,87 @@ async function purge() {
   }
 }
 
-// Keep "select all" in sync
+// ---------------------------------------------------------------------------
+// Community sources (third-party TAXII / OTX pulls)
+// ---------------------------------------------------------------------------
+
+async function loadPullers() {
+  try {
+    const r = await api("/community/pullers");
+    if (r.status !== 200) return;
+    const pullers = r.body.pullers || [];
+    const body = $("pullerBody");
+    body.innerHTML = "";
+    $("pullerTable").style.display = pullers.length ? "table" : "none";
+    $("pullerHint").style.display = pullers.length ? "none" : "block";
+    pullers.forEach(p => {
+      const tr = document.createElement("tr");
+
+      const name = document.createElement("td");
+      name.innerHTML = `<b>${p.name}</b>` + (p.collection ? `<div class="reason">collection: ${p.collection}</div>` : "");
+
+      const kind = document.createElement("td");
+      kind.textContent = p.kind || "";
+
+      const en = document.createElement("td");
+      const enPill = document.createElement("span");
+      enPill.className = "pill " + (p.enabled ? "on" : "off");
+      enPill.textContent = p.enabled ? "on" : "off";
+      en.appendChild(enPill);
+
+      const run = document.createElement("td");
+      const runPill = document.createElement("span");
+      runPill.className = "pill " + (p.running ? "on" : "off");
+      runPill.textContent = p.running ? "running" : "idle";
+      run.appendChild(runPill);
+
+      const sync = document.createElement("td");
+      sync.className = "mono"; sync.style.fontSize = "12px";
+      sync.textContent = p.last_sync ? p.last_sync.replace("T", " ").replace("Z", "") : "never";
+
+      const added = document.createElement("td");
+      added.textContent = (p.last_added == null) ? "" : String(p.last_added);
+
+      const status = document.createElement("td");
+      status.className = "reason";
+      status.textContent = p.last_message || (p.last_status || "");
+
+      const act = document.createElement("td");
+      const btn = document.createElement("button");
+      btn.className = "ghost"; btn.textContent = "Pull now"; btn.style.whiteSpace = "nowrap";
+      const result = document.createElement("div");
+      result.className = "puller-result";
+      btn.addEventListener("click", () => pullNow(p.name, btn, result));
+      act.append(btn, result);
+
+      tr.append(name, kind, en, run, sync, added, status, act);
+      body.appendChild(tr);
+    });
+  } catch (e) { /* ignore */ }
+}
+
+async function pullNow(name, btn, result) {
+  btn.disabled = true;
+  result.textContent = "Pulling…";
+  try {
+    const r = await api("/community/pull/" + encodeURIComponent(name), { method: "POST" });
+    if (r.status === 200) {
+      result.textContent = r.body.error ? `done: ${r.body.error}` : `done: +${r.body.added} object(s)`;
+      await Promise.all([loadFeed(), loadPullers()]);
+    } else {
+      result.textContent = `failed (HTTP ${r.status}): ${r.body && r.body.error || ""}`;
+    }
+  } catch (e) {
+    result.textContent = "failed: " + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Wiring
+// ---------------------------------------------------------------------------
+
 $("chkAll").addEventListener("change", (e) => {
   document.querySelectorAll("#tbody tr input[type=checkbox]").forEach(c => c.checked = e.target.checked);
   refreshCount();
@@ -448,11 +591,16 @@ document.addEventListener("change", (e) => {
   if (e.target.matches && e.target.matches("#tbody input[type=checkbox]")) refreshCount();
 });
 
-$("btnTest").addEventListener("click", connect);
+$("btnLogin").addEventListener("click", doLogin);
+$("loginPass").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
+$("loginUser").addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
+$("btnLogout").addEventListener("click", doLogout);
 $("btnLoad").addEventListener("click", loadFeed);
 $("btnAdd").addEventListener("click", addRow);
 $("btnSave").addEventListener("click", save);
 $("btnPurge").addEventListener("click", purge);
+
+init();
 </script>
 </body>
 </html>

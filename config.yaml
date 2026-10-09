@@ -57,22 +57,24 @@ taxii:
 
 # ---------------------------------------------------------------------------
 # INTEL FILTER — the gate between THIS server and Vision One
-#   OTX -> this server -> [intel_filter] -> Vision One
+#   community -> this server -> [intel_filter] -> Vision One
 #
 # This is a READ-TIME gate applied only to the /taxii2/ collection that
 # Vision One polls. Every object stays stored in the DB (auditable); the
 # filter only decides what Vision One is actually served, to reduce false
-# positives. It applies to COMMUNITY-sourced intel only (see
-# community_sources) — your manually-fed intel (web UI / API, source
-# 'manual') always passes. The web UI shows all stored intel regardless.
+# positives. It applies to COMMUNITY-sourced intel (OTX, third-party TAXII
+# pulls) — your manually-fed intel (web UI / API, source 'manual') always
+# passes. The web UI shows all stored intel regardless.
 #
 # All four rules below are toggles. Defaults = private-IP drop ON and a
 # 30-day freshness window ON; confidence floor OFF; blocklist empty.
 # ---------------------------------------------------------------------------
 intel_filter:
   # Which source tags are "community" and therefore gated. Manual is never
-  # gated no matter what. (Add more if you later pull other communities.)
-  community_sources: ['otx']
+  # gated no matter what.
+  #   []            (default) -> gate EVERY non-manual source (otx, taxii pulls)
+  #   ['otx', ...]  -> gate ONLY these named sources
+  community_sources: []
 
   # 1) Drop non-routable / special-use IPv4 addresses (10/8, 172.16/12,
   #    192.168/16, 127/8, 169.254/16, 0/8, 240/4, mapped-v6, CGNAT, reserved).
@@ -95,8 +97,22 @@ intel_filter:
     # - 'example.com'
 
 # ---------------------------------------------------------------------------
-# OPTIONAL background pollers — BOTH are off by default. Neither of these is
-# how Vision One works; Vision One polls /taxii2/ on its own (see taxii.auth).
+# WEB UI LOGIN — the dashboard (http://<server>:5000/) is behind a login.
+# This is SEPARATE from `taxii.auth` (which is what Vision One uses to poll
+# /taxii2/). The UI signs a session cookie after login; the data endpoints
+# accept EITHER the UI session OR the TAXII credentials (scripts/curl).
+# Keep this private. Set a strong password; set FLASK_SECRET to protect the
+# cookie signature.
+# ---------------------------------------------------------------------------
+ui:
+  auth:
+    username: 'admin'
+    password: 'admin'
+  session_ttl: 43200        # session lifetime, seconds (default 12 h)
+
+# ---------------------------------------------------------------------------
+# OPTIONAL background pollers — off by default. Neither is how Vision One
+# works; Vision One polls /taxii2/ on its own (see taxii.auth).
 #
 # 1) otx: pulls community threat intel FROM AlienVault OTX (public pulses /
 #    indicators) into this feed, in merge mode tagged source='otx'.
@@ -104,6 +120,9 @@ intel_filter:
 #    OTX intel. Data flow: OTX -> this server -> Vision One.
 # 2) self_check (formerly "vision_one"): a self-test that polls this
 #    server's OWN /feed endpoint to confirm it stays reachable. Not Vision One.
+# 3) taxii_pullers: pull STIX 2.1 objects FROM any third-party TAXII 2.1
+#    server (see below). Each pulled object is tagged with the puller's
+#    `name` as its source, so it is gated like other community intel.
 # ---------------------------------------------------------------------------
 
 otx:
@@ -116,6 +135,34 @@ otx:
   max_indicators_per_pulse: 1000
   max_indicators_per_poll: 5000
   object_types: ['ipv4-addr', 'domain-name', 'file-hash']
+
+# ---------------------------------------------------------------------------
+# THIRD-PARTY TAXII 2.1 PULLERS — pull objects FROM other TAXII servers.
+# Add one entry per source. `name` doubles as the object `source` tag and
+# the dashboard label. Enable via `enabled: true` OR hit "Pull now" in the
+# UI (works even when disabled, for a one-shot fetch).
+# Example (AlienVault OTX also exposes a TAXII 2.1 server you can point here
+# at, or any other provider that offers a TAXII 2.1 API root):
+#
+# taxii_pullers:
+#   - name: otx-taxii
+#     base_url: https://otx.alienvault.com/taxii2/
+#     username: 'your-otx-api-key'      # OTX uses the API key as username
+#     password: ''
+#     collection: 'threat-intel'
+#     poll_interval: 300
+#     max_objects_per_poll: 5000
+#     enabled: true
+# ---------------------------------------------------------------------------
+taxii_pullers: []
+  # - name: otx-taxii
+  #   base_url: https://otx.alienvault.com/taxii2/
+  #   username: 'your-otx-api-key'
+  #   password: ''
+  #   collection: 'threat-intel'
+  #   poll_interval: 300
+  #   max_objects_per_poll: 5000
+  #   enabled: false
 
 self_check:
   enabled: false

@@ -5,8 +5,11 @@ intelligence (IP addresses, file hashes, FQDNs) into **Trend Micro Vision One**.
 Vision One is a TAXII 2.1 **client** — it polls this server's `/taxii2/`
 collection (exactly how it consumes AlienVault OTX).
 
-Optional background pullers (both off by default): an **AlienVault OTX**
-community-intel puller (OTX → this server), and a `self_check` self-test.
+The **web UI dashboard** (`http://<server>:5000/`) is **login-protected**
+(`ui.auth` in `config.yaml`). After login you can add intel manually and
+watch/control **community sources**: the optional **AlienVault OTX** puller
+plus any number of **third-party TAXII 2.1 pullers** you define under
+`taxii_pullers:` (each with a "Pull now" button, even while disabled).
 
 An **intel filter** gates community-sourced intel before it is served to
 Vision One (see [Intel Filter](#intel-filter-filtering-between-server-and-vision-one)).
@@ -19,43 +22,43 @@ Vision One (see [Intel Filter](#intel-filter-filtering-between-server-and-vision
 │                                                                          │
 │  ┌──────────────────────────┐   ┌──────────────────────────────────┐  │
 │  │  Flask REST API          │   │  SQLite / In-Memory Store        │  │
-│  │  (TAXII 2 + REST)        │   │  (STIX 2.1 objects)              │  │
-│  │                          │   │                                   │  │
-│  │  /feed                   │   │  - STIXObject (indicator, ipv4-  │  │
-│  │  /feed/ingest            │   │    addr, file-hash, domain-name) │  │
-│  │  /feed/purge             │   │  - Subscription                 │  │
-│  │  /auth                   │   │  - OtxPoller (community pull)   │  │
-│  │  /subscriptions          │   └──────────┬──────────────────────┘  │
-│  │  /health                 │             │                            │
-│  └──────────────────────────┘             ▼                            │
+│  │  (TAXII 2 + REST)        │   │  (STIX 2.1 objects, each tagged  │  │
+│  │                          │   │   with its source)               │  │
+│  │  / (web UI, login-guard) │   │  - STIXObject (indicator, ipv4-  │  │
+│  │  /ui/login|session|logout│   │    addr, file-hash, domain-name) │  │
+│  │  /objects  /feed/ingest  │   │  - Subscription                 │  │
+│  │  /community/pullers|pull │   │  - PullerState (last sync per    │  │
+│  │  /taxii2/  (gate applied)│   │    community source)            │  │
+│  │  /health                 │   └──────────┬───────────────────────┘  │
+│  └──────────────────────────┘             │                            │
 │                                                                          │
 │  ┌──────────────────────────┐   ┌──────────────────────────────────┐  │
-│  │  OTX Community Puller    │   │  TAXII 2 Client (optional)      │  │
-│  │  (pull FROM OTX)         │   │  - TAXII feed retrieval         │  │
-│  │                          │   └──────────────────────────────────┘  │
-│  │  GET /otxapi/pulses/...  │                                             │
-│  └──────────────────────────┘                                             │
+│  │  OTX Community Puller    │   │  Third-party TAXII 2.1 Pullers   │  │
+│  │  (pull FROM OTX, merge,  │   │  (pull FROM any TAXII server,    │  │
+│  │   source='otx')          │   │   merge, source=<puller name>)   │  │
+│  └──────────────────────────┘   └──────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────┘
                               ▲
                               │
-                    ┌─────────────────────┐
-                    │  AlienVault OTX     │
-                    │  (community intel   │
-                    │   source, pulled)   │
-                    └─────────────────────┘
+             ┌────────────────┴────────────────┐
+             │  AlienVault OTX / any TAXII    │
+             │  2.1 server (community intel)  │
+             └────────────────────────────────┘
 ```
 
 ### Components
 
-1. **Flask REST API (TAXII 2 Server)** — Hosts TAXII 2.1 protocol endpoints and custom REST endpoints for feed management, auth, subscriptions, and health.
-2. **STIX 2.1 Store** — Stores threat intelligence objects (IPs, file hashes, domains, indicators) in SQLite with an in-memory store for fast polling. Every object carries a `source` tag (`manual` vs `otx`) so manual and community intel coexist.
-3. **OTX Community Puller** — Background thread that periodically pulls indicators (IPv4, domains, file hashes) from **AlienVault OTX** public pulses and merges them into the feed tagged `source='otx'`. Off by default.
-4. **Self-check Poller** — Background thread that periodically fetches the local `/feed` endpoint to verify the feed is reachable and well-formed. Off by default.
+1. **Flask REST API (TAXII 2 Server)** — Hosts TAXII 2.1 protocol endpoints and custom REST endpoints for feed management, UI login/session, community-source control, auth, subscriptions, and health.
+2. **Web UI dashboard** — Single self-contained `intel-ui.html` behind a login (`ui.auth`). Shows the current feed with per-row **source** and **gate** badges, a **withheld-by-filter** panel, a **community sources** panel (status + "Pull now"), and manual intel entry/publish. Serves all intel (the gate only affects what Vision One gets).
+3. **STIX 2.1 Store** — Stores threat intelligence objects (IPs, file hashes, domains, indicators) in SQLite with an in-memory store for fast polling. Every object carries a `source` tag (`manual` | `otx` | a `taxii_pullers` name) so manual and community intel coexist. Puller sync state (`last_sync`, `last_added`) is persisted in a `puller_state` table so delta pulls survive restarts.
+4. **OTX Community Puller** — Background thread that periodically pulls indicators (IPv4, domains, file hashes) from **AlienVault OTX** public pulses and merges them into the feed tagged `source='otx'`. Off by default; can also be fired on demand from the UI.
+5. **Third-party TAXII 2.1 Pullers** — One generic puller per `taxii_pullers:` entry. Polls `GET {api_root}collections/{collection}/objects/?since=` from any TAXII 2.1 server (Basic auth, `application/taxii+json;version=2.1`), maps STIX 2.1 objects into the feed in merge mode tagged with the puller's `name`. Off by default per entry.
+6. **Self-check Poller** — Background thread that periodically fetches the local `/feed` endpoint to verify the feed is reachable and well-formed. Off by default.
 
-> **Data flow:** `AlienVault OTX ──pull──▶ this server ──intel filter──▶ Vision One`.
+> **Data flow:** `OTX / third-party TAXII servers ──pull──▶ this server ──intel filter──▶ Vision One`.
 > The **intel filter** gates community-sourced objects before they are served
 > over `/taxii2/`, to cut false positives (manual intel always passes).
-> There is no Trend Micro SOL puller anymore — this server does not pull from
+> There is no Trend Micro SOL puller — this server does not pull from
 > Trend Micro.
 
 ## Installation
@@ -158,6 +161,13 @@ taxii:
     username: 'your-taxii-username'
     password: 'your-taxii-password'
 
+# Web UI dashboard login (SEPARATE from taxii.auth above)
+ui:
+  auth:
+    username: 'admin'
+    password: 'admin'
+  session_ttl: 43200        # UI session lifetime, seconds (default 12 h)
+
 otx:
   enabled: false        # set true to start pulling community intel from OTX
   base_url: 'https://otx.alienvault.com'
@@ -165,6 +175,17 @@ otx:
   poll_interval: 300    # 5 min polling interval
   max_pulses: 25
   object_types: ['ipv4-addr', 'domain-name', 'file-hash']
+
+# Third-party TAXII 2.1 pullers (empty = none). See Community Sources.
+taxii_pullers: []
+  # - name: otx-taxii
+  #   base_url: https://otx.alienvault.com/taxii2/
+  #   username: 'your-otx-api-key'
+  #   password: ''
+  #   collection: 'threat-intel'
+  #   poll_interval: 300
+  #   max_objects_per_poll: 5000
+  #   enabled: false
 ```
 
 > `${ENV_VAR:-default}` placeholders in config values are resolved from the
@@ -179,31 +200,51 @@ otx:
 The server starts on `http://0.0.0.0:5000` by default. Pollers only start
 when their `enabled` flag is `true` and a real `base_url` is configured.
 
-## Feeding Intel: Web UI (no curl needed)
+## Feeding Intel: Web UI (login → dashboard)
 
-Start the server and open **`http://localhost:5000/`** (or `/ui`) in a browser.
+Start the server and open **`http://localhost:5000/`** (or `/ui`) in a
+browser. You'll be shown a **login card** — enter the `ui.auth` credentials
+from `config.yaml` (default `admin` / `admin`) and click **Login**. This sets
+an http-only session cookie (`taxii2_ui_session`); subsequent UI requests
+authenticate with it, so you don't re-enter anything until it expires
+(`ui.session_ttl`, default 12 h) or you click **Log out**.
 
-The **TAXII Feed Manager** lets you:
-1. Enter the server URL + TAXII username/password (the `taxii.auth` values) and hit **Connect**.
-2. **Load current feed** — pulls what's already in the feed into an editable table.
-3. **Add new entry** — pick a type (IPv4 / domain / file hash / indicator), type the value.
-   IDs and hash algorithms (MD5/SHA-1/SHA-256) are auto-derived, and values are validated.
-4. **Save feed (replace)** — publishes the checked rows. Because ingest is
-   *replace-all*, load first and uncheck rows you want to drop (this is how you
-   "delete" an entry).
-5. **Purge all** — wipes the feed with a confirmation.
+> **UI login ≠ TAXII credentials.** `ui.auth` is for *this dashboard only*.
+> `taxii.auth` is what **Vision One** (and scripts/curl) uses to poll
+> `/taxii2/`. They are independent and can be different values. The data
+> endpoints (`/objects`, `/feed/ingest`, `/feed/purge`, `/community/*`)
+> accept **either** the UI session cookie **or** the TAXII credentials
+> (`X-Taxii-*` headers or HTTP Basic), so curl workflows keep working.
 
-Each loaded row shows a **source badge** (`manual` / `otx`) and a **gate
-badge** (`served` / `withheld`). A separate **"Withheld by filter"** panel
-lists every community object the [intel filter](#intel-filter-filtering-between-server-and-vision-one)
-is keeping out of Vision One, with the exact **reason** (Private / reserved
-IP, Stale, Low confidence, or Blocklisted). These objects are still stored —
-nothing is deleted; loosening the matching rule in `config.yaml`
-(`intel_filter:`) and restarting releases them.
+Once logged in, the **TAXII Feed Manager** dashboard lets you:
 
-The UI is a single self-contained `intel-ui.html` (no CDN/JS dependencies, works offline),
-served directly by the Flask app. Credentials are sent only as `X-Taxii-*` headers to the
-configured server.
+1. **Current feed** — an editable table of everything in the feed. Each row
+   shows a **source badge** (`manual` / `otx` / a puller name) and a **gate
+   badge** (`served` / `withheld`, with the reason on hover).
+2. **Add new entry** — pick a type (IPv4 / domain / file hash / indicator),
+   type the value. IDs and hash algorithms (MD5/SHA-1/SHA-256) are
+   auto-derived, and values are validated.
+3. **Save feed (replace)** — publishes the checked rows. Because manual ingest
+   is *replace* scoped to `source='manual'`, it only affects your manual
+   intel — community (pulled) intel is untouched. Load first and uncheck rows
+   you want to drop.
+4. **Purge all** — wipes the feed with a confirmation.
+5. **Withheld by filter** — a panel listing every community object the
+   [intel filter](#intel-filter-filtering-between-server-and-vision-one) is
+   keeping out of Vision One, with the exact **reason** (Private / reserved
+   IP, Stale, Low confidence, or Blocklisted). These objects are still stored
+   — nothing is deleted; loosening the matching rule in `config.yaml`
+   (`intel_filter:`) and restarting releases them.
+6. **Community sources** — a table of the OTX puller plus each
+   `taxii_pullers:` entry (kind, enabled/running, last sync, last added,
+   status) with a **Pull now** button. "Pull now" runs one fetch on demand
+   (it works even while a puller is `enabled: false`, for a one-shot fetch),
+   then refreshes the feed table. See
+   [Community Sources](#community-sources-pulling-from-otx-or-any-taxii-21-server).
+
+The UI is a single self-contained `intel-ui.html` (no CDN/JS dependencies,
+works offline), served directly by the Flask app. The browser talks to the
+server over same-origin requests carrying the session cookie.
 
 ## Feeding Intel: API (curl)
 
@@ -211,9 +252,12 @@ configured server.
 
 Returns the latest STIX feed in **TAXII 2 XML** format.
 
-**Authentication:** requires TAXII credentials from `taxii.auth` in
-`config.yaml`, sent either as `X-Taxii-Username` / `X-Taxii-Password`
-headers or HTTP Basic auth. Unauthenticated requests get `401`.
+**Authentication:** the data endpoints (`/feed`, `/objects`,
+`/feed/ingest`, `/feed/purge`, `/community/*`) require credentials — either
+the TAXII credentials from `taxii.auth` in `config.yaml` (sent as
+`X-Taxii-Username` / `X-Taxii-Password` headers or HTTP Basic), **or** a valid
+UI session cookie (from the dashboard login). Unauthenticated requests get
+`401`. For curl, use the TAXII credentials:
 
 **Request:**
 ```bash
@@ -333,6 +377,28 @@ Content-Type: application/x-www-form-urlencoded
 username=your-username&password=your-password
 ```
 
+### UI session endpoints
+
+These drive the dashboard login. They are independent of `taxii.auth`.
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /ui/session` | Current session: `{"authenticated": bool, "user": str\|null}` |
+| `POST /ui/login` | Body `{"username","password"}` checked against `ui.auth`. On success sets the http-only `taxii2_ui_session` cookie (signed with `security.secret_key`, lifetime `ui.session_ttl`); `401` on bad credentials. |
+| `POST /ui/logout` | Deletes the session cookie. |
+
+### Community source endpoints
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /community/pullers` | Status of all community sources: the OTX puller plus each `taxii_pullers:` entry (`name`, `kind`, `enabled`, `running`, `base_url`, `collection` for TAXII, `last_sync`, `last_added`, `last_status`, `last_message`). |
+| `POST /community/pull/otx` | Run one OTX pull cycle now (the UI "Pull now"). Returns `{name, added, error, last_sync, last_status}`. |
+| `POST /community/pull/<name>` | Run one pull cycle now for a `taxii_pullers:` entry named `<name>`. `404` if unknown, `400` if misconfigured. Works even when the puller is `enabled: false` (one-shot fetch). |
+
+> "Pull now" runs **synchronously in the request** (up to ~30 s of external
+> HTTP per call). Enable a puller's background polling with its `enabled:
+> true`; use "Pull now" for on-demand fetches.
+
 ### GET /health
 
 Health check endpoint for monitoring.
@@ -344,9 +410,16 @@ Health check endpoint for monitoring.
   "timestamp": "2026-10-07T10:30:00",
   "objects_count": 42,
   "database": "connected",
-  "poller": {"otx": "stopped", "self_check": "stopped"}
+  "poller": {
+    "otx": "stopped",
+    "self_check": "stopped",
+    "taxii": {"otx-taxii": "running"}
+  }
 }
 ```
+
+`poller.taxii` is a map of puller `name` → `running`/`stopped` (empty `{}`
+when no `taxii_pullers:` entries are configured).
 
 ## Trend Micro Vision One Integration Guide
 
@@ -425,10 +498,10 @@ curl -u admin:admin http://localhost:5000/taxii2/collections/threat-intel/object
 python -c "from taxii2client import ApiRoot; r=ApiRoot('http://localhost:5000/taxii2/',user='admin',password='admin'); r.refresh_collections(); print(r.collections[0].get_objects())"
 ```
 
-### Optional background pollers (both off by default)
+### Optional background pollers (all off by default)
 
-These two are *not* how Vision One works — Vision One polls `/taxii2/` on its
-own (see Step 3). They are optional helpers:
+These are *not* how Vision One works — Vision One polls `/taxii2/` on its
+own (see Step 3). They are optional helpers (all off by default):
 
 - **`otx`** — pulls community threat intel **from AlienVault OTX** (public
   pulses / indicators) into the feed. It lists recently-updated public pulses,
@@ -436,14 +509,64 @@ own (see Step 3). They are optional helpers:
   them in tagged `source='otx'` — so it never wipes your manual/web-UI intel,
   and a web-UI save never wipes OTX intel. To enable, set `otx.enabled: true`
   in `config.yaml` (an optional free `api_key` raises OTX rate limits).
+- **`taxii_pullers:`** — one or more generic pullers that fetch STIX 2.1
+  objects **from any third-party TAXII 2.1 server**, merged in tagged with
+  the puller's `name`. See [Community Sources](#community-sources-pulling-from-otx-or-any-taxii-21-server).
 - **`self_check`** — a self-test that polls this server's *own* `/feed`
   endpoint to confirm it stays reachable. (Previously misnamed `vision_one`;
   that name has been dropped, but old `vision_one:` configs still work.)
 
 > **Note on ingest modes.** `POST /feed/ingest` (web UI / manual) uses
-> *replace* mode scoped to `source='manual'`. The OTX puller uses *merge*
-> mode (upsert by STIX id, append-only). This keeps your hand-fed intel and
-> pulled community intel independent of each other.
+> *replace* mode scoped to `source='manual'`. The OTX and TAXII pullers use
+> *merge* mode (upsert by STIX id, append-only). This keeps your hand-fed
+> intel and pulled community intel independent of each other.
+
+## Community Sources (pulling from OTX or any TAXII 2.1 server)
+
+This is the **ingest side** of the pipeline — how community intel gets *into*
+this server (Vision One only ever reads it out via `/taxii2/`). There are two
+kinds, both shown in the **Community sources** dashboard panel:
+
+### 1. AlienVault OTX (built-in)
+
+Configured under `otx:` (see the block in `config.yaml`). `enabled: false` by
+default. Pulls public pulse indicators (IPv4 / domain / file hash) and merges
+them in tagged `source='otx'`. An optional free `api_key` raises rate limits.
+
+### 2. Third-party TAXII 2.1 servers (`taxii_pullers:`)
+
+Add one entry per source under `taxii_pullers:` in `config.yaml`. Each is a
+self-contained puller that polls a remote TAXII 2.1 collection with Basic
+auth and `Accept: application/taxii+json;version=2.1`:
+
+```yaml
+taxii_pullers:
+  - name: otx-taxii              # doubles as the object `source` tag + UI label
+    base_url: https://otx.alienvault.com/taxii2/
+    username: 'your-otx-api-key' # OTX uses the API key as the username
+    password: ''
+    collection: 'threat-intel'
+    poll_interval: 300           # seconds between background polls
+    max_objects_per_poll: 5000
+    enabled: false               # true to poll in the background
+```
+
+- **`name`** is required and unique — it becomes the `source` tag on every
+  object the puller stores, so it is gated by the intel filter like any other
+  community intel, and appears as its own badge in the UI.
+- **`base_url`** is the remote TAXII **API root** (e.g. `https://host/taxii2/`);
+  the puller requests `{base_url}collections/{collection}/objects/?since=…`.
+- **Delta pulls** — each puller remembers its last sync timestamp in the
+  `puller_state` table and sends it as `?since=`, so restarts resume from where
+  they left off instead of re-pulling everything.
+- **`enabled: false`** still lets you fire a one-shot **Pull now** from the UI
+  (or `POST /community/pull/<name>`) — handy for testing a new source before
+  committing it to background polling.
+
+All pulled objects land in the feed tagged with the puller's `name`, then pass
+through the [intel filter](#intel-filter-filtering-between-server-and-vision-one)
+before reaching Vision One. **No community source pulls anything until you
+enable it** — the server ships with all pullers off.
 
 ## Intel Filter (filtering between server and Vision One)
 
@@ -457,9 +580,13 @@ AlienVault OTX ──pull──▶ this server ──[intel filter]──▶ Vis
 
 Key properties:
 
-- **Community data only.** It applies to objects whose `source` is in
-  `intel_filter.community_sources` (default `['otx']`). Your manually-fed
-  intel (web UI / `POST /feed/ingest`, `source='manual'`) **always passes**.
+- **Community data only.** Which sources are "community" is set by
+  `intel_filter.community_sources`:
+  - `[]` (default) → gate **every non-manual source** (the OTX puller and all
+    `taxii_pullers:` entries), whatever they're named.
+  - `['otx', 'otx-taxii', …]` → gate **only** those named sources.
+  Your manually-fed intel (web UI / `POST /feed/ingest`, `source='manual'`)
+  **always passes**, no matter what.
 - **Vision One feed only.** It is enforced on the `/taxii2/` objects endpoint.
   The web UI (`GET /objects`) still shows *all* stored intel, so you can see
   and manage everything — including objects the gate is withholding.
@@ -485,7 +612,8 @@ object(s) from the TAXII feed`.
 
 ```yaml
 intel_filter:
-  community_sources: ['otx']     # which source tags are "community" (gated)
+  community_sources: []          # default: gate ALL non-manual sources
+  # community_sources: ['otx']   # or gate only these named sources
   drop_private_ips: true         # drop non-routable IPs (biggest noise reducer)
   freshness_days: 30             # drop community intel older than 30 days
   min_confidence: null           # set e.g. 80 to enforce a confidence floor
@@ -507,16 +635,26 @@ python tests/test_server.py
 ```
 
 This covers all TAXII 2.1 endpoints, ingestion (replace + merge modes),
-authentication, subscription management, STIX conversion, TAXII bundle
-generation, the OTX poller (init, URL/headers, indicator mapping, and
-manual-vs-OTX source isolation), and the intel gate (private-IP drop,
-freshness, confidence floor, blocklist, and that manual intel is never gated).
+authentication (TAXII creds **and** the UI session cookie), subscription
+management, STIX 2.1 object mapping (IP / domain / file-hash / indicator
+patterns), TAXII bundle generation, the OTX poller (init, URL/headers,
+indicator mapping, and manual-vs-OTX source isolation), the generic
+**third-party TAXII 2.1 puller** (init, headers, fetch-and-merge, state
+persistence, misconfigured handling), the **community source endpoints**
+(`GET /community/pullers`, `POST /community/pull/<name>`), the **UI
+login/logout/session** flow (cookie set, wrong-password 401, session grants
+data access), and the intel gate (private-IP drop, freshness, confidence
+floor, blocklist, and that manual intel is never gated).
 
 ## Security Considerations
 
 - Use **HTTPS/TLS** for production deployments (configurable via reverse proxy).
+- **Set a strong `ui.auth` password** and change it from the default
+  `admin`/`admin` — anyone who knows it can manage the feed and trigger pulls.
+- **Set `FLASK_SECRET`** (via `security.secret_key` / env) — the UI session
+  cookie is signed with it; an unset/dev value lets a forged cookie
+  authenticate to the data endpoints.
 - Use strong, unique passwords and store them hashed.
-- Set `SECRET_KEY` or `FLASK_SECRET` environment variable.
 - Set `debug: false` in production.
 - Rate-limit ingestion requests if needed.
 - Disable CORS (`flask_cors`) only for trusted origins.

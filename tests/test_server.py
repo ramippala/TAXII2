@@ -85,8 +85,16 @@ class TestTaxiiServer(unittest.TestCase):
         }
 
     def _get_auth_headers(self):
-        """Get auth headers for TAXII 2 requests."""
+        """Get auth headers for TAXII 2 requests (valid for data endpoints)."""
         return self.test_auth_headers
+
+    def _ingest(self, stix_objects):
+        """POST /feed/ingest with auth headers."""
+        return self.client.post(
+            '/feed/ingest',
+            json={'stix_objects': stix_objects},
+            headers=self._get_auth_headers(),
+        )
 
     def test_health_check(self):
         """Test health check endpoint"""
@@ -110,100 +118,86 @@ class TestTaxiiServer(unittest.TestCase):
 
     def test_ingest_ip_address(self):
         """Test ingestion of IP address object"""
-        response = self.client.post(
-            '/feed/ingest',
-            json={
-                'stix_objects': [
-                    {
-                        'id': 'ipv4-addr--123',
-                        'type': 'ipv4-addr',
-                        'object': {'ipv4-addr': {'value': '192.168.1.100'}},
-                        'labels': ['threat', 'malicious'],
-                        'confidence': 80,
-                    }
-                ]
+        response = self._ingest([
+            {
+                'id': 'ipv4-addr--123',
+                'type': 'ipv4-addr',
+                'object': {'ipv4-addr': {'value': '192.168.1.100'}},
+                'labels': ['threat', 'malicious'],
+                'confidence': 80,
             }
-        )
+        ])
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
         self.assertEqual(data['message'], 'Data ingested successfully')
         self.assertEqual(data['objects_count'], 1)
 
-    def test_ingest_file_hash(self):
-        """Test ingestion of file hash object"""
+    def test_ingest_no_auth(self):
+        """Test ingestion without auth returns 401"""
         response = self.client.post(
             '/feed/ingest',
-            json={
-                'stix_objects': [
-                    {
-                        'id': 'file-hash--abcdef1234567890',
-                        'type': 'file-hash',
-                        'object': {
-                            'hash_value': {
-                                'algorithm': 'sha256',
-                                'value': 'a' * 64,
-                            }
-                        },
-                        'labels': ['sha256', 'malware'],
-                        'confidence': 75,
-                    }
-                ]
-            }
+            json={'stix_objects': [
+                {'id': 'ipv4-addr--1', 'type': 'ipv4-addr',
+                 'object': {'ipv4-addr': {'value': '1.2.3.4'}}}
+            ]},
         )
+        self.assertEqual(response.status_code, 401)
+
+    def test_ingest_file_hash(self):
+        """Test ingestion of file hash object"""
+        response = self._ingest([
+            {
+                'id': 'file-hash--abcdef1234567890',
+                'type': 'file-hash',
+                'object': {
+                    'hash_value': {
+                        'algorithm': 'sha256',
+                        'value': 'a' * 64,
+                    }
+                },
+                'labels': ['sha256', 'malware'],
+                'confidence': 75,
+            }
+        ])
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()['objects_count'], 1)
 
     def test_ingest_domain_name(self):
         """Test ingestion of domain name object"""
-        response = self.client.post(
-            '/feed/ingest',
-            json={
-                'stix_objects': [
-                    {
-                        'id': 'domain-name--789',
-                        'type': 'domain-name',
-                        'object': {'domain-name': {'value': 'malicious.example.com'}},
-                        'labels': ['threat', 'malicious'],
-                        'confidence': 65,
-                    }
-                ]
+        response = self._ingest([
+            {
+                'id': 'domain-name--789',
+                'type': 'domain-name',
+                'object': {'domain-name': {'value': 'malicious.example.com'}},
+                'labels': ['threat', 'malicious'],
+                'confidence': 65,
             }
-        )
+        ])
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()['objects_count'], 1)
 
     def test_ingest_indicator(self):
         """Test ingestion of indicator object"""
-        response = self.client.post(
-            '/feed/ingest',
-            json={
-                'stix_objects': [
-                    {
-                        'id': 'indicator--abc',
-                        'type': 'indicator',
-                        'object': {'indicator': {'value': 'Suspicious Activity', 'labels': ['threat']}},
-                        'confidence': 90,
-                    }
-                ]
+        response = self._ingest([
+            {
+                'id': 'indicator--abc',
+                'type': 'indicator',
+                'object': {'indicator': {'value': 'Suspicious Activity', 'labels': ['threat']}},
+                'confidence': 90,
             }
-        )
+        ])
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()['objects_count'], 1)
 
     def test_get_feed_after_ingest(self):
         """Test feed retrieval after ingestion (with auth)"""
-        self.client.post(
-            '/feed/ingest',
-            json={
-                'stix_objects': [
-                    {
-                        'id': 'ipv4-addr--123',
-                        'type': 'ipv4-addr',
-                        'object': {'ipv4-addr': {'value': '192.168.1.100'}},
-                    }
-                ]
+        self._ingest([
+            {
+                'id': 'ipv4-addr--123',
+                'type': 'ipv4-addr',
+                'object': {'ipv4-addr': {'value': '192.168.1.100'}},
             }
-        )
+        ])
         response = self.client.get('/feed', headers=self._get_auth_headers())
         self.assertEqual(response.status_code, 200)
         xml = response.data.decode('utf-8')
@@ -211,25 +205,233 @@ class TestTaxiiServer(unittest.TestCase):
 
     def test_purge_data(self):
         """Test data purge endpoint"""
-        self.client.post(
-            '/feed/ingest',
-            json={
-                'stix_objects': [
-                    {
-                        'id': 'ipv4-addr--123',
-                        'type': 'ipv4-addr',
-                        'object': {'ipv4-addr': {'value': '192.168.1.100'}},
-                    }
-                ]
+        self._ingest([
+            {
+                'id': 'ipv4-addr--123',
+                'type': 'ipv4-addr',
+                'object': {'ipv4-addr': {'value': '192.168.1.100'}},
             }
-        )
-        response = self.client.delete('/feed/purge')
+        ])
+        response = self.client.delete('/feed/purge', headers=self._get_auth_headers())
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
         self.assertEqual(data['message'], 'All data purged successfully')
 
         # Verify store is empty
         self.assertEqual(len(memory_store), 0)
+
+    def test_purge_no_auth(self):
+        """Test purge without auth returns 401"""
+        response = self.client.delete('/feed/purge')
+        self.assertEqual(response.status_code, 401)
+
+    # ------------------------------------------------------------------
+    # Web UI session auth
+    # ------------------------------------------------------------------
+    def test_ui_session_unauthenticated(self):
+        """Test /ui/session reports not authenticated without a cookie."""
+        response = self.client.get('/ui/session')
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertFalse(data['authenticated'])
+        self.assertIsNone(data['user'])
+
+    def test_ui_login_success_sets_cookie(self):
+        """Test /ui/login with correct ui.auth creds sets a session cookie."""
+        # The UI creds come from ui.auth in config (default admin/admin in tests).
+        import server
+        user, pw = server._ui_username, server._ui_password
+        response = self.client.post(
+            '/ui/login',
+            json={'username': user, 'password': pw},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.set_cookie)  # a session cookie was set
+        # The session is now valid.
+        session = self.client.get('/ui/session').get_json()
+        self.assertTrue(session['authenticated'])
+        self.assertEqual(session['user'], user)
+
+    def test_ui_login_wrong_password(self):
+        """Test /ui/login rejects a wrong password."""
+        import server
+        response = self.client.post(
+            '/ui/login',
+            json={'username': server._ui_username, 'password': 'wrong-password-xyz'},
+        )
+        self.assertEqual(response.status_code, 401)
+
+    def test_ui_session_cookie_grants_data_access(self):
+        """Test a valid UI session cookie can read /objects (no TAXII headers)."""
+        import server
+        user, pw = server._ui_username, server._ui_password
+        login = self.client.post('/ui/login', json={'username': user, 'password': pw})
+        cookie = None
+        for k, v in login.headers:
+            if k.lower() == 'set-cookie' and 'taxii2_ui_session' in v:
+                cookie = v.split('=', 1)[1].split(';', 1)[0]
+        self.assertIsNotNone(cookie, "login should set a session cookie")
+        # Use the cookie directly (no X-Taxii-* headers) to read /objects.
+        response = self.client.get(
+            '/objects',
+            headers={'Cookie': f'taxii2_ui_session={cookie}'},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('count', response.get_json())
+
+    def test_ui_logout_clears_cookie(self):
+        """Test /ui/logout clears the session cookie."""
+        import server
+        user, pw = server._ui_username, server._ui_password
+        self.client.post('/ui/login', json={'username': user, 'password': pw})
+        response = self.client.post('/ui/logout')
+        self.assertEqual(response.status_code, 200)
+        set_cookies = [v for k, v in response.headers if k.lower() == 'set-cookie']
+        self.assertTrue(any('taxii2_ui_session=' in c for c in set_cookies))
+        # After logout the session no longer authenticates.
+        self.assertFalse(self.client.get('/ui/session').get_json()['authenticated'])
+
+    def test_objects_accepts_session_or_taxii(self):
+        """Test /objects accepts EITHER a session cookie OR TAXII headers."""
+        import server
+        # With TAXII headers (no cookie).
+        r1 = self.client.get('/objects', headers=self._get_auth_headers())
+        self.assertEqual(r1.status_code, 200)
+        # With a session cookie (no headers).
+        self.client.post('/ui/login', json={'username': server._ui_username, 'password': server._ui_password})
+        r2 = self.client.get('/objects')
+        self.assertEqual(r2.status_code, 200)
+
+    def test_objects_rejects_no_creds(self):
+        """Test /objects with neither cookie nor TAXII headers returns 401."""
+        self.client.delete_cookie('taxii2_ui_session')
+        response = self.client.get('/objects')
+        self.assertEqual(response.status_code, 401)
+
+    # ------------------------------------------------------------------
+    # Third-party TAXII 2.1 puller
+    # ------------------------------------------------------------------
+    def test_stix21_object_mapping_ipv4(self):
+        """Test STIX 2.1 ipv4-addr -> our descriptor."""
+        import server
+        d = server._stix21_object_to_our(
+            {'type': 'ipv4-addr', 'value': '203.0.113.9', 'labels': ['c2'], 'confidence': 85})
+        self.assertIsNotNone(d)
+        self.assertEqual(d['type'], 'ipv4-addr')
+        self.assertEqual(d['object']['ipv4-addr']['value'], '203.0.113.9')
+        self.assertEqual(d['confidence'], 85)
+
+    def test_stix21_object_mapping_domain(self):
+        """Test STIX 2.1 domain-name -> our descriptor."""
+        import server
+        d = server._stix21_object_to_our({'type': 'domain-name', 'value': 'bad.example.com'})
+        self.assertIsNotNone(d)
+        self.assertEqual(d['type'], 'domain-name')
+        self.assertEqual(d['object']['domain-name']['value'], 'bad.example.com')
+
+    def test_stix21_object_mapping_file(self):
+        """Test STIX 2.1 file (hashes) -> our file-hash descriptor."""
+        import server
+        d = server._stix21_object_to_our(
+            {'type': 'file', 'hashes': {'SHA-256': 'b' * 64}})
+        self.assertIsNotNone(d)
+        self.assertEqual(d['type'], 'file-hash')
+        self.assertEqual(d['object']['hash_value']['algorithm'], 'sha256')
+        self.assertEqual(d['object']['hash_value']['value'], 'b' * 64)
+
+    def test_stix21_object_mapping_indicator_pattern(self):
+        """Test STIX 2.1 indicator (IP pattern) -> our ipv4 descriptor."""
+        import server
+        d = server._stix21_object_to_our({
+            'type': 'indicator', 'pattern': "[ipv4-addr:value = '198.51.100.7']"})
+        self.assertIsNotNone(d)
+        # Pattern points at an IP -> mapped to ipv4-addr.
+        self.assertEqual(d['type'], 'ipv4-addr')
+        self.assertEqual(d['object']['ipv4-addr']['value'], '198.51.100.7')
+
+    def test_stix21_object_mapping_unsupported(self):
+        """Test unsupported/invalid STIX objects are dropped."""
+        import server
+        self.assertIsNone(server._stix21_object_to_our({'type': 'malware', 'name': 'x'}))
+        self.assertIsNone(server._stix21_object_to_our({'type': 'ipv4-addr', 'value': '999.1.1.1'}))
+        self.assertIsNone(server._stix21_object_to_our({'type': 'file'}))
+
+    def test_taxii_puller_init(self):
+        """Test TaxiiPuller initialization and URL building."""
+        import server
+        p = server.TaxiiPuller({
+            'name': 'acme',
+            'base_url': 'https://taxii.example.com/taxii2/',
+            'username': 'u', 'password': 'p',
+            'collection': 'feed1',
+            'poll_interval': 120,
+            'max_objects_per_poll': 10,
+        })
+        self.assertEqual(p.name, 'acme')
+        self.assertEqual(p.base_url, 'https://taxii.example.com/taxii2')
+        self.assertEqual(p.collection, 'feed1')
+        self.assertEqual(p.max_objects_per_poll, 10)
+        self.assertEqual(p.state_id, 'taxii:acme')
+        self.assertFalse(p.enabled)
+        # Basic auth header is built.
+        self.assertIn('Authorization', p._headers('x'))
+        self.assertEqual(p._headers('x')['Authorization'].startswith('Basic '), True)
+        # API root url keeps the trailing slash.
+        self.assertTrue(p._api_root_url().endswith('/'))
+
+    def test_taxii_puller_misconfigured(self):
+        """Test a puller missing base_url/collection reports misconfigured."""
+        import server
+        p = server.TaxiiPuller({'name': 'x'})
+        added, err = p._poll_once()
+        self.assertEqual(added, 0)
+        self.assertIn('misconfigured', err)
+
+    def test_taxii_puller_fetch_and_merge(self):
+        """Test TaxiiPuller fetch + map + merge (with a stubbed _fetch_objects)."""
+        import server
+        _reset_db()
+        p = server.TaxiiPuller({
+            'name': 'testpull', 'base_url': 'https://x/taxii2', 'collection': 'c',
+        })
+        p._fetch_objects = lambda since: [
+            {'type': 'ipv4-addr', 'value': '8.8.8.8', 'confidence': 60},
+            {'type': 'domain-name', 'value': 'c2.example.com'},
+            {'type': 'ipv4-addr', 'value': '10.1.1.1'},  # private -> still stored, gated
+            {'type': 'malware', 'name': 'drop'},           # unsupported -> skipped
+        ]
+        added, err = p._poll_once()
+        self.assertIsNone(err)
+        self.assertEqual(added, 3)
+        # They are stored with source='testpull'.
+        session = server.create_session()
+        try:
+            rows = session.query(server.STIXObject).filter_by(source='testpull').all()
+            vals = {r.ip_address or r.domain for r in rows}
+        finally:
+            session.close()
+        self.assertEqual(vals, {'8.8.8.8', 'c2.example.com', '10.1.1.1'})
+        # State was persisted.
+        st = server.read_puller_state(p.state_id)
+        self.assertEqual(st['last_status'], 'ok')
+        self.assertEqual(st['last_added'], 3)
+
+    def test_community_pullers_endpoint_requires_auth(self):
+        """Test /community/pullers requires auth."""
+        self.client.delete_cookie('taxii2_ui_session')
+        response = self.client.get('/community/pullers')
+        self.assertEqual(response.status_code, 401)
+        # With TAXII headers it works and lists the OTX puller.
+        r2 = self.client.get('/community/pullers', headers=self._get_auth_headers())
+        self.assertEqual(r2.status_code, 200)
+        names = [p['name'] for p in r2.get_json()['pullers']]
+        self.assertIn('AlienVault OTX', names)
+
+    def test_community_pull_unknown(self):
+        """Test /community/pull/<name> 404s for an unknown puller."""
+        response = self.client.post(
+            '/community/pull/nope', headers=self._get_auth_headers())
+        self.assertEqual(response.status_code, 404)
 
     def test_auth_success(self):
         """Test successful authentication"""

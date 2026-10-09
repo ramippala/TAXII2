@@ -165,6 +165,28 @@ class Subscription(Base):
     last_verified = Column(DateTime, nullable=True)
 
 
+class PullerState(Base):
+    """Per-community-puller state: last sync timestamp + status.
+
+    Lets the OTX / TAXII pullers resume from where they left off (``?since=``
+    delta polling) across restarts, and exposes the last run to the dashboard.
+    """
+
+    __tablename__ = "puller_state"
+
+    id = Column(String, primary_key=True)          # e.g. 'otx' or 'taxii:<name>'
+    last_sync = Column(DateTime, nullable=True)     # last successful poll (UTC)
+    last_added = Column(Integer, default=0)         # objects added on last poll
+    last_status = Column(String, nullable=True)     # 'ok' | 'error'
+    last_message = Column(String, nullable=True)    # error detail / summary
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+def _utc_now_iso() -> str:
+    """Current UTC time as ISO-8601 'Z' (STIX 2.1 / TAXII ?since= format)."""
+    return datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
 def create_session():
     """Create a new database session (caller is responsible for closing)."""
     return SessionLocal()
@@ -220,6 +242,58 @@ def rehydrate_memory() -> int:
     if count:
         logger.info("Rehydrated %s object(s) from database into memory", count)
     return count
+
+
+# ---------------------------------------------------------------------------
+# Community-puller state (persisted ?since= delta + status for the dashboard)
+# ---------------------------------------------------------------------------
+
+def save_puller_state(puller_id: str, status: str, added: int = 0,
+                      message: Optional[str] = None) -> None:
+    """Persist a puller's last-run state (used for ?since= resume + UI)."""
+    session = create_session()
+    try:
+        row = session.query(PullerState).filter_by(id=puller_id).first()
+        if row is None:
+            row = PullerState(id=puller_id)
+            session.add(row)
+        row.last_sync = datetime.utcnow()
+        row.last_added = int(added or 0)
+        row.last_status = status
+        row.last_message = message
+        session.commit()
+    except Exception as exc:  # pragma: no cover - persistence is best-effort
+        session.rollback()
+        logger.error("Failed to save puller state %s: %s", puller_id, exc)
+    finally:
+        session.close()
+
+
+def read_puller_state(puller_id: str) -> Optional[Dict[str, Any]]:
+    """Read a puller's persisted state dict (or None if never run)."""
+    session = create_session()
+    try:
+        row = session.query(PullerState).filter_by(id=puller_id).first()
+        if row is None:
+            return None
+        return {
+            'last_sync': row.last_sync.isoformat() + 'Z' if row.last_sync else None,
+            'last_added': row.last_added or 0,
+            'last_status': row.last_status,
+            'last_message': row.last_message,
+        }
+    finally:
+        session.close()
+
+
+def _puller_since_iso(puller_id: str) -> Optional[str]:
+    """Return the last-sync time as an ISO 'Z' string for ?since=, or None
+    (meaning a full pull) if the puller has never synced."""
+    st = read_puller_state(puller_id)
+    if not st or not st.get('last_sync'):
+        return None
+    # last_sync is 'YYYY-MM-DDTHH:MM:SS.ffffffZ' — drop microseconds for ?since=
+    return st['last_sync'].split('.')[0] + 'Z'
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +411,52 @@ def _validate_taxii_auth(client_user: str, client_pass: str) -> bool:
         client_user == auth.get('username')
         and client_pass == auth.get('password')
     )
+
+
+# ---------------------------------------------------------------------------
+# Web UI session auth (separate from TAXII credentials)
+# ---------------------------------------------------------------------------
+
+UI_CFG = CONFIG.get('ui', {}) or {}
+UI_AUTH = UI_CFG.get('auth', {}) or {}
+_ui_username = str(UI_AUTH.get('username') or 'admin')
+_ui_password = str(UI_AUTH.get('password') or 'admin')
+_ui_secret = str(CONFIG.get('security', {}).get('secret_key', 'dev-secret-key-change-in-production'))
+_ui_session_ttl = int(UI_CFG.get('session_ttl', 43200))  # seconds (default 12 h)
+
+from itsdangerous import BadSignature, URLSafeTimedSerializer
+
+_session_serializer = URLSafeTimedSerializer(_ui_secret, salt='taxii2-ui-session')
+
+
+def _session_cookie(username: str) -> str:
+    """Create a signed, time-bounded session cookie for the web UI."""
+    return _session_serializer.dumps({'user': username})
+
+
+def _session_user() -> Optional[str]:
+    """Decode the session cookie; returns the username or None."""
+    token = request.cookies.get('taxii2_ui_session')
+    if not token:
+        return None
+    try:
+        payload = _session_serializer.loads(token, max_age=_ui_session_ttl)
+        return payload.get('user')
+    except BadSignature:
+        return None
+
+
+def _ui_session_valid() -> bool:
+    return _session_user() is not None
+
+
+def _request_allowed() -> bool:
+    """Data endpoints accept TAXII credentials (scripts / Vision One,
+    unchanged) OR a valid web-UI session cookie (browser)."""
+    user, pw = _request_taxii_credentials()
+    if _validate_taxii_auth(user, pw):
+        return True
+    return _ui_session_valid()
 
 
 # ---------------------------------------------------------------------------
@@ -698,8 +818,11 @@ def threat_intel_to_stix21(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
 # so it is fully auditable and reversible.
 
 FILTER_CFG = (CONFIG.get('intel_filter', {}) or {})
+# By default EVERY source except 'manual' is gated (OTX pulls, third-party
+# TAXII pulls, ...). If community_sources is explicitly set (non-empty),
+# only those sources are gated and other non-manual sources are served.
 FILTER_COMMUNITY_SOURCES = tuple(
-    FILTER_CFG.get('community_sources', ['otx'])
+    (FILTER_CFG.get('community_sources') or [])
 )
 FILTER_DROP_PRIVATE_IPS = bool(FILTER_CFG.get('drop_private_ips', True))
 FILTER_BLOCKLIST = {
@@ -788,6 +911,21 @@ _GATE_REASON_LABELS = {
 }
 
 
+def _source_is_gated(src: Optional[str]) -> bool:
+    """True if intel from ``src`` passes through the intel gate.
+
+    Manual intel is never gated. When ``intel_filter.community_sources`` is
+    set (non-empty) only those sources are gated; otherwise every non-manual
+    source is gated (default — OTX, third-party TAXII pulls, ...).
+    """
+    src = src or 'manual'
+    if src == 'manual':
+        return False
+    if FILTER_COMMUNITY_SOURCES:
+        return src in FILTER_COMMUNITY_SOURCES
+    return True
+
+
 def gate_verdict(obj: ThreatIntel, row: 'STIXObject') -> Dict[str, Any]:
     """Return the intel-gate verdict for a stored object.
 
@@ -801,10 +939,10 @@ def gate_verdict(obj: ThreatIntel, row: 'STIXObject') -> Dict[str, Any]:
          'reason': str|None,               # machine reason or None
          'reason_label': str}              # human-readable reason ('' if served)
 
-    Manual / non-community objects are never gated (``gated`` False).
+    Manual intel is never gated (``gated`` False).
     """
     src = obj.source or 'manual'
-    if src not in FILTER_COMMUNITY_SOURCES:
+    if not _source_is_gated(src):
         return {'source': src, 'gated': False, 'reason': None, 'reason_label': ''}
     reason = community_intel_reason(obj, row)
     if reason is None:
@@ -1066,8 +1204,7 @@ def taxii_subscriptions():
 @app.route('/feed', methods=['GET'])
 def get_feed():
     """GET /feed — latest STIX feed in TAXII 2 XML format (authenticated)."""
-    client_user, client_pass = _request_taxii_credentials()
-    if not _validate_taxii_auth(client_user, client_pass):
+    if not _request_allowed():
         return _unauthorized_feed_response()
 
     session = create_session()
@@ -1101,8 +1238,7 @@ def list_objects():
     Used by the web UI (and handy for scripting): lists what is currently
     in the feed so entries can be reviewed before re-ingesting.
     """
-    client_user, client_pass = _request_taxii_credentials()
-    if not _validate_taxii_auth(client_user, client_pass):
+    if not _request_allowed():
         return jsonify({'error': 'Unauthorized'}), 401
 
     session = create_session()
@@ -1156,6 +1292,8 @@ def web_ui():
 @app.route('/feed/ingest', methods=['POST'])
 def ingest_data():
     """POST /feed/ingest — accept STIX 2.1 JSON objects, replace the feed."""
+    if not _request_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json(silent=True)
     if not data or not data.get('stix_objects'):
         return jsonify({'error': 'No valid data provided'}), 400
@@ -1176,6 +1314,8 @@ def ingest_data():
 @app.route('/feed/purge', methods=['DELETE'])
 def purge_data():
     """DELETE /feed/purge — purge all threat intelligence data."""
+    if not _request_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
     try:
         purge_all()
     except Exception as exc:
@@ -1280,6 +1420,71 @@ def add_subscription(client_id: str):
         session.close()
 
 
+# ---------------------------------------------------------------------------
+# Web UI session + community-source (puller) endpoints
+# ---------------------------------------------------------------------------
+
+@app.route('/ui/session', methods=['GET'])
+def ui_session():
+    """GET /ui/session — report whether the current cookie is a valid login."""
+    user = _session_user()
+    return jsonify({'authenticated': user is not None, 'user': user or None}), 200
+
+
+@app.route('/ui/login', methods=['POST'])
+def ui_login():
+    """POST /ui/login — authenticate to the dashboard, set a session cookie."""
+    data = request.get_json(silent=True) or {}
+    username = str(data.get('username') or '')
+    password = str(data.get('password') or '')
+    if username != _ui_username or password != _ui_password:
+        return jsonify({'error': 'Invalid credentials'}), 401
+    resp = jsonify({'message': 'Logged in', 'user': username})
+    resp.set_cookie(
+        'taxii2_ui_session',
+        _session_cookie(username),
+        max_age=_ui_session_ttl,
+        httponly=True,
+        samesite='Lax',
+    )
+    return resp, 200
+
+
+@app.route('/ui/logout', methods=['POST'])
+def ui_logout():
+    """POST /ui/logout — clear the dashboard session cookie."""
+    resp = jsonify({'message': 'Logged out'})
+    resp.delete_cookie('taxii2_ui_session')
+    return resp, 200
+
+
+@app.route('/community/pullers', methods=['GET'])
+def community_pullers():
+    """GET /community/pullers — status of all community sources (dashboard)."""
+    if not _request_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    return jsonify({
+        'pullers': [otx_poller.status()] + [p.status() for p in taxii_pullers],
+    }), 200
+
+
+@app.route('/community/pull/<name>', methods=['POST'])
+def community_pull(name: str):
+    """POST /community/pull/<name> — run one pull cycle now ('Pull now')."""
+    if not _request_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    if name == 'otx':
+        puller = otx_poller
+    else:
+        puller = next((p for p in taxii_pullers if p.name == name), None)
+    if puller is None:
+        return jsonify({'error': f'Unknown puller: {name}'}), 404
+    result = puller.pull_now()
+    if result.get('error') and 'misconfigured' in result['error']:
+        return jsonify(result), 400
+    return jsonify(result), 200
+
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """GET /health — health check endpoint for monitoring."""
@@ -1305,6 +1510,7 @@ def health_check():
                 'poller': {
                     'otx': _poller_state(otx_poller),
                     'self_check': _poller_state(self_check_poller),
+                    'taxii': {p.name: _poller_state(p) for p in taxii_pullers},
                 },
             }
         ),
@@ -1418,6 +1624,16 @@ def _guess_object_type(value: str) -> Tuple[str, Optional[str]]:
     if _DOMAIN_RE.match(value):
         return 'domain-name', None
     return 'indicator', None
+
+
+def _is_valid_ipv4(value: str) -> bool:
+    """True for a syntactically valid IPv4 address (each octet 0-255)."""
+    if not _IPV4_RE.match(value):
+        return False
+    try:
+        return all(0 <= int(o) <= 255 for o in value.split('.'))
+    except (ValueError, AttributeError):
+        return False
 
 
 # OTX indicator type -> (our object type, hash algorithm if any)
@@ -1611,12 +1827,48 @@ class OtxPoller:
         if not stix_objects:
             self.last_poll_at = datetime.utcnow()
             self.last_poll_added = 0
+            save_puller_state('otx', 'ok', 0, 'no new indicators')
             return 0
 
         added = ingest_objects(stix_objects, mode='merge', source=self.SOURCE)
         self.last_poll_at = datetime.utcnow()
         self.last_poll_added = added
+        save_puller_state('otx', 'ok', added, f'{added} object(s) ingested')
         return added
+
+    def status(self) -> Dict[str, Any]:
+        """Dashboard status for the OTX puller."""
+        st = read_puller_state('otx') or {}
+        return {
+            'name': 'AlienVault OTX',
+            'kind': 'otx',
+            'enabled': self.enabled,
+            'running': bool(self._thread and self._thread.is_alive()),
+            'base_url': self.base_url,
+            'last_sync': st.get('last_sync'),
+            'last_added': st.get('last_added', 0),
+            'last_status': st.get('last_status'),
+            'last_message': st.get('last_message'),
+        }
+
+    def pull_now(self) -> Dict[str, Any]:
+        """Run one poll cycle synchronously (for the dashboard 'Pull now')."""
+        if not self.base_url:
+            return {'name': 'AlienVault OTX', 'added': 0,
+                    'error': 'misconfigured (base_url missing)'}
+        try:
+            added = self._poll_once()
+        except Exception as exc:
+            save_puller_state('otx', 'error', 0, str(exc))
+            return {'name': 'AlienVault OTX', 'added': 0, 'error': str(exc)}
+        st = read_puller_state('otx') or {}
+        return {
+            'name': 'AlienVault OTX',
+            'added': added,
+            'error': None,
+            'last_sync': st.get('last_sync'),
+            'last_status': st.get('last_status'),
+        }
 
     def start(self) -> None:
         """Start background poller."""
@@ -1652,6 +1904,270 @@ class OtxPoller:
 
 
 # ---------------------------------------------------------------------------
+# Generic TAXII 2.1 puller — pulls objects FROM third-party TAXII servers
+# ---------------------------------------------------------------------------
+
+# STIX 2.1 object types we can map onto our store (type -> our object_type).
+_STIX_TO_OUR_TYPE = {
+    'ipv4-addr': 'ipv4-addr',
+    'domain-name': 'domain-name',
+    'file': 'file-hash',
+    'indicator': 'indicator',
+}
+_HASH_ALGO_BY_STIX_KEY = {
+    'MD5': 'md5', 'SHA-1': 'sha1', 'SHA-256': 'sha256', 'SHA-512': 'sha512',
+}
+
+
+def _stix21_object_to_our(o: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Map a raw STIX 2.1 object (ipv4-addr / domain-name / file / indicator)
+    to an ingestable descriptor. Returns None for unsupported/invalid objects.
+    """
+    stype = o.get('type')
+    if stype not in _STIX_TO_OUR_TYPE:
+        return None
+    our_type = _STIX_TO_OUR_TYPE[stype]
+
+    if our_type == 'ipv4-addr':
+        value = o.get('value')
+        if not value or not _is_valid_ipv4(str(value)):
+            return None
+        payload = {'ipv4-addr': {'value': value}}
+        stix_id = f"ipv4-addr--{str(value).replace('.', '-')}"
+        labels = list(o.get('labels') or [])
+        name = None
+    elif our_type == 'domain-name':
+        value = o.get('value')
+        if not value or not _DOMAIN_RE.match(str(value)):
+            return None
+        payload = {'domain-name': {'value': value}}
+        stix_id = f"domain-name--{str(value).replace('.', '-')}"
+        labels = list(o.get('labels') or [])
+        name = None
+    elif our_type == 'file-hash':
+        hashes = o.get('hashes') or {}
+        algo = None
+        value = None
+        for key, val in hashes.items():
+            algo = _HASH_ALGO_BY_STIX_KEY.get(str(key).upper(), 'sha256')
+            value = val
+            break
+        if not value:
+            return None
+        if not _HASH_RE.match(str(value)):
+            return None
+        payload = {'hash_value': {'algorithm': algo, 'value': str(value)}}
+        stix_id = f"file-hash--{str(value)[:16]}"
+        labels = [algo] + list(o.get('labels') or [])
+        name = None
+    else:  # indicator
+        value = None
+        pattern = o.get('pattern') or ''
+        m = re.search(r"= '([^']+)'", pattern)
+        if m:
+            value = m.group(1)
+        if not value:
+            value = o.get('value') or o.get('name') or o.get('description')
+        if not value:
+            return None
+        guessed, _ = _guess_object_type(str(value))
+        if guessed == 'ipv4-addr' and _is_valid_ipv4(str(value)):
+            stix_id = f"ipv4-addr--{str(value).replace('.', '-')}"
+        elif guessed == 'domain-name' and _DOMAIN_RE.match(str(value)):
+            stix_id = f"domain-name--{str(value).replace('.', '-')}"
+        else:
+            stix_id = f"indicator--{uuid.uuid5(uuid.NAMESPACE_OID, str(value)).hex[:16]}"
+        our_type = guessed if guessed in ('ipv4-addr', 'domain-name') else 'indicator'
+        if our_type == 'ipv4-addr':
+            payload = {'ipv4-addr': {'value': str(value)}}
+        elif our_type == 'domain-name':
+            payload = {'domain-name': {'value': str(value)}}
+        else:
+            payload = {'indicator': {'value': str(value)}}
+        labels = list(o.get('labels') or [])
+        name = o.get('name')
+
+    return {
+        'id': stix_id,
+        'type': our_type,
+        'object': payload,
+        'labels': labels or [],
+        'confidence': int(o.get('confidence', 0) or 0) or 50,
+        'name': name,
+    }
+
+
+class TaxiiPuller:
+    """
+    Pulls STIX 2.1 objects FROM a third-party TAXII 2.1 server into the feed.
+
+    Any TAXII 2.1 server can be configured (not just OTX): discover its API
+    root, pick a collection, and this puller polls it with HTTP Basic auth,
+    honoring the server's ``?since=`` delta capability. Pulled objects are
+    ingested in *merge* mode tagged with the puller's ``source`` (e.g.
+    'otx-taxii', 'acme-taxii') so they are:
+      * independent of manual intel, and
+      * subject to the community intel gate (source != 'manual').
+
+    Config block (one entry in the top-level ``taxii_pullers:`` list):
+        name: otx-taxii                 # id / source tag / dashboard label
+        base_url: https://server/taxii2/  # API Root URL (trailing slash ok)
+        username: user
+        password: pass
+        collection: threat-intel         # collection id to poll
+        poll_interval: 300
+        max_objects_per_poll: 5000
+        enabled: true
+    """
+
+    KIND = 'taxii'
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config or {}
+        self.name = str(self.config.get('name') or 'taxii').strip() or 'taxii'
+        self.base_url = (self.config.get('base_url') or '').rstrip('/')
+        self.username = self.config.get('username') or ''
+        self.password = self.config.get('password') or ''
+        self.collection = (self.config.get('collection') or '').strip().lstrip('/')
+        self.poll_interval = int(self.config.get('poll_interval', 300))
+        self.max_objects_per_poll = int(self.config.get('max_objects_per_poll', 5000))
+        self.enabled = bool(self.config.get('enabled', False))
+        self._stop = False
+        self._thread: Optional[threading.Thread] = None
+        self.state_id = f'taxii:{self.name}'
+
+    def _headers(self, url: str, since: Optional[str] = None) -> Dict[str, str]:
+        headers = {
+            'Accept': 'application/taxii+json;version=2.1',
+            'User-Agent': 'TAXII-Server-Puller/1.0',
+        }
+        if self.username:
+            token = base64.b64encode(
+                f'{self.username}:{self.password}'.encode('utf-8')
+            ).decode('ascii')
+            headers['Authorization'] = f'Basic {token}'
+        return headers
+
+    def _api_root_url(self) -> str:
+        return self.base_url + '/' if not self.base_url.endswith('/') else self.base_url
+
+    def _get_taxii(self, path: str, since: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """GET a TAXII 2.1 resource under the API root; returns parsed JSON."""
+        url = self._api_root_url() + path
+        if since:
+            url += (('&' if '?' in url else '?') + f'since={since}')
+        req = urllib.request.Request(url, headers=self._headers(url), method='GET')
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as exc:
+            logger.error("TAXII pull %s HTTP %s (%s)", self.name, exc.code, url)
+            return None
+        except Exception as exc:
+            logger.error("TAXII pull %s failed: %s", self.name, exc)
+            return None
+
+    def _fetch_objects(self, since: Optional[str]) -> List[Dict[str, Any]]:
+        """Fetch STIX 2.1 objects from the configured collection (up to cap)."""
+        if not self.collection:
+            return []
+        data = self._get_taxii(f'collections/{self.collection}/objects/', since)
+        if not isinstance(data, dict):
+            return []
+        content = data.get('content') or {}
+        bundle = content.get('content') or {}
+        objects = bundle.get('objects') or []
+        return [o for o in objects if isinstance(o, dict)][:self.max_objects_per_poll]
+
+    def _poll_once(self) -> Tuple[int, Optional[str]]:
+        """One poll cycle: ?since= poll the collection, map, merge.
+
+        Returns (added, error_message_or_None).
+        """
+        if not self.base_url or not self.collection:
+            return 0, 'misconfigured (base_url/collection missing)'
+
+        since = _puller_since_iso(self.state_id)
+        raw_objects = self._fetch_objects(since)
+        if raw_objects is None:
+            return 0, 'fetch failed (see server log)'
+
+        stix_objects = [
+            desc for desc in (_stix21_object_to_our(o) for o in raw_objects)
+            if desc is not None
+        ]
+        if not stix_objects:
+            save_puller_state(self.state_id, 'ok', 0, 'no new objects')
+            return 0, None
+
+        added = ingest_objects(stix_objects, mode='merge', source=self.name)
+        save_puller_state(self.state_id, 'ok', added, f'{added} object(s) ingested')
+        return added, None
+
+    def pull_now(self) -> Dict[str, Any]:
+        """Run one poll cycle synchronously (for the dashboard 'Pull now')."""
+        added, err = self._poll_once()
+        st = read_puller_state(self.state_id) or {}
+        return {
+            'name': self.name,
+            'added': added,
+            'error': err,
+            'last_sync': st.get('last_sync'),
+            'last_status': st.get('last_status'),
+        }
+
+    def status(self) -> Dict[str, Any]:
+        """Dashboard status for this TAXII puller."""
+        st = read_puller_state(self.state_id) or {}
+        return {
+            'name': self.name,
+            'kind': self.KIND,
+            'enabled': self.enabled,
+            'running': bool(self._thread and self._thread.is_alive()),
+            'base_url': self.base_url,
+            'collection': self.collection,
+            'last_sync': st.get('last_sync'),
+            'last_added': st.get('last_added', 0),
+            'last_status': st.get('last_status'),
+            'last_message': st.get('last_message'),
+        }
+
+    def start(self) -> None:
+        """Start background poller."""
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop = False
+        self._thread = threading.Thread(
+            target=self._poll_loop, name=f'TaxiiPuller-{self.name}', daemon=True
+        )
+        self._thread.start()
+        logger.info(
+            "TAXII puller '%s' started (interval=%ss, server=%s)",
+            self.name, self.poll_interval, self.base_url,
+        )
+
+    def stop(self) -> None:
+        """Stop background poller."""
+        self._stop = True
+        if self._thread:
+            self._thread.join(timeout=5)
+            logger.info("TAXII puller '%s' stopped", self.name)
+
+    def _poll_loop(self) -> None:
+        while not self._stop:
+            try:
+                added, err = self._poll_once()
+                if added:
+                    logger.info("TAXII pull '%s' ingested %s object(s)", self.name, added)
+                elif err:
+                    logger.warning("TAXII pull '%s': %s", self.name, err)
+            except Exception as exc:
+                logger.error("TAXII pull '%s' error: %s", self.name, exc)
+            if not self._stop:
+                time.sleep(self.poll_interval)
+
+
+# ---------------------------------------------------------------------------
 # Module-level instances & initialization
 # ---------------------------------------------------------------------------
 
@@ -1668,6 +2184,12 @@ self_check_poller = SelfCheckPoller(
 # Backward-compatible alias (the self-check poller was previously named
 # "vision_one", which was misleading — Vision One is the external TAXII client).
 VisionOnePoller = SelfCheckPoller
+
+# Generic third-party TAXII 2.1 pullers (top-level `taxii_pullers:` list).
+taxii_pullers: List[TaxiiPuller] = [
+    TaxiiPuller(cfg) for cfg in (CONFIG.get('taxii_pullers') or [])
+    if isinstance(cfg, dict) and cfg.get('name')
+]
 
 # Initialize database tables at import time (endpoints and tests rely on it).
 init_db()
@@ -1690,6 +2212,9 @@ def main() -> None:
 
     if otx_poller.enabled and otx_poller.base_url:
         otx_poller.start()
+    for puller in taxii_pullers:
+        if puller.enabled and puller.base_url and puller.collection:
+            puller.start()
     if self_check_poller.enabled and self_check_poller.base_url:
         self_check_poller.start()
 
