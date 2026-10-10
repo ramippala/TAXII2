@@ -46,6 +46,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Index,
     Integer,
     String,
     Text,
@@ -209,6 +210,15 @@ class STIXObject(Base):
     created = Column(DateTime, default=datetime.utcnow)
     modified = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    # TAXII Get Objects filters on `modified` and keyset-paginates on
+    # (modified, stix_id) — without these every poll is a full scan + sort.
+    # The collection-leading index also serves the per-collection poll.
+    __table_args__ = (
+        Index('ix_stix_objects_modified_id', 'modified', 'stix_id'),
+        Index('ix_stix_objects_coll_modified_id', 'collection_id', 'modified',
+              'stix_id'),
+    )
+
 
 class Subscription(Base):
     """ORM model for TAXII subscriptions."""
@@ -317,6 +327,12 @@ def init_db() -> None:
                     "WHERE collection_id IS NULL"
                 )
             )
+    # `create_all` only creates indexes for tables it creates, so a database
+    # that predates the poll-path indexes above never gets them. Create any
+    # missing ones explicitly — checkfirst makes this idempotent and portable
+    # (MySQL/MariaDB have no CREATE INDEX IF NOT EXISTS).
+    for index in STIXObject.__table__.indexes:
+        index.create(bind=engine, checkfirst=True)
     logger.info("Database initialized")
 
 
@@ -335,27 +351,7 @@ def rehydrate_memory() -> int:
             for row in rows:
                 if row.stix_id in memory_store:
                     continue
-                labels = [l for l in (row.labels or '').split(',') if l]
-                memory_store[row.stix_id] = ThreatIntel(
-                    stix_id=row.stix_id,
-                    object_type=row.object_type,
-                    labels=labels,
-                    confidence=row.confidence or 0,
-                    name=row.name,
-                    description=row.description,
-                    hash_value=row.hash_value,
-                    ip_address=row.ip_address,
-                    domain=row.domain,
-                    value=row.value,
-                    source_ref=row.source_ref,
-                    target_ref=row.target_ref,
-                    relationship_type=row.relationship_type,
-                    object_refs=row.object_refs,
-                    valid_from=row.valid_from,
-                    collection=row.collection_id or 'threat-intel',
-                    source=row.source or 'manual',
-                    revoked=bool(row.revoked),
-                )
+                memory_store[row.stix_id] = _row_to_threat_intel(row)
             count = len(memory_store)
     finally:
         session.close()
@@ -535,12 +531,21 @@ class ThreatIntel:
     collection: str = 'threat-intel'      # TAXII collection this object belongs to
     source: str = 'manual'
     revoked: bool = False  # once revoked -> served as STIX revoked: true
+    # Stored STIX timestamps (mirrored from the row). These are what the feed
+    # is *served* with: `created` is immutable per object and `modified` only
+    # moves when the object actually changes. Stamping `now` at render time
+    # instead would make every poll look like a full-feed change and break
+    # `added_after` delta sync.
+    created: Optional[datetime] = None
+    modified: Optional[datetime] = None
 
     def to_stix_object(self) -> Dict[str, Any]:
         """Convert to a STIX 2.1-flavoured object dict (see generate_taxii_bundle)."""
         labels = self.labels or []
         confidence = self.confidence or 0
-        now = datetime.utcnow().isoformat()
+        now = _stix_now()
+        created = _stix_ts(self.created) or now
+        modified = _stix_ts(self.modified) or created
 
         obj_dict: Dict[str, Any] = {}
         if self.object_type == "ipv4-addr":
@@ -568,8 +573,8 @@ class ThreatIntel:
         result: Dict[str, Any] = {
             "id": self.stix_id,
             "type": self.object_type,
-            "created": now,
-            "modified": now,
+            "created": created,
+            "modified": modified,
             "revoked": bool(self.revoked),
             "labels": labels,
             "confidence": confidence,
@@ -581,7 +586,39 @@ class ThreatIntel:
         return result
 
 
-# In-memory store (primary for fast polling)
+def _row_to_threat_intel(row: STIXObject) -> ThreatIntel:
+    """Build a :class:`ThreatIntel` from a persisted ``STIXObject`` row.
+
+    The single conversion used by both ``rehydrate_memory`` and the read
+    paths, so what the feed serves is always derived from the row — the DB is
+    the source of truth and a stale/missing memory entry can no longer change
+    (or silently drop) a served object.
+    """
+    return ThreatIntel(
+        stix_id=row.stix_id,
+        object_type=row.object_type,
+        labels=[l for l in (row.labels or '').split(',') if l],
+        confidence=row.confidence or 0,
+        name=row.name,
+        description=row.description,
+        hash_value=row.hash_value,
+        ip_address=row.ip_address,
+        domain=row.domain,
+        value=row.value,
+        source_ref=row.source_ref,
+        target_ref=row.target_ref,
+        relationship_type=row.relationship_type,
+        object_refs=row.object_refs,
+        valid_from=row.valid_from,
+        collection=row.collection_id or 'threat-intel',
+        source=row.source or 'manual',
+        revoked=bool(row.revoked),
+        created=row.created,
+        modified=row.modified,
+    )
+
+
+# In-memory store (fast path for the dashboard / write coordination)
 memory_store: Dict[str, ThreatIntel] = {}
 memory_lock = threading.Lock()
 
@@ -669,17 +706,54 @@ _THROTTLED_PREFIXES = ('/taxii2', '/objects', '/feed', '/auth', '/ui/login',
                        '/subscriptions')
 
 
+def _parse_trusted_networks(values: Any) -> List[Any]:
+    """Parse ``security.trusted_proxies`` entries into ip_network objects."""
+    networks: List[Any] = []
+    for entry in values or []:
+        try:
+            networks.append(ipaddress.ip_network(str(entry), strict=False))
+        except ValueError:
+            logger.warning("Ignoring invalid trusted_proxies entry: %r", entry)
+    return networks
+
+
+# Only trust proxy-supplied client-IP headers when the request actually
+# arrives from a trusted proxy. Those headers are caller-controlled otherwise,
+# so keying the auth-failure throttle on them would let a client rotate its
+# identity and dodge the gate (and, before the eviction fix, reset it for
+# everyone). The defaults cover the documented topology — the app is reached
+# over loopback or the compose network by the Cloudflare tunnel. Set
+# `security.trusted_proxies: []` to trust no proxy and always use the peer
+# address.
+_TRUSTED_PROXY_NETS = _parse_trusted_networks(
+    _SEC_CFG.get('trusted_proxies',
+                 ('127.0.0.1/32', '::1/128', '10.0.0.0/8', '172.16.0.0/12',
+                  '192.168.0.0/16'))
+)
+
+
+def _proxy_headers_trusted() -> bool:
+    """True when the immediate peer is a configured trusted proxy."""
+    try:
+        peer = ipaddress.ip_address(request.remote_addr or '')
+    except ValueError:
+        return False
+    return any(peer in net for net in _TRUSTED_PROXY_NETS)
+
+
 def _client_ip() -> str:
     """Best-effort client address, for throttling keys and log lines only.
 
-    The documented ingress is the Cloudflare tunnel, which sets
-    CF-Connecting-IP to the real client. These headers are caller-controlled
-    if the origin is reachable directly, so they are never used for authz.
+    Proxy headers (CF-Connecting-IP / X-Forwarded-For) are honoured only when
+    the request arrives from a trusted proxy; otherwise the peer address is
+    used. These values are never used for authz either way.
     """
-    raw = (request.headers.get('CF-Connecting-IP')
-           or request.headers.get('X-Forwarded-For')
-           or request.remote_addr or '')
-    return str(raw).split(',')[0].strip()[:64] or 'unknown'
+    remote = str(request.remote_addr or '')
+    if _proxy_headers_trusted():
+        raw = (request.headers.get('CF-Connecting-IP')
+               or request.headers.get('X-Forwarded-For') or remote)
+        return str(raw).split(',')[0].strip()[:64] or 'unknown'
+    return remote[:64] or 'unknown'
 
 
 def _throttle_prefix(path: str) -> Optional[str]:
@@ -711,10 +785,29 @@ def _recent_auth_failures(key: str) -> List[float]:
 
 
 def _record_auth_failure(key: str) -> None:
+    """Count one failed authentication for ``key``.
+
+    The table is bounded. At capacity, expired keys are dropped first; if it
+    is still full, the least-recently-failed keys are evicted. It is never
+    cleared wholesale — a caller able to vary its throttle key would otherwise
+    be able to wipe brute-force protection for every other client at once.
+    """
+    now = time.time()
     with _auth_fail_lock:
         if len(_auth_failures) >= _AUTH_FAIL_MAX_KEYS:
-            _auth_failures.clear()
-        _auth_failures.setdefault(key, []).append(time.time())
+            cutoff = now - _AUTH_FAIL_WINDOW
+            for stale in [k for k, v in _auth_failures.items()
+                          if not v or v[-1] < cutoff]:
+                _auth_failures.pop(stale, None)
+        if len(_auth_failures) >= _AUTH_FAIL_MAX_KEYS:
+            # Still full of live offenders: evict the oldest ~10%, keeping
+            # the most recent (most relevant) offenders throttled.
+            overflow = len(_auth_failures) - int(_AUTH_FAIL_MAX_KEYS * 0.9)
+            oldest = sorted(_auth_failures,
+                            key=lambda k: _auth_failures[k][-1])
+            for victim in oldest[:max(overflow, 1)]:
+                _auth_failures.pop(victim, None)
+        _auth_failures.setdefault(key, []).append(now)
 
 
 def _too_many_requests_response() -> Response:
@@ -1544,6 +1637,12 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                     collection=collection,
                     source=source,
                     revoked=revoked,
+                    # `created` is immutable per object; a merge refresh keeps
+                    # the original and only moves `modified` (mirrors the row,
+                    # whose `modified` has onupdate=utcnow).
+                    created=(existing_row.created if existing_row is not None
+                             else now),
+                    modified=now,
                 )
 
                 row = existing.get(stix_id)
@@ -1657,6 +1756,19 @@ DEFAULT_COLLECTION_ID = 'threat-intel'
 TAXII_OBJECTS_SHAPE = str(TAXII_CFG.get('objects_shape') or 'bundle').lower()
 
 
+def _default_page_cap() -> Optional[int]:
+    """Page ceiling for a Get Objects request that passes no ``limit``.
+
+    Bounds an otherwise unbounded query/materialise; clients page on with
+    ``more``/``next``. ``taxii.max_objects: 0`` disables the cap.
+    """
+    try:
+        cap = int(TAXII_CFG.get('max_objects') or 0)
+    except (TypeError, ValueError):
+        return None
+    return cap if cap > 0 else None
+
+
 @dataclass
 class CollectionConfig:
     """One TAXII collection: identity + the credentials that may read it."""
@@ -1723,6 +1835,19 @@ TAXII_COLLECTION_TITLE = (
 
 def _stix_now() -> str:
     return datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _stix_ts(value: Optional[datetime]) -> Optional[str]:
+    """Format a stored datetime as a STIX 2.1 timestamp, or None.
+
+    Stored datetimes are naive UTC (`datetime.utcnow`), which is what STIX
+    wants once suffixed with 'Z'. A tz-aware value is normalised to UTC first.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        value = value - value.utcoffset()
+    return value.strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 _HASH_KEY_BY_ALGO = {
@@ -1798,6 +1923,8 @@ def _ioc_stix_object(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
     back to the legacy ``x-ti-indicator`` extension object.
     """
     now = _stix_now()
+    created = _stix_ts(obj.created) or now
+    modified = _stix_ts(obj.modified) or created
     pattern = _ioc_pattern(obj)
     if not pattern:
         value = _ioc_value(obj)
@@ -1808,8 +1935,8 @@ def _ioc_stix_object(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
             'spec_version': '2.1',
             'type': 'x-ti-indicator',
             'id': 'x-ti-indicator--' + uuid.uuid5(uuid.NAMESPACE_OID, value).hex,
-            'created': now,
-            'modified': now,
+            'created': created,
+            'modified': modified,
             'value': value,
             'labels': obj.labels or [],
             'confidence': obj.confidence or 0,
@@ -1818,17 +1945,18 @@ def _ioc_stix_object(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
         'spec_version': '2.1',
         'type': 'indicator',
         'id': 'indicator--' + uuid.uuid5(uuid.NAMESPACE_OID, pattern).hex,
-        'created': now,
-        'modified': now,
+        'created': created,
+        'modified': modified,
         'revoked': bool(obj.revoked),
         'labels': obj.labels or [],
         'confidence': obj.confidence or 0,
         'pattern': pattern,
         'pattern_type': 'stix',
         'pattern_version': '2.1',
-        # Prefer the source's validity start (kept at ingest); else now.
+        # Prefer the source's validity start (kept at ingest); else the
+        # object's own created time.
         'valid_from': (obj.valid_from.strftime('%Y-%m-%dT%H:%M:%SZ')
-                       if obj.valid_from else now),
+                       if obj.valid_from else created),
     }
     if obj.name:
         out['name'] = obj.name
@@ -1866,10 +1994,15 @@ def threat_intel_to_stix21(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
     relationship — render as their own SDO/SRO type.
     """
     now = _stix_now()
+    # Serve the *stored* timestamps: `created` is immutable per object and
+    # `modified` only moves on a real change. Falling back to `now` keeps
+    # objects built outside the row path (tests, ad-hoc callers) renderable.
+    created = _stix_ts(obj.created) or now
+    modified = _stix_ts(obj.modified) or created
     common = {
         'spec_version': '2.1',
-        'created': now,
-        'modified': now,
+        'created': created,
+        'modified': modified,
         'revoked': bool(obj.revoked),
     }
 
@@ -2184,13 +2317,19 @@ def build_stix_bundle(since: Optional[str] = None,
                 and_(STIXObject.modified == m_dt,
                      STIXObject.stix_id > after_id),
             ))
-        if limit is not None and match_id_set is None:
-            rows = q.limit(limit + 1).all()
-            more = len(rows) > limit
-            rows = rows[:limit]
+        # A client that sends no `limit` must still not be able to make the
+        # server materialise an entire collection in one response. Cap the
+        # page at taxii.max_objects (the same ceiling already applied to an
+        # explicit `limit`); the client pages on via `more`/`next`. Set
+        # taxii.max_objects to 0 to restore unbounded pages.
+        page_cap = _default_page_cap()
+        page = limit if limit is not None else page_cap
+        if page is not None and match_id_set is None:
+            rows = q.limit(page + 1).all()
+            more = len(rows) > page
+            rows = rows[:page]
         else:
-            # No limit, or a targeted match[id] lookup: fetch the candidates
-            # and apply the id filter after rendering.
+            # A targeted match[id] lookup is bounded by the id set itself.
             rows = q.all()
             more = False
     except Exception:
@@ -2201,30 +2340,30 @@ def build_stix_bundle(since: Optional[str] = None,
 
     objects: List[Dict[str, Any]] = []
     withheld = 0
-    with memory_lock:
-        for row in rows:
-            obj = memory_store.get(row.stix_id)
-            if obj is None:
-                continue
-            # match[type] - filter on the stored type we would render
-            # (matches the SQL-level filter above; kept for direct callers).
-            if type_filter is not None and row.object_type not in type_filter:
-                continue
-            # Community-intel gate (manual intel is never gated).
-            verdict = gate_verdict(obj, row)
-            if verdict['gated']:
-                withheld += 1
-                continue
-            stix = threat_intel_to_stix21(obj)
-            if stix is None:
-                continue
-            # match[id]: accept the id the client RECEIVED (the served
-            # indicator id) or our stored id.
-            if match_id_set is not None and (
-                    row.stix_id not in match_id_set
-                    and stix.get('id') not in match_id_set):
-                continue
-            objects.append(stix)
+    # Render straight from the row: the DB is the source of truth for what is
+    # served, so a missing/stale memory entry can no longer silently drop an
+    # object that the SQL query (and therefore the page limit) counted.
+    for row in rows:
+        obj = _row_to_threat_intel(row)
+        # match[type] - filter on the stored type we would render
+        # (matches the SQL-level filter above; kept for direct callers).
+        if type_filter is not None and row.object_type not in type_filter:
+            continue
+        # Community-intel gate (manual intel is never gated).
+        verdict = gate_verdict(obj, row)
+        if verdict['gated']:
+            withheld += 1
+            continue
+        stix = threat_intel_to_stix21(obj)
+        if stix is None:
+            continue
+        # match[id]: accept the id the client RECEIVED (the served
+        # indicator id) or our stored id.
+        if match_id_set is not None and (
+                row.stix_id not in match_id_set
+                and stix.get('id') not in match_id_set):
+            continue
+        objects.append(stix)
 
     if withheld:
         logger.info(
@@ -2583,20 +2722,29 @@ def get_feed():
         q = session.query(STIXObject)
         if cid:
             q = q.filter(STIXObject.collection_id == cid)
-        db_objects = q.all()
+        # Bounded like /objects: the XML feed is built in one response, so cap
+        # how much a single request can materialise.
+        q = q.order_by(STIXObject.modified.asc(), STIXObject.stix_id.asc())
+        rows = q.limit(_MAX_OBJECTS_JSON + 1).all()
+        db_objects = rows[:_MAX_OBJECTS_JSON]
+        if len(rows) > _MAX_OBJECTS_JSON:
+            logger.warning(
+                "/feed truncating response at %d objects (cap %d)",
+                _MAX_OBJECTS_JSON, _MAX_OBJECTS_JSON,
+            )
     finally:
         session.close()
 
-    with memory_lock:
-        bundles = [
-            {
-                'id': obj.stix_id,
-                'type': obj.object_type,
-                'object': memory_store[obj.stix_id].to_stix_object().get('object', {}),
-            }
-            for obj in db_objects
-            if obj.stix_id in memory_store
-        ]
+    # Rendered from the rows (DB is the source of truth), so an object can no
+    # longer be dropped from the feed by a missing memory-store entry.
+    bundles = [
+        {
+            'id': row.stix_id,
+            'type': row.object_type,
+            'object': _row_to_threat_intel(row).to_stix_object().get('object', {}),
+        }
+        for row in db_objects
+    ]
 
     return Response(
         generate_taxii_bundle(bundles),
@@ -2649,35 +2797,33 @@ def list_objects():
     finally:
         session.close()
 
-    with memory_lock:
-        objects = []
-        for row in db_objects:
-            if row.stix_id not in memory_store:
-                continue
-            obj = memory_store[row.stix_id]
-            verdict = gate_verdict(obj, row)
-            objects.append({
-                'id': row.stix_id,
-                'type': row.object_type,
-                'value': (
-                    obj.ip_address
-                    or obj.domain
-                    or obj.hash_value
-                    or obj.value
-                    or obj.name
-                    or (f'{obj.source_ref} → {obj.relationship_type} → {obj.target_ref}'
-                        if obj.object_type == 'relationship' else None)
-                ),
-                'labels': obj.labels or [],
-                'confidence': row.confidence,
-                'source': verdict['source'],
-                'gated': verdict['gated'],
-                'gate_reason': verdict['reason'],
-                'gate_reason_label': verdict['reason_label'],
-                'revoked': bool(row.revoked),
-                'revoked_at': row.revoked_at.isoformat() + 'Z' if row.revoked_at else None,
-                'last_seen': row.last_seen.isoformat() + 'Z' if row.last_seen else None,
-            })
+    objects = []
+    for row in db_objects:
+        # Render from the row so a missing memory entry can't hide an object.
+        obj = _row_to_threat_intel(row)
+        verdict = gate_verdict(obj, row)
+        objects.append({
+            'id': row.stix_id,
+            'type': row.object_type,
+            'value': (
+                obj.ip_address
+                or obj.domain
+                or obj.hash_value
+                or obj.value
+                or obj.name
+                or (f'{obj.source_ref} → {obj.relationship_type} → {obj.target_ref}'
+                    if obj.object_type == 'relationship' else None)
+            ),
+            'labels': obj.labels or [],
+            'confidence': row.confidence,
+            'source': verdict['source'],
+            'gated': verdict['gated'],
+            'gate_reason': verdict['reason'],
+            'gate_reason_label': verdict['reason_label'],
+            'revoked': bool(row.revoked),
+            'revoked_at': row.revoked_at.isoformat() + 'Z' if row.revoked_at else None,
+            'last_seen': row.last_seen.isoformat() + 'Z' if row.last_seen else None,
+        })
 
     withheld_count = sum(1 for o in objects if o['gated'])
     if truncated:
@@ -4354,12 +4500,14 @@ init_db()
 # CLI Entry Point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    """Application entry point.
+def start_background_jobs() -> None:
+    """Restore persisted state, then start the TTL sweeper and pollers.
 
-    Note: Vision One is NOT started here. It is an external TAXII 2.1 client
-    that polls /taxii2/ on its own (configured with taxii.auth). Only the
-    optional background pollers below start, and both are off by default.
+    These are in-process threads that must exist exactly ONCE per deployment.
+    That is why the app is served by a single-process threaded server
+    (waitress) and not by N WSGI *workers*: each gunicorn/uwsgi worker would
+    import this module and start its own OTX/TAXII pullers and TTL sweeper,
+    multiplying outbound pulls and auto-revocations.
     """
     # Restore ingested intel that persisted in the DB so the feed is complete
     # even on the first poll after a restart.
@@ -4378,11 +4526,50 @@ def main() -> None:
     if self_check_poller.enabled and self_check_poller.base_url:
         self_check_poller.start()
 
+
+def _serve(host: str, port: int, debug: bool, server_cfg: Dict[str, Any]) -> None:
+    """Serve the app, using a production WSGI server unless debug/dev is asked.
+
+    Werkzeug's ``app.run`` server is for development only. The default is
+    waitress: a single-process, multi-threaded WSGI server, which preserves
+    the one-process-owns-the-pollers model above while giving production-grade
+    request handling. Set ``server.engine: flask`` (or ``server.debug: true``)
+    to get the dev server back.
+    """
+    engine = str(server_cfg.get('engine', 'waitress') or 'waitress').lower()
+    if debug or engine == 'flask':
+        app.run(host=host, port=port, debug=debug)
+        return
+    try:
+        from waitress import serve
+    except ImportError:  # pragma: no cover - depends on the environment
+        logger.warning(
+            "waitress is not installed — falling back to the Flask/Werkzeug "
+            "development server, which is NOT for production. "
+            "Install it with `pip install waitress`."
+        )
+        app.run(host=host, port=port, debug=False)
+        return
+    threads = int(server_cfg.get('threads', 8) or 8)
+    logger.info("Serving on %s:%s (waitress, threads=%s)", host, port, threads)
+    serve(app, host=host, port=port, threads=threads, ident='TAXII/2.1')
+
+
+def main() -> None:
+    """Application entry point.
+
+    Note: Vision One is NOT started here. It is an external TAXII 2.1 client
+    that polls /taxii2/ on its own (configured with taxii.auth). Only the
+    optional background pollers start, and both are off by default.
+    """
+    start_background_jobs()
+
     server_cfg = CONFIG.get('server', {}) or {}
-    app.run(
-        host=server_cfg.get('host', '0.0.0.0'),
-        port=int(server_cfg.get('port', 5000)),
-        debug=bool(server_cfg.get('debug', False)),
+    _serve(
+        str(server_cfg.get('host', '0.0.0.0')),
+        int(server_cfg.get('port', 5000)),
+        bool(server_cfg.get('debug', False)),
+        server_cfg,
     )
 
 

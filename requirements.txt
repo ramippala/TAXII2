@@ -2,6 +2,12 @@ Flask==3.0.0
 flask-cors==4.0.0
 SQLAlchemy==2.0.18
 Werkzeug==3.0.2
+# Production WSGI server. `python server.py` serves through waitress unless
+# server.debug is true or server.engine is set to 'flask'. waitress is
+# single-process/multi-threaded on purpose: the OTX/TAXII pollers and the TTL
+# sweeper are in-process threads that must run exactly once, which N gunicorn
+# workers would each duplicate.
+waitress==3.0.2
 pyyaml==6.0.1
 # SSO (Microsoft Entra ID / OIDC) — only used when sso.enabled: true.
 # Verifies the ID-token JWT the identity provider returns.

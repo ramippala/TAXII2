@@ -3,6 +3,14 @@ server:
   host: '0.0.0.0'
   port: 5000
   debug: false
+  # WSGI server used by `python server.py`:
+  #   waitress (default) — single-process, multi-threaded, production-grade.
+  #   flask              — the Werkzeug development server (local work only;
+  #                        implied by debug: true).
+  # The pollers + TTL sweeper are in-process threads, so a single-process
+  # server is deliberate: N gunicorn workers would each start their own.
+  engine: waitress
+  threads: 8             # waitress worker threads
   # Browser origins allowed to read the API cross-origin. The dashboard is
   # same-origin so it needs nothing here; '*' reflects ANY origin (fine for
   # local dev, not for an internet-facing feed). Pin your real origin(s).
@@ -46,6 +54,17 @@ security:
   max_objects_json: 50000      # hard cap on rows /objects returns in one response
   auth_fail_limit: 10          # failed auths per client IP before 429
   auth_fail_window: 300        # ...measured over this many seconds
+  # Client-IP headers (CF-Connecting-IP / X-Forwarded-For) are trusted ONLY
+  # when the request arrives from one of these networks; otherwise the peer
+  # address is used, so a caller reaching the origin directly cannot spoof its
+  # throttle identity. Defaults cover loopback + the compose network (the
+  # documented Cloudflare-tunnel topology). Set to [] to trust no proxy.
+  trusted_proxies:
+    - '127.0.0.1/32'
+    - '::1/128'
+    - '10.0.0.0/8'
+    - '172.16.0.0/12'
+    - '192.168.0.0/16'
 
 logging:
   level: INFO
@@ -54,6 +73,10 @@ logging:
 taxii:
   protocol_version: '2.1'
   response_format: 'STIX_JSON'
+  # Max objects in ONE Get Objects response. Also applied when the client
+  # sends no ?limit=, so a single poll can never materialise a whole
+  # collection; the client continues via more/next. Set 0 to disable the cap
+  # (an unbounded response per request).
   max_objects: 10000
   bundle_id: 'Bundle-{timestamp}'
   # Get Objects response shape:

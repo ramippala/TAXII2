@@ -50,7 +50,7 @@ Vision One (see [Intel Filter](#intel-filter-filtering-between-server-and-vision
 
 1. **Flask REST API (TAXII 2 Server)** — Hosts TAXII 2.1 protocol endpoints and custom REST endpoints for feed management, UI login/session, community-source control, auth, subscriptions, and health.
 2. **Web UI dashboard** — Single self-contained `intel-ui.html` behind a login (`ui.auth`). Organized into four tabs: **Feed** (the current feed with per-row **source** and **gate** badges, a **collection** selector when multiple collections exist, **search / type & status filters / pagination**, withheld-by-filter panel, and manual entry/publish), **Intel graph** (a dashboard of the fed intel — KPI tiles plus bar charts for **by category** (IP / domain / file hash / …), **by source**, **confidence distribution**, **pulled-over-time**, **withheld-by-filter**, and **top labels** (donut, share of label occurrences); scope switch Community / Manual / All), **Community sources** (puller status + "Pull now", with the same **search + pagination**), and **Import CSV / Excel** (GT-team ad-hoc import: `.csv` or `.xlsx`). Serves all intel (the gate only affects what Vision One gets).
-3. **STIX 2.1 Store** — Stores threat intelligence objects (IPs, file hashes, domains, URLs, emails, indicators, malware / threat-actor / campaign SDOs, and STIX *relationships* — a real graph, not just flat IOCs) in SQLite with an in-memory store for fast polling. Every object carries a `source` tag (`manual` | `otx` | a `taxii_pullers` name) and a `collection_id` (see [Multiple collections](#multiple-collections--per-client-rbac)) so manual and community intel coexist cleanly. Puller sync state (`last_sync`, `last_added`) is persisted in a `puller_state` table so delta pulls survive restarts.
+3. **STIX 2.1 Store** — Stores threat intelligence objects (IPs, file hashes, domains, URLs, emails, indicators, malware / threat-actor / campaign SDOs, and STIX *relationships* — a real graph, not just flat IOCs) in SQLite (or PostgreSQL). The database is the source of truth for what is served: TAXII polls read the stored rows directly (with a composite index on `(modified, stix_id)` for keyset pagination), and an in-memory copy is kept as a dashboard/coordination cache. Every object carries a `source` tag (`manual` | `otx` | a `taxii_pullers` name) and a `collection_id` (see [Multiple collections](#multiple-collections--per-client-rbac)) so manual and community intel coexist cleanly. Puller sync state (`last_sync`, `last_added`) is persisted in a `puller_state` table so delta pulls survive restarts.
 4. **OTX Community Puller** — Background thread that periodically pulls indicators (IPv4, domains, file hashes) from **AlienVault OTX** public pulses and merges them into the feed tagged `source='otx'`. Off by default; can also be fired on demand from the UI.
 5. **Third-party TAXII 2.1 Pullers** — One generic puller per `taxii_pullers:` entry. Polls `GET {api_root}collections/{collection}/objects/?since=` from any TAXII 2.1 server (Basic auth, `application/taxii+json;version=2.1`), maps STIX 2.1 objects into the feed in merge mode tagged with the puller's `name`. Off by default per entry.
 6. **Self-check Poller** — Background thread that periodically fetches the local `/feed` endpoint to verify the feed is reachable and well-formed. Off by default.
@@ -206,6 +206,13 @@ taxii_pullers: []
 
 The server starts on `http://0.0.0.0:5000` by default. Pollers only start
 when their `enabled` flag is `true` and a real `base_url` is configured.
+
+`python server.py` serves through **waitress** (a production WSGI server), not
+the Flask/Werkzeug development server. waitress is single-process and
+multi-threaded on purpose: the OTX/TAXII pollers and the TTL sweeper are
+in-process threads that must run exactly once, so N gunicorn *workers* would
+each start their own. Tune it with `server.threads`; set `server.engine:
+flask` (or `server.debug: true`) for the dev server during local work.
 
 ### Run with Docker (app + PostgreSQL + optional Cloudflare Tunnel)
 
@@ -746,6 +753,17 @@ curl -u admin:admin 'http://localhost:5000/taxii2/collections/threat-intel/objec
 Malformed `limit`/`since`/`next` values return a TAXII `400` (error code
 `malformed`) instead of being silently ignored.
 
+A request that omits `?limit=` is still capped at `taxii.max_objects`
+(10 000) and carries `more`/`next` like any other page, so one poll can never
+materialise an entire collection. Follow `next` until `more` is false.
+
+**Timestamps.** Served objects carry the **stored** `created`/`modified`, not
+the time of the request. `created` never changes for an object; `modified`
+advances only when the object actually changes (a merge refresh, a revoke).
+This is what makes `?added_after=` delta sync work — a client can record the
+newest `modified` it has seen and use it as its resume point, and the same
+object is not re-reported as "just modified" on every poll.
+
 > **Revoked objects** are included in the bundle with `revoked: true` (see
 > [Indicator Lifecycle](#indicator-lifecycle-ttl--revocation)) so clients can
 > purge them — they are never silently omitted.
@@ -1142,13 +1160,13 @@ group allow-lists, and session-cookie issuance on success).
 | Response headers | Every response carries `Content-Security-Policy` (inline script/style allowed, everything else `'self'`), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy`, `Strict-Transport-Security`. |
 | Session cookie | `taxii2_ui_session` is `HttpOnly`, `SameSite=Lax`, `Secure`, signed (itsdangerous) and time-bounded (`ui.session_ttl`). |
 | Upload caps | `/feed/import-csv` bodies are capped at `security.max_upload_bytes` (25 MB → `413`) and parsed at most `security.max_import_rows` rows (50 000) before truncating with a note. A workbook that fails to parse returns a generic `400` (parser detail stays in the log), and `defusedxml` hardens openpyxl's XML parsing of untrusted `.xlsx`. |
-| Response caps | `/objects` accepts `?limit=` and never returns more than `security.max_objects_json` rows (50 000), reporting `"truncated": true` when it trims. |
-| Auth throttling | After `security.auth_fail_limit` (10) failed credentials from one client IP within `security.auth_fail_window` (300 s), further attempts get `429` + `Retry-After` without the credential being evaluated. Only requests that *present* a credential are counted, and a success clears the counter. |
+| Response caps | `/objects` accepts `?limit=` and never returns more than `security.max_objects_json` rows (50 000), reporting `"truncated": true` when it trims. TAXII Get Objects is capped at `taxii.max_objects` (10 000) per response **even when the client sends no `?limit=`**, so a single poll cannot materialise a whole collection; the client continues via `more`/`next`. Set `taxii.max_objects: 0` to disable. |
+| Auth throttling | After `security.auth_fail_limit` (10) failed credentials from one client IP within `security.auth_fail_window` (300 s), further attempts get `429` + `Retry-After` without the credential being evaluated. Only requests that *present* a credential are counted, and a success clears the counter. The failure table is bounded by evicting its oldest keys — never cleared wholesale, so a caller able to vary its throttle key cannot reset protection for everyone. |
 | Error bodies | 5xx responses return a generic message; driver/exception text goes to the server log only. |
 | CORS | `server.cors_origins` — pin it to your real origin(s). `'*'` reflects any origin (dev only; still no `Allow-Credentials`, so browser reads cannot use a session cookie). |
 | Input validation | All SQL goes through the ORM (no string-built SQL); STIX ids are shape-checked (`<type>--<id>`, type-prefix match); uploaded/ingested values are stored as data (ids derived, never taken from input — see [upload sanitization](#sanitization--injection-behaviour-of-the-upload-field)); dashboard values are rendered with `textContent`/escaping; the SSO error page HTML-escapes caller input. |
 | Audit | Successful imports, deletes and revokes log the count/target plus the client IP (`CF-Connecting-IP`). |
-| Client IP | Throttling keys and log lines use `CF-Connecting-IP` (set by the Cloudflare tunnel) with `X-Forwarded-For`/`remote_addr` as fallback. |
+| Client IP | Throttling keys and log lines use `CF-Connecting-IP` / `X-Forwarded-For`, but **only when the request arrives from a `security.trusted_proxies` network** (default: loopback + the compose ranges). From any other peer the header is ignored and the connection's own address is used, so a caller reaching the origin directly cannot spoof its throttle identity. Set `security.trusted_proxies: []` to trust no proxy. |
 
 > **Upgrading from an older build:** writes used to accept plain TAXII
 > credentials. If a script relied on that, switch it to the UI credentials

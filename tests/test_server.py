@@ -10,12 +10,14 @@ import os
 import io
 import re
 import tempfile
+import time
 import types
 import unittest
 import urllib.parse
 from datetime import datetime, timedelta
 
 import jwt
+import sqlalchemy
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -1983,6 +1985,37 @@ class TestTaxiiPagination(unittest.TestCase):
         self.assertNotIn('next', msg)
         self.assertEqual(len(msg['content']['content']['objects']), 4)
 
+    def test_no_limit_still_capped_and_paginates(self):
+        """A poll with no ?limit= is bounded by taxii.max_objects.
+
+        Without the cap a single request could materialise a whole collection.
+        The client is expected to follow more/next.
+        """
+        saved = _server.TAXII_CFG.get('max_objects')
+        _server.TAXII_CFG['max_objects'] = 3
+        try:
+            self._ingest_n(7)
+            msg = self._page('')
+            self.assertEqual(len(msg['content']['content']['objects']), 3)
+            self.assertTrue(msg['more'])
+            self.assertTrue(msg.get('next'))
+            vals = [served_value(o)
+                    for o in msg['content']['content']['objects']]
+            nxt, guard = msg.get('next'), 0
+            while nxt and guard < 10:
+                msg = self._page('?next=' + urllib.parse.quote(nxt))
+                vals.extend(served_value(o)
+                            for o in msg['content']['content']['objects'])
+                nxt = msg.get('next') if msg['more'] else None
+                guard += 1
+            self.assertEqual(sorted(vals),
+                             sorted(f'1.1.1.{i}' for i in range(1, 8)))
+        finally:
+            if saved is None:
+                _server.TAXII_CFG.pop('max_objects', None)
+            else:
+                _server.TAXII_CFG['max_objects'] = saved
+
     def test_limit_zero_and_non_numeric_400(self):
         self._ingest_n(3)
         for bad in ('0', '-1', 'abc', '1.5'):
@@ -2626,6 +2659,219 @@ class TestSecurityHardening(unittest.TestCase):
         self.assertEqual(
             self.client.get('/taxii2/collections/threat-intel/objects/',
                             headers=self.auth).status_code, 200)
+
+
+class TestServedTimestamps(unittest.TestCase):
+    """The feed is served with the STORED created/modified, not render-time now.
+
+    Stamping ``now`` at render time made every object look newly modified on
+    every poll: it broke ``added_after`` delta sync (a client's watermark no
+    longer corresponded to storage) and forced consumers to re-process the
+    whole feed each cycle.
+    """
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        app.config['TAXII_AUTH'] = {'username': 'u', 'password': 'p'}
+        app.config['TAXII_ADMIN_AUTH'] = {'username': 'u', 'password': 'p'}
+        self.auth = {'X-Taxii-Username': 'u', 'X-Taxii-Password': 'p'}
+
+    def tearDown(self):
+        app.config.pop('TAXII_ADMIN_AUTH', None)
+
+    def _served(self):
+        r = self.client.get('/taxii2/collections/threat-intel/objects/',
+                            headers=self.auth)
+        self.assertEqual(r.status_code, 200)
+        return r.get_json()['content']['content']['objects']
+
+    def _ingest(self, value, mode=None):
+        body = {
+            'stix_objects': [{
+                'id': f'ipv4-addr--{value.replace(".", "-")}',
+                'type': 'ipv4-addr',
+                'object': {'ipv4-addr': {'value': value}},
+                'labels': ['t'], 'confidence': 50,
+            }],
+        }
+        if mode:
+            body['mode'] = mode
+        r = self.client.post('/feed/ingest', json=body, headers=self.auth)
+        self.assertEqual(r.status_code, 200)
+        return body['stix_objects'][0]['id']
+
+    def _backdate(self, sid, when):
+        session = _server.create_session()
+        try:
+            row = session.query(_server.STIXObject).filter_by(stix_id=sid).one()
+            row.created = when
+            row.modified = when
+            session.commit()
+        finally:
+            session.close()
+
+    def test_served_timestamps_are_the_stored_ones_and_stay_stable(self):
+        sid = self._ingest('9.9.9.9')
+        old = datetime.utcnow() - timedelta(days=40)
+        self._backdate(sid, old)
+        expected = old.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        first = self._served()[0]
+        second = self._served()[0]
+        # A render-time `now` would report today here, not 40 days ago.
+        self.assertEqual(first['created'], expected)
+        self.assertEqual(first['modified'], expected)
+        # ...and would drift between polls.
+        self.assertEqual(second['created'], first['created'])
+        self.assertEqual(second['modified'], first['modified'])
+
+    def test_merge_refresh_keeps_created_and_moves_modified(self):
+        """created is immutable per object; modified advances on a change."""
+        sid = self._ingest('5.5.5.5')
+        before = self._served()[0]
+        time.sleep(1.05)  # served timestamps are second-precision
+        body = {
+            'mode': 'merge',
+            'stix_objects': [{
+                'id': sid, 'type': 'ipv4-addr',
+                'object': {'ipv4-addr': {'value': '5.5.5.5'}},
+                'labels': ['t'], 'confidence': 90,
+            }],
+        }
+        self.assertEqual(
+            self.client.post('/feed/ingest', json=body,
+                             headers=self.auth).status_code, 200)
+        after = self._served()[0]
+        self.assertEqual(after['created'], before['created'])
+        self.assertGreater(after['modified'], before['modified'])
+
+    def test_added_after_watermark_is_a_real_resume_point(self):
+        """A watermark taken from a served `modified` filters on storage."""
+        stale = self._ingest('1.1.1.1')
+        self._backdate(stale, datetime.utcnow() - timedelta(days=40))
+        self._ingest('2.2.2.2')
+        watermark = self._served()[0]['modified']  # the backdated object
+        r = self.client.get(
+            '/taxii2/collections/threat-intel/objects/?added_after='
+            + urllib.parse.quote(watermark),
+            headers=self.auth)
+        self.assertEqual(r.status_code, 200)
+        values = {served_value(o)
+                  for o in r.get_json()['content']['content']['objects']}
+        self.assertIn('2.2.2.2', values)
+        self.assertNotIn('1.1.1.1', values)  # older than the watermark
+
+
+class TestFeedReadsFromTheDatabase(unittest.TestCase):
+    """What is served comes from the DB — a stale cache cannot hide an object."""
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        app.config['TAXII_AUTH'] = {'username': 'u', 'password': 'p'}
+        app.config['TAXII_ADMIN_AUTH'] = {'username': 'u', 'password': 'p'}
+        self.auth = {'X-Taxii-Username': 'u', 'X-Taxii-Password': 'p'}
+
+    def tearDown(self):
+        app.config.pop('TAXII_ADMIN_AUTH', None)
+
+    def test_poll_does_not_depend_on_the_memory_cache(self):
+        r = self.client.post('/feed/ingest', json={'stix_objects': [{
+            'id': 'ipv4-addr--7-7-7-7', 'type': 'ipv4-addr',
+            'object': {'ipv4-addr': {'value': '7.7.7.7'}},
+            'labels': ['t'], 'confidence': 50}]}, headers=self.auth)
+        self.assertEqual(r.status_code, 200)
+        # Simulate a cache that lost the entry — the old read path skipped
+        # such objects silently, shortening pages and dropping data.
+        with _server.memory_lock:
+            _server.memory_store.clear()
+        resp = self.client.get('/taxii2/collections/threat-intel/objects/',
+                               headers=self.auth)
+        self.assertEqual(resp.status_code, 200)
+        values = {served_value(o)
+                  for o in resp.get_json()['content']['content']['objects']}
+        self.assertIn('7.7.7.7', values)
+
+
+class TestPollPathIndexes(unittest.TestCase):
+    """Get Objects filters/paginates on `modified`: the index must exist."""
+
+    def test_modified_indexes_are_created(self):
+        init_db()
+        insp = sqlalchemy.inspect(_server.engine)
+        names = {ix['name'] for ix in insp.get_indexes('stix_objects')}
+        self.assertIn('ix_stix_objects_modified_id', names)
+        self.assertIn('ix_stix_objects_coll_modified_id', names)
+
+
+class TestThrottleTableBounded(unittest.TestCase):
+    """The auth-failure table evicts the oldest keys; it never clears wholesale.
+
+    A wholesale clear let a caller able to vary its throttle key wipe
+    brute-force protection for every other client in a single request.
+    """
+
+    def setUp(self):
+        self._saved_max = _server._AUTH_FAIL_MAX_KEYS
+        _server._auth_failures.clear()
+
+    def tearDown(self):
+        _server._AUTH_FAIL_MAX_KEYS = self._saved_max
+        _server._auth_failures.clear()
+
+    def test_capacity_does_not_wipe_the_table(self):
+        _server._AUTH_FAIL_MAX_KEYS = 10
+        for i in range(10):
+            _server._record_auth_failure(f'ip-{i}')
+        self.assertEqual(len(_server._auth_failures), 10)
+        _server._record_auth_failure('ip-10')  # tips over capacity
+        self.assertGreater(len(_server._auth_failures), 1)  # not a clear()
+        self.assertLessEqual(len(_server._auth_failures), 10)
+        self.assertIn('ip-9', _server._auth_failures)
+
+    def test_capacity_evicts_the_oldest_keys(self):
+        _server._AUTH_FAIL_MAX_KEYS = 10
+        for i in range(10):
+            _server._record_auth_failure(f'ip-{i}')
+        for i in range(10, 25):
+            _server._record_auth_failure(f'ip-{i}')
+        self.assertNotIn('ip-0', _server._auth_failures)
+        self.assertIn('ip-24', _server._auth_failures)
+        self.assertLessEqual(len(_server._auth_failures), 10)
+
+
+class TestClientIpTrust(unittest.TestCase):
+    """Proxy client-IP headers are honoured only from a trusted proxy."""
+
+    def test_spoofed_header_from_an_untrusted_peer_is_ignored(self):
+        with app.test_request_context(
+                '/', environ_base={'REMOTE_ADDR': '203.0.113.9'},
+                headers={'CF-Connecting-IP': '198.51.100.7'}):
+            self.assertEqual(_server._client_ip(), '203.0.113.9')
+
+    def test_header_from_a_trusted_proxy_is_honoured(self):
+        with app.test_request_context(
+                '/', environ_base={'REMOTE_ADDR': '127.0.0.1'},
+                headers={'CF-Connecting-IP': '198.51.100.7'}):
+            self.assertEqual(_server._client_ip(), '198.51.100.7')
+
+    def test_first_forwarded_hop_is_used_from_a_trusted_proxy(self):
+        with app.test_request_context(
+                '/', environ_base={'REMOTE_ADDR': '192.168.1.5'},
+                headers={'X-Forwarded-For': '198.51.100.7, 10.0.0.1'}):
+            self.assertEqual(_server._client_ip(), '198.51.100.7')
+
+    def test_no_trusted_proxies_configured_uses_the_peer(self):
+        saved = _server._TRUSTED_PROXY_NETS
+        _server._TRUSTED_PROXY_NETS = []
+        try:
+            with app.test_request_context(
+                    '/', environ_base={'REMOTE_ADDR': '127.0.0.1'},
+                    headers={'CF-Connecting-IP': '198.51.100.7'}):
+                self.assertEqual(_server._client_ip(), '127.0.0.1')
+        finally:
+            _server._TRUSTED_PROXY_NETS = saved
 
 
 class _FakeJwkClient:
