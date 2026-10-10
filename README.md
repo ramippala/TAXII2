@@ -49,7 +49,7 @@ Vision One (see [Intel Filter](#intel-filter-filtering-between-server-and-vision
 ### Components
 
 1. **Flask REST API (TAXII 2 Server)** — Hosts TAXII 2.1 protocol endpoints and custom REST endpoints for feed management, UI login/session, community-source control, auth, subscriptions, and health.
-2. **Web UI dashboard** — Single self-contained `intel-ui.html` behind a login (`ui.auth`). Organized into three tabs: **Feed** (the current feed with per-row **source** and **gate** badges, a **collection** selector when multiple collections exist, **search / type & status filters / pagination**, withheld-by-filter panel, and manual entry/publish), **Community sources** (puller status + "Pull now", with the same **search + pagination**), and **Import CSV / Excel** (GT-team ad-hoc import: `.csv` or `.xlsx`). Serves all intel (the gate only affects what Vision One gets).
+2. **Web UI dashboard** — Single self-contained `intel-ui.html` behind a login (`ui.auth`). Organized into four tabs: **Feed** (the current feed with per-row **source** and **gate** badges, a **collection** selector when multiple collections exist, **search / type & status filters / pagination**, withheld-by-filter panel, and manual entry/publish), **Intel graph** (a dashboard of the fed intel — KPI tiles plus bar charts for **by category** (IP / domain / file hash / …), **by source**, **confidence distribution**, **pulled-over-time**, **withheld-by-filter**, and **top labels** (donut, share of label occurrences); scope switch Community / Manual / All), **Community sources** (puller status + "Pull now", with the same **search + pagination**), and **Import CSV / Excel** (GT-team ad-hoc import: `.csv` or `.xlsx`). Serves all intel (the gate only affects what Vision One gets).
 3. **STIX 2.1 Store** — Stores threat intelligence objects (IPs, file hashes, domains, URLs, emails, indicators, malware / threat-actor / campaign SDOs, and STIX *relationships* — a real graph, not just flat IOCs) in SQLite with an in-memory store for fast polling. Every object carries a `source` tag (`manual` | `otx` | a `taxii_pullers` name) and a `collection_id` (see [Multiple collections](#multiple-collections--per-client-rbac)) so manual and community intel coexist cleanly. Puller sync state (`last_sync`, `last_added`) is persisted in a `puller_state` table so delta pulls survive restarts.
 4. **OTX Community Puller** — Background thread that periodically pulls indicators (IPv4, domains, file hashes) from **AlienVault OTX** public pulses and merges them into the feed tagged `source='otx'`. Off by default; can also be fired on demand from the UI.
 5. **Third-party TAXII 2.1 Pullers** — One generic puller per `taxii_pullers:` entry. Polls `GET {api_root}collections/{collection}/objects/?since=` from any TAXII 2.1 server (Basic auth, `application/taxii+json;version=2.1`), maps STIX 2.1 objects into the feed in merge mode tagged with the puller's `name`. Off by default per entry.
@@ -101,6 +101,11 @@ Dependencies:
 | Setup | None | `createdb taxii_feed` | `CREATE DATABASE taxii_feed` |
 | Concurrent read + write | Single writer (file lock) | MVCC — readers never block the writer | Good (InnoDB MVCC) |
 | Best for | Dev / single small feed | **Production** | Production (if that's your standard) |
+
+> **Schema & production setup** (tables, DDL, DBA-managed provisioning,
+> privileges): see [Database Schema & Production Setup](IMPLEMENTATION_GUIDE.md#database-schema--production-setup)
+> in the implementation guide. The tables are created automatically on first
+> start — no manual DDL needed.
 
 **Recommendation: PostgreSQL.** This server is read-heavy while being written —
 Vision One polls the collection (full reads) at the same time the SOL poller /
@@ -181,10 +186,10 @@ otx:
 # Third-party TAXII 2.1 pullers (empty = none). See Community Sources.
 taxii_pullers: []
   # - name: otx-taxii
-  #   base_url: https://otx.alienvault.com/taxii2/
-  #   username: 'your-otx-api-key'
+  #   base_url: https://otx.alienvault.com/taxii/root   # OTX TAXII 2.1 API root
+  #   username: 'your-otx-api-key'                       # OTX: API key = username
   #   password: ''
-  #   collection: 'threat-intel'
+  #   collection: '<collection-uuid>'
   #   poll_interval: 300
   #   max_objects_per_poll: 5000
   #   enabled: false
@@ -273,9 +278,10 @@ authenticate with it, so you don't re-enter anything until it expires
 > (`X-Taxii-*` headers or HTTP Basic), so curl workflows keep working.
 
 Once logged in, the **TAXII Feed Manager** dashboard opens on the **Feed** tab.
-Use the top tabs to switch between **Feed**, **Community sources**, and
-**Import CSV** (each is a deep link — the URL hash updates, so
-`#sources` / `#import` open that tab directly). On the **Feed** tab you can:
+Use the top tabs to switch between **Feed**, **Intel graph**, **Community
+sources**, and **Import CSV / Excel** (each is a deep link — the URL hash
+updates, so `#graph` / `#sources` / `#import` open that tab directly). On the
+**Feed** tab you can:
 
 1. **Current feed** — an editable table of everything in the feed. Each row
    shows a **source badge** (`manual` / `otx` / a puller name), a **gate
@@ -325,7 +331,9 @@ Use the top tabs to switch between **Feed**, **Community sources**, and
    (`intel_filter:`) and restarting releases them.
 7. **Community sources** — a table of the OTX puller plus each
    `taxii_pullers:` entry (kind, enabled/running, last sync, last added,
-   status) with a **Pull now** button. "Pull now" runs one fetch on demand
+   status) with a **limit box** and a **Pull now** button. Type a number in
+   the box to cap how many objects that one pull ingests (blank = the
+   puller's configured cap). "Pull now" runs one fetch on demand
    (it works even while a puller is `enabled: false`, for a one-shot fetch),
    then refreshes the feed table. See
    [Community Sources](#community-sources-pulling-from-otx-or-any-taxii-21-server).
@@ -456,12 +464,18 @@ collection — see [Multiple Collections](#multiple-collections--per-client-rbac
 **Supported STIX 2.1 types:** `ipv4-addr`, `domain-name`, `file-hash`,
 `indicator`, `url`, `email-addr`, `ipv6-addr`, `mac-addr`,
 `windows-registry-key`, `autonomous-system`, `malware`, `malware-family`,
-`threat-actor`, `campaign`, and `relationship` (a full STIX graph, not just
-flat IOCs). Every object is validated before storage — id/type shape
-(`<type>--<value>`, prefix must match the type), confidence 0–100,
-list-shaped labels, parseable timestamps, and complete relationship
-triples. Invalid objects are **skipped with a warning** (never block the
-batch) — the response's `objects_count` reflects what was actually stored.
+`threat-actor`, `campaign`, `report`, `identity`, `attack-pattern`,
+`vulnerability`, and `relationship` (a full STIX graph, not just flat IOCs).
+Every object is validated before storage — id/type shape (`<type>--<value>`,
+prefix must match the type), confidence 0–100, list-shaped labels, parseable
+timestamps, complete relationship triples, and `object_refs` on reports.
+Invalid objects are **skipped with a warning** (never block the batch) — the
+response's `objects_count` reflects what was actually stored.
+
+Objects are **served back as spec-valid STIX 2.1**: IOCs as `indicator`
+objects (with a `pattern` + `valid_from` — the source's `valid_from` is kept
+when the puller provides it), and SDO/SRO types as their own type with a
+`<type>--<uuid>` id; a report's `object_refs` are passed through verbatim.
 
 **Request Body:**
 ```json
@@ -573,6 +587,8 @@ These drive the dashboard login. They are independent of `taxii.auth`.
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /ui/session` | Current session: `{"authenticated": bool, "user": str\|null}` |
+| `GET /ui/collections` | Collection registry for the dashboard selector: `{"collections": [{id,title}], "primary": id}` |
+| `GET /ui/stats` | Aggregates for the **Intel graph** tab. `?scope=community\|manual\|all` (default community) and `?collection=<id>`: totals, `categories`, `by_source`, `withheld_reasons`, `confidence` (histogram), `timeline`, `top_labels`. |
 | `POST /ui/login` | Body `{"username","password"}` checked against `ui.auth`. On success sets the http-only `taxii2_ui_session` cookie (signed with `security.secret_key`, lifetime `ui.session_ttl`); `401` on bad credentials. |
 | `POST /ui/logout` | Deletes the session cookie. |
 
@@ -592,9 +608,16 @@ These drive the dashboard login. They are independent of `taxii.auth`.
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /community/pullers` | Status of all community sources: the OTX puller plus each `taxii_pullers:` entry (`name`, `kind`, `enabled`, `running`, `base_url`, `collection` for TAXII, `last_sync`, `last_added`, `last_status`, `last_message`). |
-| `POST /community/pull/otx` | Run one OTX pull cycle now (the UI "Pull now"). Returns `{name, added, error, last_sync, last_status}`. |
-| `POST /community/pull/<name>` | Run one pull cycle now for a `taxii_pullers:` entry named `<name>`. `404` if unknown, `400` if misconfigured. Works even when the puller is `enabled: false` (one-shot fetch). |
+| `GET /community/pullers` | Status of all community sources: the OTX puller plus each `taxii_pullers:` entry (`id`, `name`, `kind`, `enabled`, `running`, `limit`, `base_url`, `collection` for TAXII, `last_sync`, `last_added`, `last_status`, `last_message`). |
+| `POST /community/pull/otx` | Run one OTX pull cycle now (the UI "Pull now"). Optional `limit` (JSON `{"limit": N}` or `?limit=N`) caps objects this cycle. Returns `{name, added, error, last_sync, last_status, limit?}`. |
+| `POST /community/pull/<name>` | Run one pull cycle now for a `taxii_pullers:` entry named `<name>`, with the same optional `limit`. `404` if unknown, `400` if misconfigured or the limit is not a positive integer. Works even when the puller is `enabled: false` (one-shot fetch). |
+
+> **Limiting a pull.** "Pull now" accepts a per-cycle **limit** — the dashboard's
+> Community-sources table has a **limit box** next to each Pull button (blank =
+> the puller's configured cap: `otx.max_indicators_per_poll` /
+> `taxii_pullers[].max_objects_per_poll`). The API takes `{"limit": N}` (or
+> `?limit=N`). The value is a *maximum* — the pull may ingest fewer (duplicates
+> are merged, and a source may have less).
 
 > "Pull now" runs **synchronously in the request** (up to ~30 s of external
 > HTTP per call). Enable a puller's background polling with its `enabled:
@@ -889,10 +912,10 @@ auth and `Accept: application/taxii+json;version=2.1`:
 ```yaml
 taxii_pullers:
   - name: otx-taxii              # doubles as the object `source` tag + UI label
-    base_url: https://otx.alienvault.com/taxii2/
+    base_url: https://otx.alienvault.com/taxii/root   # OTX TAXII 2.1 API root
     username: 'your-otx-api-key' # OTX uses the API key as the username
     password: ''
-    collection: 'threat-intel'
+    collection: '<collection-uuid>'   # from GET /taxii/root/collections/
     poll_interval: 300           # seconds between background polls
     max_objects_per_poll: 5000
     enabled: false               # true to poll in the background
@@ -1100,6 +1123,7 @@ Rules:
 | `UI_AUTH_USER` / `UI_AUTH_PASSWORD` | *(no default)* | Dashboard login credentials (`ui.auth`). Unset → startup warning; `/ui/login` fails closed (503) |
 | `DATABASE_URL` | `sqlite:///taxii_feed.db` | Database connection URL (set to e.g. `postgresql+psycopg2://taxii:...@127.0.0.1:5432/taxii_feed` to run on PostgreSQL) |
 | `OTX_API_KEY` | *(empty)* | Optional AlienVault OTX API key (`otx.api_key` in config.yaml, `${OTX_API_KEY:-}`). Free key from otx.alienvault.com raises the public read-only rate limits; empty = anonymous browsing (throttled) |
+| `TAXII_OBJECTS_SHAPE` | `bundle` | Get Objects response shape (`taxii.objects_shape`): `bundle` (default — OTX-compatible `{type,objects,more,next}`, no envelope; **what Vision One ingests**) or `envelope` (spec TAXII 2.1 Message Resource, §5.3 — set this only for a spec-strict client). |
 | `SSO_CLIENT_SECRET` | *(empty)* | Microsoft Entra client secret (referenced by `sso.client_secret` in config.yaml) |
 
 ## Troubleshooting

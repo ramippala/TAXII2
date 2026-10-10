@@ -48,11 +48,14 @@ taxii:
   max_objects: 10000
   bundle_id: 'Bundle-{timestamp}'
   # Get Objects response shape:
-  #   envelope (default) — spec TAXII 2.1 Message Resource (§5.3)
-  #   bundle            — OTX-compatible: the STIX bundle at the top level
-  #                       with more/next, no envelope. Set TAXII_OBJECTS_SHAPE=bundle
-  #                       in .env if a consumer expects the OTX shape.
-  objects_shape: '${TAXII_OBJECTS_SHAPE:-envelope}'
+  #   bundle   (default) — OTX-compatible: the STIX bundle at the top level
+  #                        with more/next, no envelope. This is the shape
+  #                        Trend Micro Vision One ingests (it does not unpack
+  #                        the spec message envelope).
+  #   envelope           — spec TAXII 2.1 Message Resource (§5.3). Set
+  #                        TAXII_OBJECTS_SHAPE=envelope in .env for a
+  #                        spec-strict client.
+  objects_shape: '${TAXII_OBJECTS_SHAPE:-bundle}'
   # === The ONE place Vision One is configured on THIS server ===
   # Trend Micro Vision One is a TAXII 2.1 CLIENT. It polls this server's
   #   http://<this-server>:5000/taxii2/
@@ -223,13 +226,16 @@ sso:
 # ---------------------------------------------------------------------------
 
 otx:
-  enabled: false               # set true to start pulling community intel from OTX
+  enabled: true               # set true to start pulling community intel from OTX
   base_url: 'https://otx.alienvault.com'   # OTX API base (no trailing slash)
   # Optional free OTX API key — put the real value in .env (OTX_API_KEY=...)
   # so it never lands in version control. Unset = anonymous read-only browsing
   # (works, but stricter rate limits).
   api_key: '${OTX_API_KEY:-}'
-  poll_interval: 300           # seconds between poll cycles (5 min)
+  poll_interval: 86400         # seconds between background poll cycles
+                               # (86400 = once a day; 3600 = hourly; 300 = 5 min)
+                               # NB: the first poll runs at startup, then every
+                               # interval — a restart triggers one early poll.
   max_pulses: 25               # recently-updated pulses inspected per poll
   min_indicator_count: 1       # skip pulses with fewer indicators than this
   max_indicators_per_pulse: 1000
@@ -246,20 +252,20 @@ otx:
 #
 # taxii_pullers:
 #   - name: otx-taxii
-#     base_url: https://otx.alienvault.com/taxii2/
+#     base_url: https://otx.alienvault.com/taxii/root   # OTX TAXII 2.1 API root
 #     username: 'your-otx-api-key'      # OTX uses the API key as username
 #     password: ''
-#     collection: 'threat-intel'
+#     collection: '<collection-uuid>'   # e.g. from /taxii/root/collections/
 #     poll_interval: 300
 #     max_objects_per_poll: 5000
 #     enabled: true
 # ---------------------------------------------------------------------------
 taxii_pullers: []
   # - name: otx-taxii
-  #   base_url: https://otx.alienvault.com/taxii2/
+  #   base_url: https://otx.alienvault.com/taxii/root
   #   username: 'your-otx-api-key'
   #   password: ''
-  #   collection: 'threat-intel'
+  #   collection: '<collection-uuid>'
   #   poll_interval: 300
   #   max_objects_per_poll: 5000
   #   enabled: false

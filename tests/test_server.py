@@ -419,11 +419,28 @@ class TestTaxiiServer(unittest.TestCase):
     def test_stix21_object_mapping_unsupported(self):
         """Test unsupported/invalid STIX objects are dropped."""
         import server
-        # attack-pattern is not a supported store type -> dropped.
+        # 'tool' is not a supported store type -> dropped.
         self.assertIsNone(
-            server._stix21_object_to_our({'type': 'attack-pattern', 'name': 'x'}))
+            server._stix21_object_to_our({'type': 'tool', 'name': 'x'}))
         self.assertIsNone(server._stix21_object_to_our({'type': 'ipv4-addr', 'value': '999.1.1.1'}))
         self.assertIsNone(server._stix21_object_to_our({'type': 'file'}))
+        # report without object_refs is invalid -> dropped
+        self.assertIsNone(server._stix21_object_to_our(
+            {'type': 'report', 'name': 'r'}))
+
+    def test_stix21_object_mapping_community_sdos(self):
+        """Community-feed SDOs (report/identity/attack-pattern/vulnerability)."""
+        import server
+        d = server._stix21_object_to_our({'type': 'attack-pattern', 'name': 'T1059'})
+        self.assertEqual(d['type'], 'attack-pattern')
+        d = server._stix21_object_to_our({'type': 'vulnerability', 'name': 'CVE-2026-1'})
+        self.assertEqual(d['type'], 'vulnerability')
+        d = server._stix21_object_to_our({'type': 'identity', 'name': 'Acme'})
+        self.assertEqual(d['type'], 'identity')
+        d = server._stix21_object_to_our({
+            'type': 'report', 'name': 'Daily', 'object_refs': ['indicator--a']})
+        self.assertEqual(d['type'], 'report')
+        self.assertEqual(d['object']['report']['object_refs'], ['indicator--a'])
 
     def test_stix21_object_mapping_extended_types(self):
         """Test the extended SCO / SDO / relationship mapping (graph)."""
@@ -478,6 +495,20 @@ class TestTaxiiServer(unittest.TestCase):
         # API root url keeps the trailing slash.
         self.assertTrue(p._api_root_url().endswith('/'))
 
+    def test_taxii_puller_parses_bare_bundle(self):
+        """The generic puller must parse both the spec envelope and the
+        OTX-style bare bundle ({type:"bundle", objects:[…]})."""
+        import server
+        p = server.TaxiiPuller({'name': 'x', 'base_url': 'https://h/', 'collection': 'c'})
+        p._get_taxii = lambda path, since=None: {
+            'type': 'bundle', 'more': False,
+            'objects': [{'type': 'ipv4-addr', 'value': '1.2.3.4'}]}
+        self.assertEqual(len(p._fetch_objects(None)), 1)          # bare bundle
+        p._get_taxii = lambda path, since=None: {
+            'content': {'content': {'type': 'bundle',
+                                    'objects': [{'type': 'ipv4-addr', 'value': '5.6.7.8'}]}}}
+        self.assertEqual(len(p._fetch_objects(None)), 1)          # spec envelope
+
     def test_taxii_puller_misconfigured(self):
         """Test a puller missing base_url/collection reports misconfigured."""
         import server
@@ -493,11 +524,11 @@ class TestTaxiiServer(unittest.TestCase):
         p = server.TaxiiPuller({
             'name': 'testpull', 'base_url': 'https://x/taxii2', 'collection': 'c',
         })
-        p._fetch_objects = lambda since: [
+        p._fetch_objects = lambda since, limit=None: [
             {'type': 'ipv4-addr', 'value': '8.8.8.8', 'confidence': 60},
             {'type': 'domain-name', 'value': 'c2.example.com'},
             {'type': 'ipv4-addr', 'value': '10.1.1.1'},  # private -> still stored, gated
-            {'type': 'attack-pattern', 'name': 'drop'},   # unsupported -> skipped
+            {'type': 'tool', 'name': 'drop'},             # unsupported -> skipped
         ]
         added, err = p._poll_once()
         self.assertIsNone(err)
@@ -1773,6 +1804,80 @@ class TestExtendedTypesAndValidation(unittest.TestCase):
         self.assertEqual(objs[0]['name'], 'Operation Beep')
 
 
+class TestCommunitySdoAndFidelity(unittest.TestCase):
+    """Community-feed SDOs (report/identity/attack-pattern/vulnerability) and
+    upstream provenance (valid_from) preserved through ingest -> serve."""
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        app.config['TAXII_AUTH'] = {'username': 'u', 'password': 'p'}
+        self.auth = {'X-Taxii-Username': 'u', 'X-Taxii-Password': 'p'}
+
+    def _served(self):
+        r = self.client.get('/taxii2/collections/threat-intel/objects/',
+                            headers=self.auth)
+        self.assertEqual(r.status_code, 200)
+        return r.get_json()['content']['content']['objects']
+
+    def test_serve_community_sdos(self):
+        r = self.client.post('/feed/ingest', json={'stix_objects': [
+            {'id': 'attack-pattern--T1059', 'type': 'attack-pattern',
+             'object': {'attack-pattern': {'name': 'Command and Scripting Interpreter'}},
+             'labels': ['attack'], 'confidence': 60},
+            {'id': 'vulnerability--CVE-2026-1', 'type': 'vulnerability',
+             'object': {'vulnerability': {'name': 'CVE-2026-1'}},
+             'labels': ['cve'], 'confidence': 60},
+            {'id': 'identity--acme', 'type': 'identity',
+             'object': {'identity': {'name': 'Acme Corp'}},
+             'labels': ['identity'], 'confidence': 60},
+            {'id': 'report--daily', 'type': 'report',
+             'object': {'report': {'name': 'Daily report',
+                                   'object_refs': ['indicator--x']}},
+             'labels': ['report'], 'confidence': 60},
+        ]}, headers=self.auth)
+        self.assertEqual(r.get_json()['objects_count'], 4)
+        by = {o['type']: o for o in self._served()}
+        self.assertEqual(by['attack-pattern']['name'], 'Command and Scripting Interpreter')
+        self.assertEqual(by['vulnerability']['name'], 'CVE-2026-1')
+        self.assertEqual(by['identity']['identity_class'], 'unknown')   # REQUIRED field
+        self.assertEqual(by['report']['object_refs'], ['indicator--x'])  # REQUIRED field
+
+    def test_upstream_valid_from_preserved(self):
+        self.client.post('/feed/ingest', json={'stix_objects': [
+            {'id': 'indicator--vf', 'type': 'indicator',
+             'object': {'indicator': {'value': 'evil.example.com'}},
+             'labels': ['x'], 'confidence': 70,
+             'valid_from': '2026-09-01T01:00:36.000Z'},
+        ]}, headers=self.auth)
+        objs = self._served()
+        self.assertEqual(objs[0]['type'], 'indicator')
+        self.assertEqual(objs[0]['valid_from'], '2026-09-01T01:00:36Z')
+
+    def test_report_without_refs_skipped(self):
+        r = self.client.post('/feed/ingest', json={'stix_objects': [
+            {'id': 'report--x', 'type': 'report',
+             'object': {'report': {'name': 'no refs'}}, 'labels': [], 'confidence': 50},
+        ]}, headers=self.auth)
+        self.assertEqual(r.get_json()['objects_count'], 0)
+
+    def test_sdo_ids_are_valid_stix(self):
+        """A served SDO/SRO id must be <type>--<uuid> even if ingested with a
+        human id (strict STIX consumers reject anything else)."""
+        import uuid as _uuid
+        self.client.post('/feed/ingest', json={'stix_objects': [
+            {'id': 'attack-pattern--human', 'type': 'attack-pattern',
+             'object': {'attack-pattern': {'name': 'T1059'}},
+             'labels': [], 'confidence': 50},
+            {'id': 'malware--trickbot', 'type': 'malware',
+             'object': {'malware': {'name': 'TrickBot'}},
+             'labels': [], 'confidence': 50},
+        ]}, headers=self.auth)
+        for o in self._served():
+            self.assertTrue(o['id'].startswith(o['type'] + '--'), o['id'])
+            _uuid.UUID(o['id'].split('--', 1)[1])   # raises if not a UUID
+
+
 class TestTaxiiPagination(unittest.TestCase):
     """TAXII 2.1 Get Objects pagination: limit / next / more (keyset)."""
 
@@ -2019,6 +2124,113 @@ class TestXlsxImport(unittest.TestCase):
         )
         # unparseable workbook -> no objects -> 400 (or openpyxl error)
         self.assertEqual(r.status_code, 400)
+
+
+class TestUiStats(unittest.TestCase):
+    """GET /ui/stats — aggregates behind the Intel graph dashboard."""
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        app.config['TAXII_AUTH'] = {'username': 'u', 'password': 'p'}
+        self.auth = {'X-Taxii-Username': 'u', 'X-Taxii-Password': 'p'}
+
+    def _seed(self):
+        ingest_objects([
+            {'id': 'ipv4-addr--1-1-1-1', 'type': 'ipv4-addr',
+             'object': {'ipv4-addr': {'value': '1.1.1.1'}},
+             'labels': ['otx', 'pulseA'], 'confidence': 70},
+            {'id': 'domain-name--a-b', 'type': 'domain-name',
+             'object': {'domain-name': {'value': 'a.b'}},
+             'labels': ['otx'], 'confidence': 80},
+        ], mode='merge', source='otx')
+        ingest_objects([
+            {'id': 'ipv4-addr--8-8-8-8', 'type': 'ipv4-addr',
+             'object': {'ipv4-addr': {'value': '8.8.8.8'}},
+             'labels': ['manual'], 'confidence': 90},
+        ], mode='merge', source='manual')
+
+    def test_scopes_and_aggregates(self):
+        self._seed()
+        d = self.client.get('/ui/stats?scope=community', headers=self.auth).get_json()
+        self.assertEqual(d['scope'], 'community')
+        self.assertEqual(d['total'], 2)
+        self.assertEqual({c['type']: c['count'] for c in d['categories']},
+                         {'ipv4-addr': 1, 'domain-name': 1})
+        self.assertEqual([s['source'] for s in d['by_source']], ['otx'])
+        self.assertEqual(d['sources'], 1)
+        self.assertEqual(d['served'], 2)
+        self.assertEqual(len(d['confidence']['histogram']), 5)
+        self.assertIn('otx', [l['label'] for l in d['top_labels']])
+        self.assertEqual(d['labels_total'], 3)   # otx, pulseA, otx
+
+        self.assertEqual(
+            self.client.get('/ui/stats?scope=manual', headers=self.auth).get_json()['total'], 1)
+        all_stats = self.client.get('/ui/stats?scope=all', headers=self.auth).get_json()
+        self.assertEqual(all_stats['total'], 3)
+        self.assertEqual(all_stats['sources'], 2)
+
+    def test_bad_scope_and_auth(self):
+        self.assertEqual(
+            self.client.get('/ui/stats?scope=nope', headers=self.auth).status_code, 400)
+        self.assertEqual(self.client.get('/ui/stats').status_code, 401)
+
+    def test_withheld_reason_reported(self):
+        ingest_objects([
+            {'id': 'ipv4-addr--10-0-0-5', 'type': 'ipv4-addr',
+             'object': {'ipv4-addr': {'value': '10.0.0.5'}},
+             'labels': ['otx'], 'confidence': 70},
+        ], mode='merge', source='otx')
+        d = self.client.get('/ui/stats?scope=community', headers=self.auth).get_json()
+        self.assertEqual(d['withheld'], 1)
+        self.assertEqual(d['served'], 0)
+        self.assertEqual(d['withheld_reasons'][0]['reason'], 'private-ip')
+
+
+class TestPullLimit(unittest.TestCase):
+    """POST /community/pull/<name> — one-shot object limiter."""
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        app.config['TAXII_AUTH'] = {'username': 'u', 'password': 'p'}
+        self.auth = {'X-Taxii-Username': 'u', 'X-Taxii-Password': 'p'}
+
+    def test_fetch_objects_honors_limit(self):
+        import server
+        p = server.TaxiiPuller({'name': 'c1', 'base_url': 'https://h/', 'collection': 'c'})
+        p._get_taxii = lambda path, since=None: {
+            'type': 'bundle',
+            'objects': [{'type': 'ipv4-addr', 'value': f'1.1.1.{i}'} for i in range(10)]}
+        self.assertEqual(len(p._fetch_objects(None, limit=3)), 3)   # capped by limit
+        self.assertEqual(len(p._fetch_objects(None)), 10)          # default cap (5000)
+
+    def test_endpoint_validates_limit(self):
+        for bad in ('0', '-1', 'abc'):
+            r = self.client.post('/community/pull/otx?limit=' + bad,
+                                 headers=self.auth)
+            self.assertEqual(r.status_code, 400, bad)              # no network hit
+
+    def test_endpoint_passes_limit_to_puller(self):
+        import server
+        seen = {}
+
+        class FakePuller:
+            name = 'fakepuller'
+
+            def pull_now(self, limit=None):
+                seen['limit'] = limit
+                return {'name': self.name, 'added': 0, 'error': None}
+
+        server.taxii_pullers.append(FakePuller())
+        try:
+            r = self.client.post('/community/pull/fakepuller',
+                                 json={'limit': 7}, headers=self.auth)
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(seen['limit'], 7)
+            self.assertEqual(r.get_json()['limit'], 7)
+        finally:
+            server.taxii_pullers.pop()
 
 
 class TestCollectionsRbac(unittest.TestCase):

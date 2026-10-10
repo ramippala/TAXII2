@@ -195,6 +195,8 @@ class STIXObject(Base):
     source_ref = Column(String, nullable=True)   # STIX relationship source_ref
     target_ref = Column(String, nullable=True)   # STIX relationship target_ref
     relationship_type = Column(String, nullable=True)  # STIX relationship_type
+    object_refs = Column(Text, nullable=True)    # report object_refs (JSON list)
+    valid_from = Column(DateTime, nullable=True)  # STIX valid_from (upstream, when known)
     collection_id = Column(String, default='threat-intel', index=True)  # which TAXII
                                                  # collection this object belongs to
     source = Column(String, nullable=True)       # origin: 'manual' | 'otx'
@@ -253,6 +255,14 @@ def _parse_iso_ts(value: Any) -> Optional[datetime]:
     return None
 
 
+def _parse_iso_naive(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp to a naive UTC datetime (or None)."""
+    dt = _parse_iso_ts(value)
+    if dt is not None and dt.tzinfo is not None:
+        dt = dt - dt.utcoffset()
+    return dt
+
+
 def create_session():
     """Create a new database session (caller is responsible for closing)."""
     return SessionLocal()
@@ -287,6 +297,9 @@ def init_db() -> None:
             ('target_ref', 'VARCHAR'),
             ('relationship_type', 'VARCHAR'),
             ('collection_id', 'VARCHAR'),
+            ('object_refs', 'TEXT'),        # report object_refs (JSON list)
+            ('valid_from', 'TIMESTAMP'),    # STIX valid_from (upstream; TIMESTAMP
+                                            # works on both SQLite and Postgres)
         ):
             if col not in cols:
                 with engine.begin() as conn:
@@ -335,6 +348,8 @@ def rehydrate_memory() -> int:
                     source_ref=row.source_ref,
                     target_ref=row.target_ref,
                     relationship_type=row.relationship_type,
+                    object_refs=row.object_refs,
+                    valid_from=row.valid_from,
                     collection=row.collection_id or 'threat-intel',
                     source=row.source or 'manual',
                     revoked=bool(row.revoked),
@@ -513,6 +528,8 @@ class ThreatIntel:
     source_ref: Optional[str] = None      # STIX relationship source_ref
     target_ref: Optional[str] = None      # STIX relationship target_ref
     relationship_type: Optional[str] = None  # STIX relationship_type
+    object_refs: Optional[str] = None     # report object_refs (JSON list, as stored)
+    valid_from: Optional[datetime] = None  # STIX valid_from (upstream, when known)
     collection: str = 'threat-intel'      # TAXII collection this object belongs to
     source: str = 'manual'
     revoked: bool = False  # once revoked -> served as STIX revoked: true
@@ -1082,12 +1099,15 @@ def _unauthorized_feed_response() -> Response:
 # types (ipv4-addr / domain-name / file-hash / indicator) are joined by
 # extra single-value SCOs (url, email-addr, ipv6-addr, mac-addr,
 # windows-registry-key, autonomous-system), the SDOs the UI feeds
-# (malware / threat-actor / campaign), and STIX relationships (the graph).
+# (malware / threat-actor / campaign), the SDOs community TAXII feeds carry
+# (report / identity / attack-pattern / vulnerability), and STIX
+# relationships (the graph).
 _SUPPORTED_STIX_TYPES = frozenset({
     'ipv4-addr', 'domain-name', 'file-hash', 'indicator',
     'url', 'email-addr', 'ipv6-addr', 'mac-addr',
     'windows-registry-key', 'autonomous-system',
     'malware', 'malware-family', 'threat-actor', 'campaign', 'relationship',
+    'report', 'identity', 'attack-pattern', 'vulnerability',
 })
 
 
@@ -1132,6 +1152,12 @@ def _validate_stix_object(obj: Any) -> Optional[str]:
         for field in ('source_ref', 'relationship_type', 'target_ref'):
             if not inner.get(field):
                 return f'relationship missing {field!r}'
+    if obj_type == 'report':
+        od = obj.get('object') or {}
+        nested = od.get('report') if isinstance(od, dict) else None
+        inner = nested if isinstance(nested, dict) else od
+        if not inner.get('object_refs'):
+            return 'report missing object_refs'
     for key in ('created', 'modified'):
         if obj.get(key) is not None and _parse_iso_ts(obj.get(key)) is None:
             return f'{key} not parseable: {obj.get(key)!r}'
@@ -1161,6 +1187,7 @@ def _extract_object_fields(
         'source_ref': None,
         'target_ref': None,
         'relationship_type': None,
+        'object_refs': None,
     }
 
     if obj_type == 'file-hash':
@@ -1185,6 +1212,13 @@ def _extract_object_fields(
         result['source_ref'] = inner.get('source_ref')
         result['relationship_type'] = inner.get('relationship_type')
         result['target_ref'] = inner.get('target_ref')
+    elif obj_type == 'report':
+        result['name'] = inner.get('name')
+        refs = inner.get('object_refs')
+        if isinstance(refs, list):
+            result['object_refs'] = json.dumps([str(r) for r in refs])
+    elif obj_type in ('identity', 'attack-pattern', 'vulnerability'):
+        result['name'] = inner.get('name')
     elif obj_type in ('indicator', 'malware', 'malware-family',
                       'threat-actor', 'campaign'):
         result['name'] = inner.get('value') or inner.get('name')
@@ -1266,6 +1300,12 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                     labels = [labels]
                 confidence = int(obj_dict.get('confidence', 0) or 0)
                 fields = _extract_object_fields(obj_type, object_dict)
+                # Upstream valid_from (fall back to upstream created), kept so
+                # served indicators carry the source's validity start.
+                valid_from = _parse_iso_naive(
+                    obj_dict.get('valid_from') or object_dict.get('valid_from')
+                    or obj_dict.get('created') or object_dict.get('created')
+                )
 
                 existing_row = existing.get(stix_id)
                 # Revocation is sticky. An explicit "revoked" in the payload
@@ -1298,6 +1338,8 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                     source_ref=fields['source_ref'],
                     target_ref=fields['target_ref'],
                     relationship_type=fields['relationship_type'],
+                    object_refs=fields['object_refs'],
+                    valid_from=valid_from,
                     collection=collection,
                     source=source,
                     revoked=revoked,
@@ -1317,6 +1359,8 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                     row.source_ref = fields['source_ref']
                     row.target_ref = fields['target_ref']
                     row.relationship_type = fields['relationship_type']
+                    row.object_refs = fields['object_refs']
+                    row.valid_from = valid_from
                     row.collection_id = collection
                     row.last_seen = now
                     row.revoked = revoked  # sticky (see above); keeps first revoked_at
@@ -1336,6 +1380,8 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                         source_ref=fields['source_ref'],
                         target_ref=fields['target_ref'],
                         relationship_type=fields['relationship_type'],
+                        object_refs=fields['object_refs'],
+                        valid_from=valid_from,
                         collection_id=collection,
                         source=source,
                         first_seen=now,
@@ -1404,11 +1450,10 @@ def purge_all(collection: Optional[str] = None) -> int:
 TAXII_CFG = CONFIG.get('taxii', {}) or {}
 DEFAULT_COLLECTION_ID = 'threat-intel'
 # Get Objects response shape:
-#   'envelope' (default) — the TAXII 2.1 Message Resource (spec §5.3).
-#   'bundle'             — OTX-compatible: the STIX bundle at the top level
-#                          with more/next, no envelope. Some consumers (the
-#                          OTX feed Vision One ingests) use this shape.
-TAXII_OBJECTS_SHAPE = str(TAXII_CFG.get('objects_shape') or 'envelope').lower()
+#   'bundle' (default) — OTX-compatible: the STIX bundle at the top level with
+#                        more/next, no envelope. What Vision One ingests.
+#   'envelope'         — the TAXII 2.1 Message Resource (spec §5.3).
+TAXII_OBJECTS_SHAPE = str(TAXII_CFG.get('objects_shape') or 'bundle').lower()
 
 
 @dataclass
@@ -1580,13 +1625,32 @@ def _ioc_stix_object(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
         'pattern': pattern,
         'pattern_type': 'stix',
         'pattern_version': '2.1',
-        'valid_from': now,
+        # Prefer the source's validity start (kept at ingest); else now.
+        'valid_from': (obj.valid_from.strftime('%Y-%m-%dT%H:%M:%SZ')
+                       if obj.valid_from else now),
     }
     if obj.name:
         out['name'] = obj.name
     if obj.description:
         out['description'] = obj.description
     return out
+
+
+def _stix_uuid_id(obj_type: str, stix_id: Optional[str], seed: str) -> str:
+    """Return a spec-valid STIX id: keep ``stix_id`` when it is
+    ``<type>--<uuid>``, else derive a deterministic uuid5-based one.
+
+    STIX requires an id of the form ``<object-type>--<UUID>``; objects that
+    were ingested with a human/short id (manual entry, some pullers) would
+    otherwise be served as invalid STIX and rejected by strict consumers.
+    """
+    if stix_id and stix_id.startswith(obj_type + '--'):
+        try:
+            uuid.UUID(stix_id.split('--', 1)[1])
+            return stix_id
+        except (ValueError, AttributeError):
+            pass
+    return f'{obj_type}--{uuid.uuid5(uuid.NAMESPACE_OID, seed)}'
 
 
 def threat_intel_to_stix21(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
@@ -1612,12 +1676,15 @@ def threat_intel_to_stix21(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
     if obj.object_type in _IOC_STORED_TYPES:
         return _ioc_stix_object(obj)
 
-    # SDOs beyond the free-text indicator: malware / threat-actor / campaign.
-    if obj.object_type in ('malware', 'threat-actor', 'campaign'):
+    # SDOs: malware / threat-actor / campaign (UI-fed) plus identity /
+    # attack-pattern / vulnerability (community TAXII feeds).
+    if obj.object_type in ('malware', 'threat-actor', 'campaign',
+                           'identity', 'attack-pattern', 'vulnerability'):
         base: Dict[str, Any] = {
             **common,
             'type': obj.object_type,
-            'id': obj.stix_id,
+            'id': _stix_uuid_id(obj.object_type, obj.stix_id,
+                                f'{obj.object_type}:{obj.name or obj.stix_id}'),
             'labels': obj.labels or [],
             'confidence': obj.confidence or 0,
         }
@@ -1627,9 +1694,38 @@ def threat_intel_to_stix21(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
         elif obj.object_type == 'threat-actor':
             base['name'] = obj.name or 'Unknown threat actor'
             base['threat_actor_types'] = ['unknown']  # open-vocab, required
-        else:  # campaign
+        elif obj.object_type == 'campaign':
             base['name'] = obj.name or 'Unnamed campaign'
+        elif obj.object_type == 'identity':
+            base['name'] = obj.name or 'Unknown identity'
+            base['identity_class'] = 'unknown'        # REQUIRED by STIX
+        elif obj.object_type == 'attack-pattern':
+            base['name'] = obj.name or 'Unnamed attack pattern'  # name REQUIRED
+        else:  # vulnerability
+            base['name'] = obj.name or 'Unnamed vulnerability'    # name REQUIRED
         return base
+
+    # STIX report (community feeds bundle indicators into reports).
+    if obj.object_type == 'report':
+        refs: List[str] = []
+        if obj.object_refs:
+            try:
+                refs = json.loads(obj.object_refs) or []
+            except (TypeError, ValueError):
+                refs = []
+        if not refs:
+            return None              # object_refs is REQUIRED; skip if unknown
+        return {
+            **common,
+            'type': 'report',
+            'id': _stix_uuid_id('report', obj.stix_id,
+                                'report:' + (obj.name or obj.stix_id)),
+            'name': obj.name or 'Threat report',
+            'object_refs': refs,
+            'published': common['created'],
+            'labels': obj.labels or [],
+            'confidence': obj.confidence or 0,
+        }
 
     # STIX relationship (the graph edge).
     if obj.object_type == 'relationship':
@@ -2367,6 +2463,109 @@ def list_objects():
     }), 200
 
 
+@app.route('/ui/stats', methods=['GET'])
+def ui_stats():
+    """GET /ui/stats — aggregate counts for the Intel graph dashboard.
+
+    Optional ``?collection=<id>`` (default: primary) and
+    ``?scope=community|manual|all`` (default ``community`` = every non-manual
+    source: the OTX pull and any third-party TAXII pullers).
+    """
+    if not _request_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    cid, err = _collection_param(request.args.get('collection'))
+    if err:
+        return jsonify({'error': err}), 400
+    cid = cid or TAXII_COLLECTION_ID
+    scope = str(request.args.get('scope') or 'community').lower()
+    if scope not in ('community', 'manual', 'all'):
+        return jsonify({
+            'error': f'scope must be community|manual|all, got {scope!r}'
+        }), 400
+
+    session = create_session()
+    try:
+        q = session.query(STIXObject)
+        if cid:
+            q = q.filter(STIXObject.collection_id == cid)
+        rows = q.all()
+    finally:
+        session.close()
+
+    by_type: Dict[str, int] = {}
+    by_source: Dict[str, int] = {}
+    reasons: Dict[str, int] = {}
+    labels: Dict[str, int] = {}
+    timeline: Dict[str, int] = {}
+    conf_values: List[int] = []
+    buckets = [0, 0, 0, 0, 0]          # 1-20, 21-40, 41-60, 61-80, 81-100
+    total = served = withheld = revoked = 0
+
+    with memory_lock:
+        for row in rows:
+            obj = memory_store.get(row.stix_id)
+            if obj is None:
+                continue
+            src = row.source or 'manual'
+            if scope == 'community' and src == 'manual':
+                continue
+            if scope == 'manual' and src != 'manual':
+                continue
+            total += 1
+            by_type[row.object_type] = by_type.get(row.object_type, 0) + 1
+            by_source[src] = by_source.get(src, 0) + 1
+            if row.revoked:
+                revoked += 1
+            verdict = gate_verdict(obj, row)
+            if verdict['gated']:
+                withheld += 1
+                key = verdict['reason'] or 'other'
+                reasons[key] = reasons.get(key, 0) + 1
+            else:
+                served += 1
+            for lb in (obj.labels or []):
+                labels[lb] = labels.get(lb, 0) + 1
+            if row.last_seen:
+                day = row.last_seen.strftime('%Y-%m-%d')
+                timeline[day] = timeline.get(day, 0) + 1
+            c = int(row.confidence or 0)
+            conf_values.append(c)
+            buckets[min(4, max(0, (c - 1) // 20)) if c > 0 else 0] += 1
+
+    def _ranked(counter: Dict[str, int], name: str) -> List[Dict[str, Any]]:
+        return [{name: k, 'count': v}
+                for k, v in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+    hist_labels = ['1-20', '21-40', '41-60', '61-80', '81-100']
+    return jsonify({
+        'collection': cid,
+        'scope': scope,
+        'total': total,
+        'served': served,
+        'withheld': withheld,
+        'revoked': revoked,
+        'sources': len(by_source),
+        'categories': _ranked(by_type, 'type'),
+        'by_source': _ranked(by_source, 'source'),
+        'withheld_reasons': [
+            {'reason': r, 'label': _GATE_REASON_LABELS.get(r, r), 'count': n}
+            for r, n in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))
+        ],
+        'confidence': {
+            'min': min(conf_values) if conf_values else 0,
+            'max': max(conf_values) if conf_values else 0,
+            'avg': round(sum(conf_values) / len(conf_values), 1) if conf_values else 0,
+            'histogram': [{'bucket': hist_labels[i], 'count': buckets[i]}
+                          for i in range(5)],
+        },
+        'timeline': [{'date': d, 'count': timeline[d]} for d in sorted(timeline)][-30:],
+        'top_labels': _ranked(labels, 'label')[:10],
+        'labels_total': sum(labels.values()),   # all label occurrences
+        'generated': _stix_now(),
+    }), 200
+
+
 @app.route('/objects/<stix_id>/revoke', methods=['POST'])
 def revoke_object(stix_id: str):
     """POST /objects/<stix_id>/revoke — revoke or reinstate an object.
@@ -2701,16 +2900,35 @@ def community_pullers():
 
 @app.route('/community/pull/<name>', methods=['POST'])
 def community_pull(name: str):
-    """POST /community/pull/<name> — run one pull cycle now ('Pull now')."""
+    """POST /community/pull/<name> — run one pull cycle now ('Pull now').
+
+    Optional ``limit`` (JSON body ``{"limit": N}`` or ``?limit=N``) caps how
+    many objects this single cycle ingests, overriding the puller's
+    configured cap (``max_indicators_per_poll`` / ``max_objects_per_poll``).
+    """
     if not _request_allowed():
         return jsonify({'error': 'Unauthorized'}), 401
+    body = request.get_json(silent=True) or {}
+    raw = body.get('limit', request.args.get('limit'))
+    limit = None
+    if raw is not None and raw != '':
+        try:
+            limit = int(raw)
+            if limit <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return jsonify({
+                'error': f'limit must be a positive integer, got {raw!r}'
+            }), 400
     if name == 'otx':
         puller = otx_poller
     else:
         puller = next((p for p in taxii_pullers if p.name == name), None)
     if puller is None:
         return jsonify({'error': f'Unknown puller: {name}'}), 404
-    result = puller.pull_now()
+    result = puller.pull_now(limit=limit)
+    if limit is not None:
+        result['limit'] = limit
     if result.get('error') and 'misconfigured' in result['error']:
         return jsonify(result), 400
     return jsonify(result), 200
@@ -3343,18 +3561,22 @@ class OtxPoller:
                            f'(OTX type: {raw_type})',
         }
 
-    def _poll_once(self) -> int:
+    def _poll_once(self, limit: Optional[int] = None) -> int:
         """One poll cycle: fetch recent OTX pulses, map indicators, merge.
 
+        ``limit`` caps the number of indicators ingested this cycle (an
+        on-demand override for the dashboard's "Pull now"; the configured
+        ``max_indicators_per_poll`` applies otherwise).
         Returns the number of objects ingested in this cycle.
         """
         if not self.base_url:
             logger.warning("OTX poller misconfigured (base_url missing)")
             return 0
 
+        cap = int(limit) if limit and limit > 0 else self.max_indicators_per_poll
         stix_objects: List[Dict[str, Any]] = []
         for pulse in self.fetch_recent_pulses():
-            if len(stix_objects) >= self.max_indicators_per_poll:
+            if len(stix_objects) >= cap:
                 break
             pulse_id = pulse.get('id') or ''
             if not pulse_id:
@@ -3366,7 +3588,7 @@ class OtxPoller:
                 stix = self.otx_indicator_to_stix(item, pulse.get('name') or '', 0)
                 if stix:
                     stix_objects.append(stix)
-                    if len(stix_objects) >= self.max_indicators_per_poll:
+                    if len(stix_objects) >= cap:
                         break
 
         if not stix_objects:
@@ -3386,7 +3608,9 @@ class OtxPoller:
         st = read_puller_state('otx') or {}
         return {
             'name': 'AlienVault OTX',
+            'id': 'otx',
             'kind': 'otx',
+            'limit': self.max_indicators_per_poll,
             'enabled': self.enabled,
             'running': bool(self._thread and self._thread.is_alive()),
             'base_url': self.base_url,
@@ -3396,13 +3620,16 @@ class OtxPoller:
             'last_message': st.get('last_message'),
         }
 
-    def pull_now(self) -> Dict[str, Any]:
-        """Run one poll cycle synchronously (for the dashboard 'Pull now')."""
+    def pull_now(self, limit: Optional[int] = None) -> Dict[str, Any]:
+        """Run one poll cycle synchronously (for the dashboard 'Pull now').
+
+        ``limit`` overrides ``max_indicators_per_poll`` for this one cycle.
+        """
         if not self.base_url:
             return {'name': 'AlienVault OTX', 'added': 0,
                     'error': 'misconfigured (base_url missing)'}
         try:
-            added = self._poll_once()
+            added = self._poll_once(limit=limit)
         except Exception as exc:
             save_puller_state('otx', 'error', 0, str(exc))
             return {'name': 'AlienVault OTX', 'added': 0, 'error': str(exc)}
@@ -3471,6 +3698,10 @@ _STIX_TO_OUR_TYPE = {
     'threat-actor': 'threat-actor',
     'campaign': 'campaign',
     'relationship': 'relationship',
+    'report': 'report',
+    'identity': 'identity',
+    'attack-pattern': 'attack-pattern',
+    'vulnerability': 'vulnerability',
 }
 _HASH_ALGO_BY_STIX_KEY = {
     'MD5': 'md5', 'SHA-1': 'sha1', 'SHA-256': 'sha256', 'SHA-512': 'sha512',
@@ -3578,13 +3809,23 @@ def _stix21_object_to_our(o: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             ).hex
         )
         name = None
-    elif our_type in ('malware', 'threat-actor', 'campaign'):
+    elif our_type in ('malware', 'threat-actor', 'campaign',
+                      'identity', 'attack-pattern', 'vulnerability'):
         name = o.get('name')
         if not name:
             return None
         payload = {our_type: {'name': name}}
         stix_id = str(o.get('id') or '') or (
             f"{our_type}--{uuid.uuid5(uuid.NAMESPACE_OID, str(name)).hex}"
+        )
+    elif our_type == 'report':
+        name = o.get('name')
+        refs = o.get('object_refs')
+        if not name or not isinstance(refs, list) or not refs:
+            return None
+        payload = {'report': {'name': name, 'object_refs': refs}}
+        stix_id = str(o.get('id') or '') or (
+            'report--' + uuid.uuid5(uuid.NAMESPACE_OID, str(name)).hex
         )
     else:  # indicator
         value = None
@@ -3612,7 +3853,7 @@ def _stix21_object_to_our(o: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             payload = {'indicator': {'value': str(value)}}
         name = o.get('name')
 
-    return {
+    descriptor = {
         'id': stix_id,
         'type': our_type,
         'object': payload,
@@ -3620,6 +3861,13 @@ def _stix21_object_to_our(o: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         'confidence': confidence,
         'name': name,
     }
+    # Preserve provenance/fidelity the upstream object carries.
+    if o.get('description'):
+        descriptor['description'] = o['description']
+    upstream_vf = o.get('valid_from') or o.get('created')
+    if upstream_vf:
+        descriptor['valid_from'] = upstream_vf
+    return descriptor
 
 
 class TaxiiPuller:
@@ -3692,28 +3940,36 @@ class TaxiiPuller:
             logger.error("TAXII pull %s failed: %s", self.name, exc)
             return None
 
-    def _fetch_objects(self, since: Optional[str]) -> List[Dict[str, Any]]:
-        """Fetch STIX 2.1 objects from the configured collection (up to cap)."""
+    def _fetch_objects(self, since: Optional[str],
+                       limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Fetch STIX 2.1 objects from the configured collection (up to cap).
+
+        Accepts both the spec TAXII envelope (``content.content.objects``) and
+        the OTX-style bare bundle (``{type:"bundle", objects:[…]}``). ``limit``
+        overrides ``max_objects_per_poll`` for this fetch.
+        """
         if not self.collection:
             return []
         data = self._get_taxii(f'collections/{self.collection}/objects/', since)
         if not isinstance(data, dict):
             return []
-        content = data.get('content') or {}
-        bundle = content.get('content') or {}
-        objects = bundle.get('objects') or []
-        return [o for o in objects if isinstance(o, dict)][:self.max_objects_per_poll]
+        inner = (data.get('content') or {}).get('content')
+        source = inner if isinstance(inner, dict) else data
+        cap = int(limit) if limit and limit > 0 else self.max_objects_per_poll
+        objects = source.get('objects') or []
+        return [o for o in objects if isinstance(o, dict)][:cap]
 
-    def _poll_once(self) -> Tuple[int, Optional[str]]:
+    def _poll_once(self, limit: Optional[int] = None) -> Tuple[int, Optional[str]]:
         """One poll cycle: ?since= poll the collection, map, merge.
 
+        ``limit`` caps the objects ingested this cycle (on-demand override).
         Returns (added, error_message_or_None).
         """
         if not self.base_url or not self.collection:
             return 0, 'misconfigured (base_url/collection missing)'
 
         since = _puller_since_iso(self.state_id)
-        raw_objects = self._fetch_objects(since)
+        raw_objects = self._fetch_objects(since, limit=limit)
         if raw_objects is None:
             return 0, 'fetch failed (see server log)'
 
@@ -3729,9 +3985,12 @@ class TaxiiPuller:
         save_puller_state(self.state_id, 'ok', added, f'{added} object(s) ingested')
         return added, None
 
-    def pull_now(self) -> Dict[str, Any]:
-        """Run one poll cycle synchronously (for the dashboard 'Pull now')."""
-        added, err = self._poll_once()
+    def pull_now(self, limit: Optional[int] = None) -> Dict[str, Any]:
+        """Run one poll cycle synchronously (for the dashboard 'Pull now').
+
+        ``limit`` overrides ``max_objects_per_poll`` for this one cycle.
+        """
+        added, err = self._poll_once(limit=limit)
         st = read_puller_state(self.state_id) or {}
         return {
             'name': self.name,
@@ -3746,7 +4005,9 @@ class TaxiiPuller:
         st = read_puller_state(self.state_id) or {}
         return {
             'name': self.name,
+            'id': self.name,
             'kind': self.KIND,
+            'limit': self.max_objects_per_poll,
             'enabled': self.enabled,
             'running': bool(self._thread and self._thread.is_alive()),
             'base_url': self.base_url,

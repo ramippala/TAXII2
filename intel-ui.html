@@ -105,6 +105,7 @@
   .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
   .topbar .who { color: var(--muted); font-size: 13px; }
   .puller-result { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .limitbox { width: 76px; margin-right: 6px; vertical-align: middle; }
   /* dashboard tabs */
   .tabs { display: flex; gap: 6px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
   .tab {
@@ -117,6 +118,30 @@
   section[data-page].active { display: block; }
   .colsel { font-size: 12px; color: var(--muted); margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
   .colsel select { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 4px 8px; }
+  /* intel graph (dashboard) */
+  .kpis { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .kpi { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; min-width: 96px; }
+  .kpi .n { font-size: 22px; font-weight: 600; line-height: 1.15; }
+  .kpi .l { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .kpi.warn .n { color: var(--warn); }
+  .kpi.err .n { color: var(--err); }
+  .kpi.ok .n { color: var(--ok); }
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; }
+  .chartcard { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .chartcard h3 { margin: 0 0 10px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  .chartcard .muted { text-transform: none; letter-spacing: 0; }
+  svg.chart { width: 100%; height: auto; display: block; overflow: visible; }
+  svg.chart text.lbl { fill: var(--muted); font-size: 11px; }
+  svg.chart text.val { fill: var(--text); font-size: 11px; }
+  .chart-empty { color: var(--muted); font-size: 12px; padding: 8px 0; }
+  .donut-wrap { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
+  svg.chart.donut { width: 172px; height: 172px; flex: 0 0 auto; }
+  svg.chart text.dnum { fill: var(--text); font-size: 20px; font-weight: 600; }
+  svg.chart text.dlbl { fill: var(--muted); font-size: 11px; }
+  .legend { display: flex; flex-direction: column; gap: 4px; font-size: 12px; min-width: 0; }
+  .legend .lg { display: flex; align-items: center; gap: 6px; color: var(--text); }
+  .legend .sw { width: 10px; height: 10px; border-radius: 2px; flex: 0 0 auto; }
+  .legend .muted { color: var(--muted); }
   /* confirmation modal (replaces the native confirm()) */
   .modal-overlay {
     position: fixed; inset: 0; background: rgba(4, 8, 12, .72);
@@ -175,6 +200,7 @@
     <!-- Page tabs -->
     <div class="tabs" id="tabs">
       <button class="tab active" data-page="feed">Feed</button>
+      <button class="tab" data-page="graph">Intel graph</button>
       <button class="tab" data-page="sources">Community sources</button>
       <button class="tab" data-page="import">Import CSV / Excel</button>
     </div>
@@ -284,7 +310,7 @@
       </div>
       <table id="pullerTable" style="display:none">
         <thead>
-          <tr><th>Source</th><th>Kind</th><th>Enabled</th><th>Running</th><th>Last sync</th><th>Last added</th><th>Status</th><th></th></tr>
+          <tr><th>Source</th><th>Kind</th><th>Enabled</th><th>Running</th><th>Last sync</th><th>Last added</th><th>Status</th><th>Pull</th></tr>
         </thead>
         <tbody id="pullerBody"></tbody>
       </table>
@@ -323,6 +349,61 @@
         <button id="btnCsvSample" class="ghost" title="Download a ready-to-edit template with all header styles">Download sample CSV</button>
       </div>
       <div id="csvMsg" class="msg" style="margin-top:10px"></div>
+    </div>
+
+    </section>
+
+    <!-- ============ PAGE: INTEL GRAPH ============ -->
+    <section data-page="graph">
+
+    <div class="panel">
+      <h2>Intel graph</h2>
+      <div class="hint" style="margin:0 0 10px">
+        Aggregated view of the fed intel — <b>Community</b> is everything pulled from
+        external sources (OTX / TAXII pullers), <b>Manual</b> is hand-fed intel,
+        <b>All</b> is both. Counts are per collection.
+      </div>
+      <div class="row" style="margin-bottom:14px">
+        <label>Scope
+          <select id="graphScope">
+            <option value="community" selected>Community</option>
+            <option value="manual">Manual</option>
+            <option value="all">All</option>
+          </select>
+        </label>
+        <button id="btnGraphRefresh" class="ghost">Refresh</button>
+        <span class="currange mono" id="graphMeta"></span>
+      </div>
+
+      <div class="kpis" id="graphKpis"></div>
+
+      <div class="charts">
+        <div class="chartcard">
+          <h3>Intel by category <span class="muted">(type)</span></h3>
+          <div id="chartCategories"></div>
+        </div>
+        <div class="chartcard">
+          <h3>By source</h3>
+          <div id="chartSources"></div>
+        </div>
+        <div class="chartcard">
+          <h3>Confidence distribution <span class="muted">(share of objects)</span></h3>
+          <div id="chartConfidence"></div>
+        </div>
+        <div class="chartcard">
+          <h3>Pulled over time <span class="muted">(share by day)</span></h3>
+          <div id="chartTimeline"></div>
+        </div>
+        <div class="chartcard">
+          <h3>Withheld by filter <span class="muted">(share)</span></h3>
+          <div id="chartWithheld"></div>
+        </div>
+        <div class="chartcard">
+          <h3>Top labels <span class="muted">(share of occurrences)</span></h3>
+          <div id="chartLabels"></div>
+        </div>
+      </div>
+      <div class="hint" id="graphEmpty" style="display:none">No objects in this scope.</div>
     </div>
 
     </section>
@@ -478,8 +559,8 @@ function showDashboard(user) {
   showPage(currentPageFromHash());
 }
 
-// --- Dashboard page tabs (Feed / Community sources / Import CSV / Excel) ---
-const PAGE_NAMES = ["feed", "sources", "import"];
+// --- Dashboard page tabs (Feed / Intel graph / Community sources / Import) ---
+const PAGE_NAMES = ["feed", "graph", "sources", "import"];
 function currentPageFromHash() {
   const h = (location.hash || "").replace(/^#/, "");
   return PAGE_NAMES.includes(h) ? h : "feed";
@@ -495,6 +576,7 @@ function showPage(name) {
   if (location.hash !== "#" + name && window.history && history.replaceState) {
     history.replaceState(null, "", "#" + name);
   }
+  if (name === "graph") loadStats();  // aggregated view: fetch on entry
 }
 function onTabClick(e) {
   const name = e.currentTarget.dataset.page;
@@ -1161,12 +1243,16 @@ function pullerRow(p) {
   status.textContent = p.last_message || (p.last_status || "");
 
   const act = document.createElement("td");
+  const lim = document.createElement("input");
+  lim.type = "number"; lim.min = "1"; lim.step = "1"; lim.className = "limitbox";
+  lim.placeholder = p.limit ? String(p.limit) : "limit";
+  lim.title = "Max objects to ingest this pull (blank = the puller's configured cap)";
   const btn = document.createElement("button");
   btn.className = "ghost"; btn.textContent = "Pull now"; btn.style.whiteSpace = "nowrap";
   const result = document.createElement("div");
   result.className = "puller-result";
-  btn.addEventListener("click", () => pullNow(p.name, btn, result));
-  act.append(btn, result);
+  btn.addEventListener("click", () => pullNow(p.id || p.name, btn, result, lim));
+  act.append(lim, btn, result);
 
   tr.append(name, kind, en, run, sync, added, status, act);
   return tr;
@@ -1201,11 +1287,23 @@ function renderPullers() {
 }
 function setPullerPage(p) { pullerPage = p; renderPullers(); }
 
-async function pullNow(name, btn, result) {
+async function pullNow(id, btn, result, limitInput) {
+  const raw = limitInput ? limitInput.value.trim() : "";
+  let limit = null;
+  if (raw !== "") {
+    limit = Number(raw);
+    if (!Number.isInteger(limit) || limit <= 0) {
+      result.textContent = "limit must be a positive whole number";
+      return;
+    }
+  }
   btn.disabled = true;
-  result.textContent = "Pulling…";
+  result.textContent = limit ? `Pulling (max ${limit})…` : "Pulling…";
   try {
-    const r = await api("/community/pull/" + encodeURIComponent(name), { method: "POST" });
+    const r = await api("/community/pull/" + encodeURIComponent(id), {
+      method: "POST",
+      body: JSON.stringify(limit ? { limit } : {}),
+    });
     if (r.status === 200) {
       result.textContent = r.body.error ? `done: ${r.body.error}` : `done: +${r.body.added} object(s)`;
       await Promise.all([loadFeed(), loadPullers()]);
@@ -1216,6 +1314,122 @@ async function pullNow(name, btn, result) {
     result.textContent = "failed: " + e.message;
   } finally {
     btn.disabled = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Intel graph (aggregated dashboards)
+// ---------------------------------------------------------------------------
+
+// Palettes for the donuts: unordered categories use a small categorical set;
+// ordered buckets (confidence, time) use a single-hue sequential ramp. Every
+// slice is always paired with a labelled legend entry (count + %).
+const GRAPH_PALETTE = ["#60a5fa", "#f59e0b", "#34d399", "#a78bfa"];
+const SEQ_RAMP = ["#3b82f6", "#60a5fa", "#93c5fd", "#bfdbfe", "#e0f2fe"];
+let graphScope = "community";
+
+const fmtN = (n) => Number(n || 0).toLocaleString();
+function xmlEsc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// Keep a donut readable: at most `max` slices — the biggest ones, with the
+// remainder aggregated into a final "other" slice.
+function capForDonut(rows, max, otherLabel = "other") {
+  if (rows.length <= max) return rows;
+  const head = rows.slice(0, max - 1);
+  const tail = rows.slice(max - 1).reduce((s, r) => s + r.value, 0);
+  return tail > 0 ? head.concat([{ label: otherLabel, value: tail }]) : head;
+}
+
+// Donut (pie-family) for a part-to-whole view: slices + direct legend.
+function donutChart(el, rows, { colors = GRAPH_PALETTE } = {}) {
+  const total = rows.reduce((s, r) => s + r.value, 0);
+  if (!total) { el.innerHTML = '<div class="chart-empty">no data</div>'; return; }
+  const size = 172, R = 66, W = 24, cx = size / 2, cy = size / 2;
+  const C = 2 * Math.PI * R;
+  let off = 0, arcs = "";
+  rows.forEach((r, i) => {
+    const len = (r.value / total) * C;
+    arcs += `<circle cx="${cx}" cy="${cy}" r="${R}" fill="none"`
+      + ` stroke="${colors[i % colors.length]}" stroke-width="${W}"`
+      + ` stroke-dasharray="${len.toFixed(2)} ${(C - len).toFixed(2)}"`
+      + ` stroke-dashoffset="${(-off).toFixed(2)}"></circle>`;
+    off += len;
+  });
+  const legend = rows.map((r, i) => {
+    const pct = (100 * r.value / total).toFixed(1);
+    return `<div class="lg"><span class="sw" style="background:${colors[i % colors.length]}"></span>`
+      + `${xmlEsc(r.label)} <span class="muted">${fmtN(r.value)} · ${pct}%</span></div>`;
+  }).join("");
+  el.innerHTML = `<div class="donut-wrap">`
+    + `<svg class="chart donut" viewBox="0 0 ${size} ${size}" role="img">`
+    + `<g transform="rotate(-90 ${cx} ${cy})">${arcs}</g>`
+    + `<text class="dnum" x="${cx}" y="${cy - 2}" text-anchor="middle">${fmtN(total)}</text>`
+    + `<text class="dlbl" x="${cx}" y="${cy + 15}" text-anchor="middle">labels</text>`
+    + `</svg><div class="legend">${legend}</div></div>`;
+}
+
+function renderKpis(d) {
+  const tiles = [
+    { n: d.total, l: d.scope + " objects" },
+    { n: d.served, l: "served to Vision One", cls: "ok" },
+    { n: d.withheld, l: "withheld by filter", cls: d.withheld ? "warn" : "" },
+    { n: d.revoked, l: "revoked", cls: d.revoked ? "err" : "" },
+    { n: d.sources, l: d.sources === 1 ? "source" : "sources" },
+    { n: d.confidence.avg, l: "avg confidence" },
+  ];
+  $("graphKpis").innerHTML = tiles.map(t =>
+    `<div class="kpi ${t.cls || ""}"><div class="n">${fmtN(t.n)}</div>`
+    + `<div class="l">${xmlEsc(t.l)}</div></div>`).join("");
+}
+
+async function loadStats() {
+  const q = new URLSearchParams({ scope: graphScope });
+  if (currentCollection) q.set("collection", currentCollection);
+  const meta = $("graphMeta");
+  try {
+    const r = await api("/ui/stats?" + q.toString());
+    if (r.status !== 200) {
+      meta.textContent = `load failed (HTTP ${r.status})`;
+      return;
+    }
+    const d = r.body;
+    renderKpis(d);
+    meta.textContent = `${fmtN(d.total)} objects · collection ${d.collection} · `
+      + `updated ${(d.generated || "").replace("T", " ").replace("Z", "")}`;
+    $("graphEmpty").style.display = d.total ? "none" : "block";
+    // Every dashboard is a donut (share of the current scope). Unordered
+    // categories use the categorical palette; ordered buckets (confidence,
+    // time) use the sequential ramp. Slices are capped so a donut stays legible.
+    donutChart($("chartCategories"),
+      capForDonut(d.categories.map(c => ({ label: c.type, value: c.count })), 8));
+    donutChart($("chartSources"),
+      capForDonut(d.by_source.map(c => ({ label: c.source, value: c.count })), 8));
+    donutChart($("chartConfidence"),
+      d.confidence.histogram.filter(h => h.count > 0)
+        .map(h => ({ label: h.bucket, value: h.count })),
+      { colors: SEQ_RAMP });
+    let tl = d.timeline.map(p => ({ label: p.date.slice(5), value: p.count }));
+    if (tl.length > 8) {          // keep the most recent days + an "earlier" slice
+      const earlier = tl.slice(0, tl.length - 7).reduce((s, r) => s + r.value, 0);
+      tl = [{ label: "earlier", value: earlier }].concat(tl.slice(-7));
+    }
+    if (tl.length) donutChart($("chartTimeline"), tl, { colors: SEQ_RAMP });
+    else $("chartTimeline").innerHTML = '<div class="chart-empty">no data</div>';
+    const wr = d.withheld_reasons.map(x => ({ label: x.label, value: x.count }));
+    if (wr.length) donutChart($("chartWithheld"), capForDonut(wr, 6));
+    else $("chartWithheld").innerHTML = '<div class="chart-empty">nothing withheld</div>';
+    // Top labels: top 5 + an accurate "other" (labels overlap — an object
+    // carries several — so this is a share of label occurrences).
+    const top = d.top_labels.slice(0, 5).map(x => ({ label: x.label, value: x.count }));
+    const shown = top.reduce((s, r) => s + r.value, 0);
+    const other = (d.labels_total || shown) - shown;
+    if (other > 0) top.push({ label: "other", value: other });
+    donutChart($("chartLabels"), top);
+  } catch (e) {
+    meta.textContent = "load failed: " + e.message;
   }
 }
 
@@ -1281,7 +1495,15 @@ $("collectionSel").addEventListener("change", () => {
   feedData = [];
   newRows = [];
   loadFeed();
+  if (currentPageFromHash() === "graph") loadStats();
 });
+
+// Intel graph: scope switch + manual refresh.
+$("graphScope").addEventListener("change", () => {
+  graphScope = $("graphScope").value;
+  loadStats();
+});
+$("btnGraphRefresh").addEventListener("click", loadStats);
 
 // Dashboard page tabs (Feed / Community sources / Import CSV) + deep links.
 document.querySelectorAll("#tabs .tab").forEach(b => b.addEventListener("click", onTabClick));
