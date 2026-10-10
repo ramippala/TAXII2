@@ -242,29 +242,33 @@ Use the top tabs to switch between **Feed**, **Community sources**, and
    type the value. IDs and hash algorithms (MD5/SHA-1/SHA-256) are
    auto-derived, and values are validated. New rows are added on the last page
    (and that page is shown) so they're never off-screen.
-3. **Save feed (replace)** — publishes the checked rows (the full set,
-   regardless of the current filter/page). Because manual ingest is *replace*
-   scoped to `source='manual'`, it only affects your manual intel — community
-   (pulled) intel is untouched. Uncheck rows you want to drop; the view resets
-   to the full list after a save.
-4. **Purge all** — wipes the feed with a confirmation.
-5. **Withheld by filter** — a panel listing every community object the
+3. **Save changes** — a true **save** (merge): keeps everything already in the
+   feed and only **adds new rows + applies your edits** (value, type, labels,
+   confidence). It never wipes, and checkboxes do **not** affect what is saved
+   (they only drive *Purge unchecked*). Empty/invalid rows are skipped with a
+   warning instead of being written or blocking the rest.
+4. **Purge unchecked** — deletes the entries that are **unchecked** (across
+   the whole feed, not just the visible page). Uncheck a few rows, click it,
+   and only those are dropped. The per-row **×** deletes a single entry.
+5. **Purge all** — wipes the **entire** feed in one click (all sources, with
+   a confirmation).
+6. **Withheld by filter** — a panel listing every community object the
    [intel filter](#intel-filter-filtering-between-server-and-vision-one) is
    keeping out of Vision One, with the exact **reason** (Private / reserved
    IP, Stale, Low confidence, or Blocklisted). These objects are still stored
    — nothing is deleted; loosening the matching rule in `config.yaml`
    (`intel_filter:`) and restarting releases them.
-6. **Community sources** — a table of the OTX puller plus each
+7. **Community sources** — a table of the OTX puller plus each
    `taxii_pullers:` entry (kind, enabled/running, last sync, last added,
    status) with a **Pull now** button. "Pull now" runs one fetch on demand
    (it works even while a puller is `enabled: false`, for a one-shot fetch),
    then refreshes the feed table. See
    [Community Sources](#community-sources-pulling-from-otx-or-any-taxii-21-server).
-7. **Import CSV (GT team)** — upload a `.csv` with any headers (fuzzy-mapped
+8. **Import CSV (GT team)** — upload a `.csv` with any headers (fuzzy-mapped
    to IPv4 / domain / file hash / indicator); appends to the manual feed. See
    [CSV import](#3-csv-import-gt-team-ad-hoc-intel).
 
-> Items **6 (Community sources)** and **7 (Import CSV)** live on their own
+> Items **7 (Community sources)** and **8 (Import CSV)** live on their own
 > tabs, not the Feed tab. The **Community sources** tab has the same
 > client-side **search** (name / kind / collection) and **pagination** as the
 > feed table, so a long list of pullers stays navigable.
@@ -369,11 +373,19 @@ curl http://localhost:5000/feed \
 
 ### POST /feed/ingest
 
-Accepts STIX 2.1 JSON objects and replaces the in-memory feed.
+Accepts STIX 2.1 JSON objects into the feed. The `mode` field selects the
+write semantics:
+
+- **`"replace"`** (default, legacy) — wipes and rebuilds the *manual* feed
+  from the list (community-sourced rows are untouched).
+- **`"merge"`** — upsert by STIX id: edits/labels/confidence are refreshed,
+  new ids are added, **everything else is preserved**. This is what the web
+  UI **Save changes** button sends.
 
 **Request Body:**
 ```json
 {
+  "mode": "merge",
   "stix_objects": [
     {
       "id": "ipv4-addr--123",
@@ -409,9 +421,28 @@ Accepts STIX 2.1 JSON objects and replaces the in-memory feed.
 ```json
 {
   "message": "Data ingested successfully",
+  "mode": "merge",
   "objects_count": 3
 }
 ```
+
+### POST /feed/delete
+
+Deletes the given STIX ids from the feed (**any source**). This is what the
+web UI **Purge unchecked** button sends (the ids of the unchecked rows).
+Per-row removal is the × button; the full-feed wipe is `DELETE /feed/purge`.
+
+**Request Body:**
+```json
+{ "ids": ["ipv4-addr--192-168-1-100", "domain-name--789"] }
+```
+
+**Response:**
+```json
+{ "deleted": 2, "ids": ["ipv4-addr--192-168-1-100", "domain-name--789"] }
+```
+
+`400` if `ids` is missing/empty; `401` without credentials.
 
 ### DELETE /feed/purge
 
@@ -617,10 +648,13 @@ own (see Step 3). They are optional helpers (all off by default):
   endpoint to confirm it stays reachable. (Previously misnamed `vision_one`;
   that name has been dropped, but old `vision_one:` configs still work.)
 
-> **Note on ingest modes.** `POST /feed/ingest` (web UI / manual) uses
-> *replace* mode scoped to `source='manual'`. The OTX and TAXII pullers use
-> *merge* mode (upsert by STIX id, append-only). This keeps your hand-fed
-> intel and pulled community intel independent of each other.
+> **Note on ingest modes.** `POST /feed/ingest` takes an optional `mode`:
+> *replace* (default — wipes and rebuilds the `source='manual'` feed) or
+> *merge* (upsert by STIX id, append-only). The web UI **Save changes**
+> button uses *merge*, so a save never wipes anything (manual **or**
+> community intel); dropping entries is an explicit action (*Purge unchecked*
+> / × / *Purge all*). The OTX and TAXII pullers also use *merge* mode. This
+> keeps hand-fed intel and pulled community intel independent of each other.
 
 ## Indicator Lifecycle (TTL & revocation)
 

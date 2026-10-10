@@ -1821,7 +1821,14 @@ def web_ui():
 
 @app.route('/feed/ingest', methods=['POST'])
 def ingest_data():
-    """POST /feed/ingest — accept STIX 2.1 JSON objects, replace the feed."""
+    """POST /feed/ingest — accept STIX 2.1 JSON objects into the feed.
+
+    Optional JSON body field ``mode``:
+      * ``'replace'`` (default, legacy) — wipe and rebuild the *manual* feed.
+      * ``'merge'`` — upsert by STIX id: edits/labels/confidence are
+        refreshed, new ids are added, everything else (including other
+        sources) is preserved. This is what the web UI "Save changes" uses.
+    """
     if not _request_allowed():
         return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json(silent=True)
@@ -1832,13 +1839,57 @@ def ingest_data():
     if not isinstance(stix_objects, list):
         return jsonify({'error': 'stix_objects must be a list'}), 400
 
+    mode = str(data.get('mode') or 'replace')
+    if mode not in ('replace', 'merge'):
+        return jsonify({'error': "mode must be 'replace' or 'merge'"}), 400
+
     try:
-        count = ingest_objects(stix_objects)
+        count = ingest_objects(stix_objects, mode=mode)
     except Exception as exc:
         logger.error("Ingest error: %s", exc)
         return jsonify({'error': str(exc)}), 500
 
-    return jsonify({'message': 'Data ingested successfully', 'objects_count': count}), 200
+    return jsonify({
+        'message': 'Data ingested successfully',
+        'mode': mode,
+        'objects_count': count,
+    }), 200
+
+
+@app.route('/feed/delete', methods=['POST'])
+def delete_objects_data():
+    """POST /feed/delete — delete the given STIX ids from the feed (any source).
+
+    Body: {"ids": ["ipv4-addr--...", ...]}. Used by the web UI's
+    "Purge unchecked" (drop the rows the user unchecked) — per-row and
+    full-feed removal are the × button and DELETE /feed/purge.
+    """
+    if not _request_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+    ids = data.get('ids')
+    if not isinstance(ids, list) or not ids:
+        return jsonify({'error': "ids: non-empty list of STIX ids required"}), 400
+
+    id_set = {str(i) for i in ids if i}
+    session = create_session()
+    try:
+        with memory_lock:
+            rows = session.query(STIXObject).filter(STIXObject.stix_id.in_(id_set)).all()
+            deleted = [r.stix_id for r in rows]
+            for r in rows:
+                session.delete(r)
+            for s in [s for s in memory_store if s in id_set]:
+                memory_store.pop(s, None)
+            session.commit()
+    except Exception as exc:
+        session.rollback()
+        logger.error("Delete error: %s", exc)
+        return jsonify({'error': str(exc)}), 500
+    finally:
+        session.close()
+    logger.info("Deleted %d object(s) via /feed/delete", len(deleted))
+    return jsonify({'deleted': len(deleted), 'ids': deleted}), 200
 
 
 @app.route('/feed/purge', methods=['DELETE'])

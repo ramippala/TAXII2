@@ -1384,6 +1384,97 @@ class TestDotenv(unittest.TestCase):
         self.assertFalse(default.startswith(self.tmp.name))
 
 
+class TestSaveAndDelete(unittest.TestCase):
+    """Web-UI save semantics (mode=merge) + POST /feed/delete (purge option)."""
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        app.config['TAXII_AUTH'] = {
+            'username': 'test_taxii_user', 'password': 'test_taxii_pass',
+        }
+        self.auth = {
+            'X-Taxii-Username': 'test_taxii_user',
+            'X-Taxii-Password': 'test_taxii_pass',
+        }
+
+    def _seed(self):
+        # 10 manual IPs + 1 OTX IP (community source, must survive saves).
+        manual = [_manual_obj(f"203.0.113.{i}") for i in range(1, 11)]
+        self._ingest(manual)
+        # Simulate the puller's write path (tags source='otx', merge mode).
+        ingest_objects([_otx_obj("8.8.8.8")], mode='merge', source='otx')
+
+    def _ingest(self, stix_objects, mode=None):
+        payload = {'stix_objects': stix_objects}
+        if mode:
+            payload['mode'] = mode
+        return self.client.post('/feed/ingest', json=payload, headers=self.auth)
+
+    def _ids(self):
+        r = self.client.get('/objects', headers=self.auth)
+        self.assertEqual(r.status_code, 200)
+        return {o['id']: o for o in r.get_json()['objects']}
+
+    def test_ingest_mode_merge_preserves_everything(self):
+        self._seed()
+        ids = self._ids()
+        self.assertEqual(len(ids), 11)
+        self.assertEqual(ids['ipv4-addr--8-8-8-8']['source'], 'otx')
+
+        # UI save: merge with 5 (edited) manual rows + 1 brand-new row.
+        save = [_manual_obj(f"203.0.113.{i}") for i in range(1, 6)]
+        save.append(_manual_obj("203.0.113.99"))  # new
+        r = self._ingest(save, mode='merge')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()['mode'], 'merge')
+
+        ids = self._ids()
+        # The 5 other manual rows + the OTX row survived (not wiped).
+        for i in range(6, 11):
+            self.assertIn(f"ipv4-addr--203-0-113-{i}", ids)
+        self.assertIn('ipv4-addr--8-8-8-8', ids)
+        self.assertEqual(ids['ipv4-addr--8-8-8-8']['source'], 'otx')
+        # New row merged in; total = 10 manual + 1 new + 1 otx.
+        self.assertIn('ipv4-addr--203-0-113-99', ids)
+        self.assertEqual(len(ids), 12)
+
+    def test_ingest_default_is_replace(self):
+        self._seed()
+        self._ingest([_manual_obj("203.0.113.1")])  # legacy replace
+        ids = self._ids()
+        # Other manual rows wiped; otx row survives.
+        self.assertNotIn('ipv4-addr--203-0-113-2', ids)
+        self.assertIn('ipv4-addr--203-0-113-1', ids)
+        self.assertIn('ipv4-addr--8-8-8-8', ids)
+
+    def test_ingest_bad_mode_400(self):
+        r = self._ingest([_manual_obj()], mode='bogus')
+        self.assertEqual(r.status_code, 400)
+
+    def test_delete_ids(self):
+        self._seed()
+        r = self.client.post('/feed/delete',
+                             json={'ids': ['ipv4-addr--203-0-113-1', 'ipv4-addr--8-8-8-8']},
+                             headers=self.auth)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()['deleted'], 2)
+        ids = self._ids()
+        self.assertNotIn('ipv4-addr--203-0-113-1', ids)
+        self.assertNotIn('ipv4-addr--8-8-8-8', ids)  # any-source delete
+        self.assertIn('ipv4-addr--203-0-113-2', ids)
+
+    def test_delete_empty_ids_400(self):
+        r = self.client.post('/feed/delete', json={'ids': []}, headers=self.auth)
+        self.assertEqual(r.status_code, 400)
+        r = self.client.post('/feed/delete', json={}, headers=self.auth)
+        self.assertEqual(r.status_code, 400)
+
+    def test_delete_unauth_401(self):
+        r = self.client.post('/feed/delete', json={'ids': ['x']})
+        self.assertEqual(r.status_code, 401)
+
+
 class _FakeJwkClient:
     """Stand-in for jwt.PyJWKClient: returns the local public key for any token."""
 

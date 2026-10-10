@@ -218,15 +218,21 @@
       </table>
     </div>
 
-    <!-- Save -->
+    <!-- Save / Purge -->
     <div class="panel">
       <h2>Publish</h2>
       <div class="row">
-        <button id="btnSave">Save feed (replace)</button>
+        <button id="btnSave">Save changes</button>
+        <button id="btnPurgeUnchecked" class="ghost" title="Delete the rows that are unchecked (across the whole feed, not just this page/filter)">Purge unchecked</button>
         <button id="btnPurge" class="danger">Purge all</button>
       </div>
-      <div class="hint">Saving replaces the entire <b>manual</b> feed with the checked entries above
-        (community intel from pullers is never wiped by a save). This is how the server's feed model works.</div>
+      <div class="hint">
+        <b>Save changes</b> never wipes the feed — it keeps every entry and only
+        <b>adds new rows + applies your edits</b> (value, type, labels, confidence).
+        To drop specific entries, uncheck them and hit <b>Purge unchecked</b> (per row) or
+        use the × on a row; <b>Purge all</b> wipes the entire feed in one click
+        (community intel from pullers included).
+      </div>
       <div id="msg" class="msg"></div>
     </div>
 
@@ -791,31 +797,67 @@ function addRow() {
 }
 
 async function save() {
-  // Read from the model (the full set), never a filtered/paged DOM slice,
-  // so saving can never silently drop rows hidden by the current filter/page.
-  const rows = feedData.filter(o => o.checked)
-    .concat(newRows.filter(o => o.checked))
-    .map(o => ({ id: o.id, type: o.type, value: o.value, labels: o.labels || [], confidence: o.confidence ?? 0, name: o.name || null }));
-  for (const r of rows) {
-    if (r.type === "indicator") continue; // patterns are free-form
-    const err = validateValue(r.type, r.value);
-    if (err) { showMsg(`Invalid entry: ${r.type} "${r.value}" — ${err}`, false); return; }
+  // SAVE = a real save: merge the WHOLE current model (every existing row +
+  // every new row) into the feed. It never wipes anything. Checkboxes do NOT
+  // affect saving — they only drive "Purge unchecked". Invalid / empty rows
+  // are skipped (and reported) rather than written or blocking the rest, so a
+  // half-typed scratch row can't stop a save or get written as garbage.
+  const all = feedData.concat(newRows).map(o => ({
+    id: o.id, type: o.type, value: o.value,
+    labels: o.labels || [], confidence: o.confidence ?? 0, name: o.name || null,
+    isNew: !!o._key && String(o._key).startsWith("new-"),
+  }));
+
+  const good = [], skipped = [];
+  for (const r of all) {
+    if (!r.value) { skipped.push(`empty value (${r.type})`); continue; }
+    if (r.type !== "indicator") {
+      const err = validateValue(r.type, r.value);
+      if (err) { skipped.push(`${r.value} — ${err}`); continue; }
+    }
+    good.push(r);
   }
-  const stix_objects = rows.map(r => {
+  if (!good.length) {
+    showMsg(`Nothing to save — all ${skipped.length} row(s) are empty or invalid: ${skipped.join("; ")}`, false);
+    return;
+  }
+  const stix_objects = good.map(r => {
     const obj = { id: r.id, type: r.type, object: buildObject(r.type, r.value), labels: r.labels, confidence: r.confidence };
     if (r.type === "indicator" && r.name) obj.name = r.name;
     return obj;
   });
   try {
-    const r = await api("/feed/ingest", { method: "POST", body: JSON.stringify({ stix_objects }) });
+    const r = await api("/feed/ingest", { method: "POST", body: JSON.stringify({ stix_objects, mode: "merge" }) });
     if (r.status === 200) {
-      showMsg(`Feed updated: ${r.body.objects_count} object(s) stored.`, true);
+      let text = `Saved ${good.length} object(s) (merge — nothing wiped)`;
+      const nNew = good.filter(r => r.isNew).length;
+      if (nNew) text += `, including ${nNew} new`;
+      if (skipped.length) text += `. Skipped ${skipped.length}: ${skipped.join("; ")}`;
+      showMsg(text + ".", skipped.length ? false : true);
       await loadFeed();
     } else {
       showMsg(`Save failed (HTTP ${r.status}): ${r.body && r.body.error || "unknown error"}`, false);
     }
   } catch (e) {
     showMsg("Save failed: " + e.message, false);
+  }
+}
+
+async function purgeUnchecked() {
+  // Explicit removal: delete every row that is UNCHECKED (all pages/filters).
+  const unchecked = feedData.filter(o => !o.checked).map(o => o.id);
+  if (!unchecked.length) { showMsg("Nothing to purge — every row is checked.", false); return; }
+  if (!confirm(`Purge ${unchecked.length} unchecked entr${unchecked.length === 1 ? "y" : "ies"} from the feed (all pages)?`)) return;
+  try {
+    const r = await api("/feed/delete", { method: "POST", body: JSON.stringify({ ids: unchecked }) });
+    if (r.status === 200) {
+      showMsg(`Purged ${r.body.deleted} entr${r.body.deleted === 1 ? "y" : "ies"}.`, true);
+      await loadFeed();
+    } else {
+      showMsg(`Purge failed (HTTP ${r.status}): ${r.body && r.body.error || "unknown error"}`, false);
+    }
+  } catch (e) {
+    showMsg("Purge failed: " + e.message, false);
   }
 }
 
@@ -1028,6 +1070,7 @@ $("btnLogout").addEventListener("click", doLogout);
 $("btnLoad").addEventListener("click", loadFeed);
 $("btnAdd").addEventListener("click", addRow);
 $("btnSave").addEventListener("click", save);
+$("btnPurgeUnchecked").addEventListener("click", purgeUnchecked);
 $("btnPurge").addEventListener("click", purge);
 
 // Dashboard page tabs (Feed / Community sources / Import CSV) + deep links.
