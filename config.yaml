@@ -3,7 +3,10 @@ server:
   host: '0.0.0.0'
   port: 5000
   debug: false
-  cors_origins: ['*']
+  # Browser origins allowed to read the API cross-origin. The dashboard is
+  # same-origin so it needs nothing here; '*' reflects ANY origin (fine for
+  # local dev, not for an internet-facing feed). Pin your real origin(s).
+  cors_origins: ['https://taxii.ramippala.com']
 
 database:
   # --- Development default: in-process SQLite (zero setup, single writer).
@@ -37,6 +40,12 @@ security:
   # Set FLASK_SECRET in the .env file (see .env.example) — required.
   # No fallback default: an empty secret means unsignable session cookies.
   secret_key: ${FLASK_SECRET}
+  # Upload / response guards (all optional, defaults shown):
+  max_upload_bytes: 26214400   # 25 MB cap on /feed/import-csv bodies (413 past it)
+  max_import_rows: 50000       # rows parsed per CSV/XLSX upload
+  max_objects_json: 50000      # hard cap on rows /objects returns in one response
+  auth_fail_limit: 10          # failed auths per client IP before 429
+  auth_fail_window: 300        # ...measured over this many seconds
 
 logging:
   level: INFO
@@ -65,9 +74,20 @@ taxii:
   collection_title: 'Custom Threat Intelligence Feed'
   # TAXII client credentials (HTTP Basic) — enter these in Vision One.
   # Values live in .env (see .env.example); no default here on purpose.
+  # READ-ONLY: a TAXII principal can only LIST and READ collections. Every
+  # write (ingest, purge, delete, revoke, community pull) needs the dashboard
+  # session, the UI credentials, or the optional admin principal below.
   auth:
     username: '${TAXII_AUTH_USER}'
     password: '${TAXII_AUTH_PASSWORD}'
+
+  # Optional third principal: a script/automation credential allowed to do
+  # feed-wide writes without reusing the dashboard login. Unset by default —
+  # only the dashboard session and the UI credentials can write feed-wide.
+  # Values live in .env (see .env.example).
+  # admin_auth:
+  #   username: '${TAXII_ADMIN_USER:-}'
+  #   password: '${TAXII_ADMIN_PASSWORD:-}'
 
   # === MULTI-COLLECTION / per-client RBAC (optional) ===
   # Serve MORE than one consumer with SEPARATE credentials. When the

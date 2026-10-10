@@ -162,7 +162,7 @@
 </head>
 <body>
   <h1>TAXII Feed Manager</h1>
-  <div class="sub">Feed STIX 2.1 threat intel, pull from community TAXII sources, and gate what reaches Vision One</div>
+  <div class="sub">Feed STIX 2.1 threat intel, pull from community TAXII sources</div>
 
   <!-- ============ LOGIN (shown when not authenticated) ============ -->
   <div id="loginPanel" class="login-wrap" style="display:none">
@@ -673,6 +673,8 @@ function rowElement(o) {
       gate.title = o.gate_reason_label || "";
     } else {
       gate.className = "gate served"; gate.textContent = "served";
+      gate.title = "Passes the intel filter — served in the feed (Vision One "
+        + "receives it when it polls)";
     }
     cType.appendChild(gate);
   }
@@ -720,7 +722,7 @@ function rowElement(o) {
     btn.className = "revbtn";
     btn.textContent = o.revoked ? "Unrevoke" : "Revoke";
     btn.title = o.revoked
-      ? "Reinstate (served to Vision One again)"
+      ? "Reinstate (mark active again)"
       : "Mark as false-positive / clean (served as revoked: true)";
     btn.addEventListener("click", () => toggleRevoke(tr, o.id, !o.revoked, st, btn));
     cStatus.append(st, " ", btn);
@@ -777,7 +779,7 @@ async function toggleRevoke(tr, id, toRevoked, badge, btn) {
       } else {
         badge.className = "rev active"; badge.textContent = "active";
         badge.title = ""; btn.textContent = "Revoke";
-        showMsg(`Reinstated ${id} — served to Vision One again.`, true);
+        showMsg(`Reinstated ${id} — marked active again.`, true);
       }
       tr.dataset.revoked = toRevoked ? "1" : "";
       // Reflect in the model so the Status filter + counts update at once.
@@ -969,8 +971,9 @@ async function loadFeed(opts) {
     if (opts.silent) return; // a caller is about to set its own status message
     const wh = r.body.withheld_count || 0;
     showMsg(
-      `Loaded ${r.body.count} object(s): ${r.body.served_count} served to Vision One, ` +
-      `${wh} withheld by the filter. Select entries (checkbox) to purge them.`, true);
+      `Loaded ${r.body.count} object(s): ${r.body.served_count} pass the intel filter ` +
+      `(Vision One fetches these on its next poll), ${wh} withheld. ` +
+      `Select entries (checkbox) to purge them.`, true);
   } catch (e) {
     showMsg("Load failed: " + e.message, false);
   }
@@ -1214,7 +1217,8 @@ function pullerRow(p) {
   const tr = document.createElement("tr");
 
   const name = document.createElement("td");
-  name.innerHTML = `<b>${p.name}</b>` + (p.collection ? `<div class="reason">collection: ${p.collection}</div>` : "");
+  name.innerHTML = `<b>${xmlEsc(p.name)}</b>`
+    + (p.collection ? `<div class="reason">collection: ${xmlEsc(p.collection)}</div>` : "");
 
   const kind = document.createElement("td");
   kind.textContent = p.kind || "";
@@ -1374,7 +1378,7 @@ function donutChart(el, rows, { colors = GRAPH_PALETTE } = {}) {
 function renderKpis(d) {
   const tiles = [
     { n: d.total, l: d.scope + " objects" },
-    { n: d.served, l: "served to Vision One", cls: "ok" },
+    { n: d.served, l: "pass the intel filter", cls: "ok" },
     { n: d.withheld, l: "withheld by filter", cls: d.withheld ? "warn" : "" },
     { n: d.revoked, l: "revoked", cls: d.revoked ? "err" : "" },
     { n: d.sources, l: d.sources === 1 ? "source" : "sources" },

@@ -17,6 +17,8 @@ Architecture:
 import base64
 import csv
 import hashlib
+import hmac
+import html
 import io
 import ipaddress
 import json
@@ -619,6 +621,150 @@ CORS(app, origins=_cors_origins)
 
 
 # ---------------------------------------------------------------------------
+# Security hardening: response headers, upload cap, auth-failure throttling
+# ---------------------------------------------------------------------------
+
+_SEC_CFG = CONFIG.get('security', {}) or {}
+
+# Cap request bodies. Werkzeug has no default limit, so without this an
+# authenticated client can stream an unbounded .csv/.xlsx upload into memory
+# (the CSV/Excel import reads the whole body before parsing).
+_MAX_UPLOAD_BYTES = int(_SEC_CFG.get('max_upload_bytes', 25 * 1024 * 1024))
+_MAX_IMPORT_ROWS = int(_SEC_CFG.get('max_import_rows', 50000))
+app.config['MAX_CONTENT_LENGTH'] = _MAX_UPLOAD_BYTES
+
+# Hard ceiling on rows returned by the JSON dashboard endpoint (/objects),
+# which the browser loads in one shot. ?limit= narrows it further; the cap
+# stops one request from materialising an unbounded JSON payload.
+_MAX_OBJECTS_JSON = int(_SEC_CFG.get('max_objects_json', 50000))
+
+# Headers applied to every response. The dashboard is a single self-contained
+# inline-script page served from this origin, so 'unsafe-inline' is required
+# for script/style; everything else is locked to 'self'.
+_SECURITY_HEADERS = (
+    ('X-Content-Type-Options', 'nosniff'),
+    ('X-Frame-Options', 'DENY'),
+    ('Referrer-Policy', 'no-referrer'),
+    ('Permissions-Policy', 'geolocation=(), microphone=(), camera=()'),
+    ('Strict-Transport-Security', 'max-age=15552000; includeSubDomains'),
+    ('Content-Security-Policy',
+     "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+     "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+     "font-src 'self'; connect-src 'self'; object-src 'none'; "
+     "base-uri 'none'; frame-ancestors 'none'; form-action 'self'"),
+)
+
+# Auth-failure throttling. Only requests that actually PRESENT a credential
+# are counted (an anonymous probe has no credential to brute-force, and the
+# "requires auth" smoke tests send none). A successful request clears the
+# counter, so a caller holding correct credentials is never locked out.
+_AUTH_FAIL_LIMIT = int(_SEC_CFG.get('auth_fail_limit', 10))
+_AUTH_FAIL_WINDOW = int(_SEC_CFG.get('auth_fail_window', 300))
+_AUTH_FAIL_MAX_KEYS = 20000
+_auth_failures: Dict[str, List[float]] = {}
+_auth_fail_lock = threading.Lock()
+
+_THROTTLED_PREFIXES = ('/taxii2', '/objects', '/feed', '/auth', '/ui/login',
+                       '/ui/stats', '/ui/collections', '/community',
+                       '/subscriptions')
+
+
+def _client_ip() -> str:
+    """Best-effort client address, for throttling keys and log lines only.
+
+    The documented ingress is the Cloudflare tunnel, which sets
+    CF-Connecting-IP to the real client. These headers are caller-controlled
+    if the origin is reachable directly, so they are never used for authz.
+    """
+    raw = (request.headers.get('CF-Connecting-IP')
+           or request.headers.get('X-Forwarded-For')
+           or request.remote_addr or '')
+    return str(raw).split(',')[0].strip()[:64] or 'unknown'
+
+
+def _throttle_prefix(path: str) -> Optional[str]:
+    """The throttled path class for ``path``, or None when it isn't guarded."""
+    p = path or '/'
+    for prefix in _THROTTLED_PREFIXES:
+        if p == prefix or p.startswith(prefix + '/'):
+            return prefix
+    return None
+
+
+def _request_carries_credentials() -> bool:
+    return bool(request.headers.get('Authorization')
+                or request.headers.get('X-Taxii-Username')
+                or request.cookies.get('taxii2_ui_session'))
+
+
+def _recent_auth_failures(key: str) -> List[float]:
+    """Failures for ``key`` inside the window (prunes stale entries)."""
+    now = time.time()
+    with _auth_fail_lock:
+        stamps = [t for t in (_auth_failures.get(key) or [])
+                  if now - t < _AUTH_FAIL_WINDOW]
+        if stamps:
+            _auth_failures[key] = stamps
+        else:
+            _auth_failures.pop(key, None)
+        return stamps
+
+
+def _record_auth_failure(key: str) -> None:
+    with _auth_fail_lock:
+        if len(_auth_failures) >= _AUTH_FAIL_MAX_KEYS:
+            _auth_failures.clear()
+        _auth_failures.setdefault(key, []).append(time.time())
+
+
+def _too_many_requests_response() -> Response:
+    detail = (f'too many failed authentication attempts; '
+              f'retry after {_AUTH_FAIL_WINDOW}s')
+    if (request.path or '').startswith('/taxii2'):
+        resp = _taxii_error(429, 'Too Many Requests', detail, 'throttled')
+    else:
+        resp = jsonify({'error': detail})
+        resp.status_code = 429
+    resp.headers['Retry-After'] = str(_AUTH_FAIL_WINDOW)
+    return resp
+
+
+@app.before_request
+def _auth_failure_gate():
+    """Answer 429 instead of validating credentials for a throttled client."""
+    if _AUTH_FAIL_LIMIT <= 0 or _throttle_prefix(request.path) is None:
+        return None
+    if len(_recent_auth_failures(_client_ip())) >= _AUTH_FAIL_LIMIT:
+        logger.warning("Throttling repeated auth failures from %s",
+                       _client_ip())
+        return _too_many_requests_response()
+    return None
+
+
+@app.after_request
+def _security_headers_and_throttle(resp: Response) -> Response:
+    for header, value in _SECURITY_HEADERS:
+        resp.headers.setdefault(header, value)
+    if (_AUTH_FAIL_LIMIT > 0 and _throttle_prefix(request.path) is not None
+            and _request_carries_credentials()):
+        key = _client_ip()
+        if resp.status_code == 401:
+            _record_auth_failure(key)
+        elif resp.status_code < 400:
+            with _auth_fail_lock:
+                _auth_failures.pop(key, None)
+    return resp
+
+
+@app.errorhandler(413)
+def _request_too_large(_err):
+    mb = _MAX_UPLOAD_BYTES / (1024 * 1024)
+    return jsonify({
+        'error': f'request body too large (limit {mb:.0f} MB)',
+    }), 413
+
+
+# ---------------------------------------------------------------------------
 # TAXII 2 Authentication
 # ---------------------------------------------------------------------------
 
@@ -651,6 +797,16 @@ def _request_taxii_credentials() -> Tuple[str, str]:
     return username or '', password or ''
 
 
+def _credentials_match(user: str, password: str, cfg: Dict[str, Any]) -> bool:
+    """Constant-time comparison against a configured username/password pair."""
+    expected_user = str((cfg or {}).get('username') or '')
+    expected_pass = str((cfg or {}).get('password') or '')
+    if not expected_user or not expected_pass:
+        return False
+    return (hmac.compare_digest(str(user or ''), expected_user)
+            and hmac.compare_digest(str(password or ''), expected_pass))
+
+
 def _validate_taxii_auth(client_user: str, client_pass: str) -> bool:
     """Validate TAXII 2 authentication credentials.
 
@@ -659,11 +815,11 @@ def _validate_taxii_auth(client_user: str, client_pass: str) -> bool:
     """
     override = _get_taxii_auth_config()
     if override.get('username'):
-        if (client_user == override.get('username')
-                and client_pass == override.get('password')):
+        if _credentials_match(client_user, client_pass, override):
             return True
     return any(
-        c.username and c.username == client_user and c.password == client_pass
+        _credentials_match(client_user, client_pass,
+                           {'username': c.username, 'password': c.password})
         for c in TAXII_COLLECTIONS
     )
 
@@ -678,12 +834,12 @@ def _collections_readable_by(client_user: str, client_pass: str
     """
     override = _get_taxii_auth_config()
     if override.get('username'):
-        if (client_user == override.get('username')
-                and client_pass == override.get('password')):
+        if _credentials_match(client_user, client_pass, override):
             return list(TAXII_COLLECTIONS)
     return [
         c for c in TAXII_COLLECTIONS
-        if c.username and c.username == client_user and c.password == client_pass
+        if _credentials_match(client_user, client_pass,
+                              {'username': c.username, 'password': c.password})
     ]
 
 
@@ -731,10 +887,52 @@ def _ui_session_valid() -> bool:
 def _request_allowed() -> bool:
     """Data endpoints accept TAXII credentials (scripts / Vision One,
     unchanged) OR a valid web-UI session cookie (browser)."""
-    user, pw = _request_taxii_credentials()
-    if _validate_taxii_auth(user, pw):
+    if _ui_session_valid():
         return True
-    return _ui_session_valid()
+    user, pw = _request_taxii_credentials()
+    return _validate_taxii_auth(user, pw) or _validate_ui_credentials(user, pw)
+
+
+def _validate_ui_credentials(user: str, password: str) -> bool:
+    """Constant-time check of the dashboard credentials (ui.auth)."""
+    return _credentials_match(user, password,
+                              {'username': _ui_username,
+                               'password': _ui_password})
+
+
+def _get_admin_auth_config() -> Dict[str, str]:
+    """Optional feed-wide admin principal (``taxii.admin_auth``).
+
+    When it is not configured, feed-wide writes are limited to the dashboard
+    session and the UI credentials.
+    """
+    override = app.config.get('TAXII_ADMIN_AUTH')
+    cfg = override if override is not None else (
+        (CONFIG.get('taxii', {}) or {}).get('admin_auth') or {})
+    return {
+        'username': str((cfg or {}).get('username') or ''),
+        'password': str((cfg or {}).get('password') or ''),
+    }
+
+
+def _write_allowed() -> bool:
+    """Authorization for data-mutating endpoints.
+
+    Only the dashboard session, the UI credentials or an optional
+    ``taxii.admin_auth`` principal may write. TAXII credentials — including
+    the read credential handed to a consumer such as Vision One — are
+    read-only, so a leaked consumer credential cannot ingest, revoke, delete
+    or purge anything.
+    """
+    if _ui_session_valid():
+        return True
+    user, pw = _request_taxii_credentials()
+    if _validate_ui_credentials(user, pw):
+        return True
+    admin = _get_admin_auth_config()
+    if admin.get('username') and _credentials_match(user, pw, admin):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -929,7 +1127,7 @@ def ui_sso_start():
         _oauth_state_cookie,
         _sso_oauth_state_token({'state': state, 'nonce': nonce,
                                 'code_verifier': code_verifier}),
-        max_age=600, httponly=True, samesite='Lax',
+        max_age=600, httponly=True, samesite='Lax', secure=True,
     )
     return resp
 
@@ -985,20 +1183,23 @@ def ui_sso_callback():
     resp = redirect('/')
     resp.set_cookie(
         'taxii2_ui_session', _session_cookie(username),
-        max_age=_ui_session_ttl, httponly=True, samesite='Lax',
+        max_age=_ui_session_ttl, httponly=True, samesite='Lax', secure=True,
     )
-    resp.delete_cookie(_oauth_state_cookie)
+    resp.delete_cookie(_oauth_state_cookie, httponly=True, samesite='Lax',
+                       secure=True)
     logger.info("SSO login successful for %s", username)
     return resp
 
 
 def _ui_sso_fail(message: str) -> Response:
     """Render a small inline error and point back at the login form."""
+    # ``message`` can embed caller-controlled query parameters (?error=...),
+    # so it is HTML-escaped rather than interpolated raw.
     resp = make_response(
         f'<!doctype html><meta charset="utf-8">'
         f'<title>Sign-in failed</title><body style="font-family:system-ui;max-width:520px;'
         f'margin:80px auto;padding:0 16px"><h2>Sign-in failed</h2>'
-        f'<p>{message}</p><p><a href="/">Return to login</a></p></body>',
+        f'<p>{html.escape(message)}</p><p><a href="/">Return to login</a></p></body>',
         401,
     )
     resp.headers['Content-Type'] = 'text/html; charset=utf-8'
@@ -2235,6 +2436,8 @@ def taxii_collections():
 @app.route('/taxii2/collections/<collection_id>/', methods=['GET'])
 def taxii_collection_info(collection_id: str):
     """TAXII 2.1 Get a Collection (section 5.2)."""
+    if not _taxii_check_auth():
+        return _taxii_unauthorized()
     cfg = TAXII_COLLECTION_MAP.get(collection_id)
     if cfg is None:
         return _taxii_error(404, 'Not Found',
@@ -2251,6 +2454,10 @@ def taxii_collection_info(collection_id: str):
 @app.route('/taxii2/collections/<collection_id>/objects/', methods=['GET', 'POST'])
 def taxii_objects(collection_id: str):
     """TAXII 2.1 Get Objects (5.3) / Add Objects (5.4) for a collection."""
+    # Authorize BEFORE resolving the collection: an unauthenticated caller must
+    # not be able to tell a real collection id (401) from an unknown one (404).
+    if not _taxii_check_auth():
+        return _taxii_unauthorized()
     cfg = TAXII_COLLECTION_MAP.get(collection_id)
     if cfg is None:
         return _taxii_error(404, 'Not Found',
@@ -2415,12 +2622,30 @@ def list_objects():
         return jsonify({'error': err}), 400
     cid = cid or TAXII_COLLECTION_ID
 
+    raw_limit = request.args.get('limit')
+    limit = None
+    if raw_limit not in (None, ''):
+        try:
+            limit = int(raw_limit)
+            if limit <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return jsonify({
+                'error': f'limit must be a positive integer, got {raw_limit!r}'
+            }), 400
+    cap = _MAX_OBJECTS_JSON if limit is None else min(limit, _MAX_OBJECTS_JSON)
+
     session = create_session()
     try:
         q = session.query(STIXObject)
         if cid:
             q = q.filter(STIXObject.collection_id == cid)
-        db_objects = q.all()
+        # Fetch one extra row so truncation is reported without a 2nd query.
+        # (No ORDER BY: the cap is a size guard, and the previous unordered
+        # read order is kept so the dashboard's list order is unchanged.)
+        rows = q.limit(cap + 1).all()
+        truncated = len(rows) > cap
+        db_objects = rows[:cap]
     finally:
         session.close()
 
@@ -2455,11 +2680,15 @@ def list_objects():
             })
 
     withheld_count = sum(1 for o in objects if o['gated'])
+    if truncated:
+        logger.warning("/objects truncating response at %d rows (cap %d)",
+                       cap, _MAX_OBJECTS_JSON)
     return jsonify({
         'objects': objects,
         'count': len(objects),
         'served_count': len(objects) - withheld_count,
         'withheld_count': withheld_count,
+        'truncated': truncated,
     }), 200
 
 
@@ -2574,7 +2803,7 @@ def revoke_object(stix_id: str):
     sets STIX ``revoked: true`` (still served, so clients drop it); unrevoking
     reinstates it. Revocation is the manual side of the indicator lifecycle.
     """
-    if not _request_allowed():
+    if not _write_allowed():
         return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json(silent=True) or {}
     action = str(data.get('action', 'revoke') or 'revoke').lower()
@@ -2610,7 +2839,7 @@ def revoke_object(stix_id: str):
     except Exception as exc:
         session.rollback()
         logger.error("Revoke error: %s", exc)
-        return jsonify({'error': str(exc)}), 500
+        return jsonify({'error': 'could not update the object'}), 500
     finally:
         session.close()
 
@@ -2655,12 +2884,14 @@ def ingest_data():
     if err:
         return jsonify({'error': err}), 400
     cid = cid or TAXII_COLLECTION_ID
+    if not _write_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
 
     try:
         count = ingest_objects(stix_objects, mode=mode, collection=cid)
     except Exception as exc:
         logger.error("Ingest error: %s", exc)
-        return jsonify({'error': str(exc)}), 500
+        return jsonify({'error': 'could not ingest the supplied objects'}), 500
 
     return jsonify({
         'message': 'Data ingested successfully',
@@ -2678,7 +2909,7 @@ def delete_objects_data():
     "Purge selected" (drop the rows the user ticked) — per-row and
     full-feed removal are the × button and DELETE /feed/purge.
     """
-    if not _request_allowed():
+    if not _write_allowed():
         return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json(silent=True) or {}
     ids = data.get('ids')
@@ -2699,7 +2930,7 @@ def delete_objects_data():
     except Exception as exc:
         session.rollback()
         logger.error("Delete error: %s", exc)
-        return jsonify({'error': str(exc)}), 500
+        return jsonify({'error': 'could not delete the requested objects'}), 500
     finally:
         session.close()
     logger.info("Deleted %d object(s) via /feed/delete", len(deleted))
@@ -2720,11 +2951,15 @@ def purge_data():
     cid, err = _collection_param(request.args.get('collection'))
     if err:
         return jsonify({'error': err}), 400
+    if not _write_allowed():
+        # Writes (ingest, purge, delete, revoke, community pull) are the
+        # dashboard's job — TAXII credentials are read-only.
+        return jsonify({'error': 'Unauthorized'}), 401
     try:
         purged = purge_all(collection=cid)
     except Exception as exc:
         logger.error("Purge error: %s", exc)
-        return jsonify({'error': str(exc)}), 500
+        return jsonify({'error': 'could not purge the feed'}), 500
     if cid:
         return jsonify({
             'message': f"Collection '{cid}' purged successfully",
@@ -2855,7 +3090,7 @@ def ui_login():
     # let anyone in with a blank login.
     if not _ui_username or not _ui_password:
         return jsonify({'error': 'Login not configured (UI_AUTH_USER/UI_AUTH_PASSWORD unset)'}), 503
-    if username != _ui_username or password != _ui_password:
+    if not _validate_ui_credentials(username, password):
         return jsonify({'error': 'Invalid credentials'}), 401
     resp = jsonify({'message': 'Logged in', 'user': username})
     resp.set_cookie(
@@ -2864,6 +3099,7 @@ def ui_login():
         max_age=_ui_session_ttl,
         httponly=True,
         samesite='Lax',
+        secure=True,
     )
     return resp, 200
 
@@ -2906,7 +3142,7 @@ def community_pull(name: str):
     many objects this single cycle ingests, overriding the puller's
     configured cap (``max_indicators_per_poll`` / ``max_objects_per_poll``).
     """
-    if not _request_allowed():
+    if not _write_allowed():
         return jsonify({'error': 'Unauthorized'}), 401
     body = request.get_json(silent=True) or {}
     raw = body.get('limit', request.args.get('limit'))
@@ -3281,13 +3517,24 @@ def parse_csv_intel(text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any
     """
     try:
         reader = csv.DictReader(io.StringIO(text or ''))
-        rows = list(reader)
+        rows = []
+        truncated = False
+        for row in reader:
+            if len(rows) >= _MAX_IMPORT_ROWS:
+                truncated = True
+                break
+            rows.append(row)
     except Exception:
         return [], [{'error': 'could not parse CSV'}]
 
     if not rows or not reader.fieldnames:
         return [], [{'error': 'empty CSV (no header row found)'}]
-    return _parse_tabular_rows(reader.fieldnames, rows, start_row=2)
+    objects, skipped = _parse_tabular_rows(reader.fieldnames, rows, start_row=2)
+    if truncated:
+        skipped.append({
+            'error': f'stopped after {_MAX_IMPORT_ROWS} rows '
+                     f'(file contains more)'})
+    return objects, skipped
 
 
 def parse_xlsx_intel(data: bytes) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -3304,7 +3551,13 @@ def parse_xlsx_intel(data: bytes) -> Tuple[List[Dict[str, Any]], List[Dict[str, 
     try:
         wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
         ws = wb.active
-        raw_rows = list(ws.iter_rows(values_only=True))
+        raw_rows = []
+        truncated = False
+        for row in ws.iter_rows(values_only=True):
+            if len(raw_rows) >= _MAX_IMPORT_ROWS + 1:  # +1 = header row
+                truncated = True
+                break
+            raw_rows.append(row)
         wb.close()
     except Exception as exc:
         return [], [{'error': f'could not parse workbook: {exc}'}]
@@ -3328,7 +3581,12 @@ def parse_xlsx_intel(data: bytes) -> Tuple[List[Dict[str, Any]], List[Dict[str, 
             h: (str(cell).strip() if cell is not None else '')
             for h, cell in zip(headers, raw)
         })
-    return _parse_tabular_rows(headers, rows, start_row=2)
+    objects, skipped = _parse_tabular_rows(headers, rows, start_row=2)
+    if truncated:
+        skipped.append({
+            'error': f'stopped after {_MAX_IMPORT_ROWS} rows '
+                     f'(workbook contains more)'})
+    return objects, skipped
 
 
 @app.route('/feed/import-csv', methods=['POST'])
@@ -3359,7 +3617,7 @@ def import_csv_data():
             objects, skipped = parse_xlsx_intel(data_bytes)
         except Exception as exc:
             logger.error("XLSX import error: %s", exc)
-            return jsonify({'error': str(exc)}), 500
+            return jsonify({'error': 'could not parse the uploaded workbook'}), 400
         if skipped and any(
                 'openpyxl' in (s.get('error') or '') for s in skipped[:1]):
             return jsonify({
@@ -3373,7 +3631,7 @@ def import_csv_data():
                 data_bytes.decode('utf-8-sig', errors='replace'))
         except Exception as exc:
             logger.error("CSV import error: %s", exc)
-            return jsonify({'error': str(exc)}), 500
+            return jsonify({'error': 'could not parse the uploaded CSV'}), 400
     if not objects:
         return jsonify({
             'imported': 0,
@@ -3386,12 +3644,14 @@ def import_csv_data():
     if err:
         return jsonify({'error': err}), 400
     cid = cid or TAXII_COLLECTION_ID
+    if not _write_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
     try:
         added = ingest_objects(objects, mode='merge', source='manual',
                                collection=cid)
     except Exception as exc:
         logger.error("CSV ingest error: %s", exc)
-        return jsonify({'error': str(exc)}), 500
+        return jsonify({'error': 'could not import the uploaded file'}), 500
     return jsonify({
         'imported': added,
         'skipped': skipped[:50],
@@ -3533,7 +3793,10 @@ class OtxPoller:
             return None
 
         pulse_ref = pulse_name or 'pulse'
-        labels = ['otx', pulse_ref]
+        # Provenance label only — the `otx` source is already the object's
+        # `source` tag (shown as the Source column in the UI), so it is not
+        # duplicated as a label.
+        labels = [pulse_ref]
         confidence = 70  # community-sourced default; tune per deployment
 
         if obj_type == 'file-hash':

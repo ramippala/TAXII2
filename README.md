@@ -285,7 +285,8 @@ updates, so `#graph` / `#sources` / `#import` open that tab directly). On the
 
 1. **Current feed** — an editable table of everything in the feed. Each row
    shows a **source badge** (`manual` / `otx` / a puller name), a **gate
-   badge** (`served` / `withheld`, with the reason on hover), and a
+   badge** (`served` = passes the intel filter and is offered in the feed,
+   `withheld` = filtered out, with the reason on hover), and a
    **Status** cell (`active` / `revoked`) with a **Revoke / Unrevoke** button
    for marking false positives.
    - **Search** — filters rows by value, label, type, or ID as you type.
@@ -409,12 +410,27 @@ uses a signed short-lived `state` cookie + PKCE to stop CSRF/replay.
 
 Returns the latest STIX feed in **TAXII 2 XML** format.
 
-**Authentication:** the data endpoints (`/feed`, `/objects`,
-`/feed/ingest`, `/feed/purge`, `/community/*`) require credentials — either
-the TAXII credentials from `taxii.auth` in `config.yaml` (sent as
-`X-Taxii-Username` / `X-Taxii-Password` headers or HTTP Basic), **or** a valid
-UI session cookie (from the dashboard login). Unauthenticated requests get
-`401`. For curl, use the TAXII credentials:
+**Authentication:** the **data endpoints** are split by privilege —
+**reads** (`/feed`, `/objects`, `/ui/stats`, `/ui/collections`,
+`/community/pullers`, `/taxii2/*`) accept the TAXII credentials from
+`taxii.auth` in `config.yaml` (sent as `X-Taxii-Username` /
+`X-Taxii-Password` headers or HTTP Basic) **or** a valid UI session cookie
+(from the dashboard login). **Writes** (`/feed/ingest`, `/feed/delete`,
+`/feed/purge`, `/feed/import-csv`, `/objects/<id>/revoke`,
+`/community/pull/<name>`) need the **dashboard session, the UI credentials,
+or an optional `taxii.admin_auth` principal** — TAXII credentials are
+read-only on purpose, so the credential handed to Vision One cannot change
+the feed. Unauthenticated requests get `401`. For curl reads, use the TAXII
+credentials; for curl writes, use the UI credentials:
+
+```bash
+# read (consumer credential)
+curl -u "$TAXII_AUTH_USER:$TAXII_AUTH_PASSWORD" http://localhost:5000/objects
+# write (dashboard credential)
+curl -u "$UI_AUTH_USER:$UI_AUTH_PASSWORD" -X POST http://localhost:5000/feed/ingest \
+  -H 'Content-Type: application/json' -d '{"stix_objects": [...]}'
+```
+
 
 **Request:**
 ```bash
@@ -596,21 +612,21 @@ These drive the dashboard login. They are independent of `taxii.auth`.
 
 | Endpoint | Purpose |
 |----------|---------|
-| `POST /objects/<stix_id>/revoke` | Body `{"action":"revoke"}` (default) or `{"action":"unrevoke"}`. Sets/clears the STIX `revoked` flag. A revoked object stays stored and is served to Vision One with `revoked: true` so it can be purged. `404` if the id is unknown, `400` on a bad action. |
+| `POST /objects/<stix_id>/revoke` | **Write** (dashboard session / UI credentials / `taxii.admin_auth`; TAXII credentials get `401`). Body `{"action":"revoke"}` (default) or `{"action":"unrevoke"}`. Sets/clears the STIX `revoked` flag. A revoked object stays stored and is served to Vision One with `revoked: true` so it can be purged. `404` if the id is unknown, `400` on a bad action. |
 
 ### CSV import endpoint
 
 | Endpoint | Purpose |
 |----------|---------|
-| `POST /feed/import-csv` | GT-team ad-hoc intel. Multipart `file` field (UI) or raw CSV body. Fuzzy header → type mapping, per-value validation, merge (append) as `source='manual'`. Returns `{imported, skipped[], skipped_total}`. `400` if nothing recognizable. See [CSV import](#3-csv-import-gt-team-ad-hoc-intel). |
+| `POST /feed/import-csv` | **Write** (dashboard session / UI credentials / `taxii.admin_auth`). GT-team ad-hoc intel. Multipart `file` field (UI) or raw CSV body; capped at `security.max_upload_bytes` (25 MB → `413`) and `security.max_import_rows` rows. Fuzzy header → type mapping, per-value validation, merge (append) as `source='manual'`. Returns `{imported, skipped[], skipped_total}`. `400` if nothing recognizable or the file can't be parsed (no driver internals echoed). See [CSV import](#3-csv-import-gt-team-ad-hoc-intel). |
 
 ### Community source endpoints
 
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /community/pullers` | Status of all community sources: the OTX puller plus each `taxii_pullers:` entry (`id`, `name`, `kind`, `enabled`, `running`, `limit`, `base_url`, `collection` for TAXII, `last_sync`, `last_added`, `last_status`, `last_message`). |
-| `POST /community/pull/otx` | Run one OTX pull cycle now (the UI "Pull now"). Optional `limit` (JSON `{"limit": N}` or `?limit=N`) caps objects this cycle. Returns `{name, added, error, last_sync, last_status, limit?}`. |
-| `POST /community/pull/<name>` | Run one pull cycle now for a `taxii_pullers:` entry named `<name>`, with the same optional `limit`. `404` if unknown, `400` if misconfigured or the limit is not a positive integer. Works even when the puller is `enabled: false` (one-shot fetch). |
+| `POST /community/pull/otx` | **Write** (dashboard session / UI credentials / `taxii.admin_auth`). Run one OTX pull cycle now (the UI "Pull now"). Optional `limit` (JSON `{"limit": N}` or `?limit=N`) caps objects this cycle. Returns `{name, added, error, last_sync, last_status, limit?}`. |
+| `POST /community/pull/<name>` | **Write** (as above). Run one pull cycle now for a `taxii_pullers:` entry named `<name>`, with the same optional `limit`. `404` if unknown, `400` if misconfigured or the limit is not a positive integer. Works even when the puller is `enabled: false` (one-shot fetch). |
 
 > **Limiting a pull.** "Pull now" accepts a per-cycle **limit** — the dashboard's
 > Community-sources table has a **limit box** next to each Pull button (blank =
@@ -838,6 +854,9 @@ taxii:
   collection* (a bare `DELETE /feed/purge` without `?collection=` still
   wipes everything, for scripts). Community pullers (OTX / third-party
   TAXII) always feed the primary collection.
+- **Writes are operator-only.** Every item above is a *write*: it needs the
+  dashboard session, the UI credentials or `taxii.admin_auth`. A collection's
+  TAXII credentials can list and read that collection and nothing else.
 
 See the commented `collections:` block in `config.yaml` and the
 `PREMIUM_TAXII_USER` / `PREMIUM_TAXII_PASS` keys in `.env.example`.
@@ -1076,9 +1095,14 @@ group allow-lists, and session-cookie issuance on success).
 - Use **HTTPS/TLS** for production deployments (configurable via reverse proxy).
 - **Set strong `ui.auth` / `taxii.auth` credentials** in `.env`
   (`UI_AUTH_USER`/`UI_AUTH_PASSWORD`, `TAXII_AUTH_USER`/`TAXII_AUTH_PASSWORD`)
-  and change them from the default `admin`/`admin` — the UI creds manage the
-  feed and the TAXII creds authenticate Vision One and any script/curl using
-  TAXII Basic auth on the data endpoints.
+  and change them from the default `admin`/`admin`.
+- **Privilege split (enforced in code).** `taxii.auth` is a **read-only**
+  consumer credential — it can poll `/taxii2/` but not ingest, delete, revoke
+  or purge. Every write needs the **dashboard session**, the **UI
+  credentials** (`curl -u "$UI_AUTH_USER:$UI_AUTH_PASSWORD"`) or an optional
+  **`taxii.admin_auth`** principal (`.env`: `TAXII_ADMIN_USER`/
+  `TAXII_ADMIN_PASSWORD`, config: `taxii.admin_auth`). So a leaked Vision One
+  credential cannot change the feed.
 - **Set `FLASK_SECRET`** (in `.env`; it's required — no default) — the UI
   session cookie is signed with it; an unset value leaves cookies unsigned
   and lets a forged cookie authenticate to the data endpoints.
@@ -1089,8 +1113,24 @@ group allow-lists, and session-cookie issuance on success).
   control (env var); and require **HTTPS** for the production redirect URI.
   Local `http://localhost` is only for testing.
 - Set `debug: false` in production.
-- Rate-limit ingestion requests if needed.
-- Disable CORS (`flask_cors`) only for trusted origins.
+
+**What the server does for you (`server.py`)**
+
+| Control | Behavior |
+|---------|----------|
+| Response headers | Every response carries `Content-Security-Policy` (inline script/style allowed, everything else `'self'`), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy`, `Strict-Transport-Security`. |
+| Session cookie | `taxii2_ui_session` is `HttpOnly`, `SameSite=Lax`, `Secure`, signed (itsdangerous) and time-bounded (`ui.session_ttl`). |
+| Upload caps | `/feed/import-csv` bodies are capped at `security.max_upload_bytes` (25 MB → `413`) and parsed at most `security.max_import_rows` rows (50 000) before truncating with a note. |
+| Response caps | `/objects` accepts `?limit=` and never returns more than `security.max_objects_json` rows (50 000), reporting `"truncated": true` when it trims. |
+| Auth throttling | After `security.auth_fail_limit` (10) failed credentials from one client IP within `security.auth_fail_window` (300 s), further attempts get `429` + `Retry-After` without the credential being evaluated. Only requests that *present* a credential are counted, and a success clears the counter. |
+| Error bodies | 5xx responses return a generic message; driver/exception text goes to the server log only. |
+| CORS | `server.cors_origins` — pin it to your real origin(s). `'*'` reflects any origin (dev only; still no `Allow-Credentials`, so browser reads cannot use a session cookie). |
+| Input validation | All SQL goes through the ORM (no string-built SQL); STIX ids are shape-checked (`<type>--<id>`, type-prefix match); dashboard values are rendered with `textContent`/escaping; the SSO error page HTML-escapes caller input. |
+| Client IP | Throttling keys and log lines use `CF-Connecting-IP` (set by the Cloudflare tunnel) with `X-Forwarded-For`/`remote_addr` as fallback. |
+
+> **Upgrading from an older build:** writes used to accept plain TAXII
+> credentials. If a script relied on that, switch it to the UI credentials
+> (`-u "$UI_AUTH_USER:$UI_AUTH_PASSWORD"`) or set `taxii.admin_auth`.
 
 ## Environment Variables
 
@@ -1119,8 +1159,9 @@ Rules:
 | `TAXII_CONFIG` | `./config.yaml` | Path to configuration file |
 | `TAXII_ENV_FILE` | `./.env` (next to server.py) | Path to the .env file |
 | `FLASK_SECRET` | *(required, no default)* | Flask secret key (signs UI session + SSO state cookies) — set in `.env` |
-| `TAXII_AUTH_USER` / `TAXII_AUTH_PASSWORD` | *(no default)* | TAXII client credentials (`taxii.auth`) — what Vision One uses on `/taxii2/`. Unset → startup warning; `/taxii2/` rejects all clients |
-| `UI_AUTH_USER` / `UI_AUTH_PASSWORD` | *(no default)* | Dashboard login credentials (`ui.auth`). Unset → startup warning; `/ui/login` fails closed (503) |
+| `TAXII_AUTH_USER` / `TAXII_AUTH_PASSWORD` | *(no default)* | TAXII client credentials (`taxii.auth`) — what Vision One uses on `/taxii2/`. **Read-only**: cannot ingest/delete/revoke/purge. Unset → startup warning; `/taxii2/` rejects all clients |
+| `UI_AUTH_USER` / `UI_AUTH_PASSWORD` | *(no default)* | Dashboard login credentials (`ui.auth`) and a valid write credential for scripts (`curl -u`). Unset → startup warning; `/ui/login` fails closed (503) |
+| `TAXII_ADMIN_USER` / `TAXII_ADMIN_PASSWORD` | *(empty)* | Optional feed-wide **write** principal (`taxii.admin_auth`) for automation that shouldn't use the dashboard login. Empty → only the dashboard session/UI credentials can write |
 | `DATABASE_URL` | `sqlite:///taxii_feed.db` | Database connection URL (set to e.g. `postgresql+psycopg2://taxii:...@127.0.0.1:5432/taxii_feed` to run on PostgreSQL) |
 | `OTX_API_KEY` | *(empty)* | Optional AlienVault OTX API key (`otx.api_key` in config.yaml, `${OTX_API_KEY:-}`). Free key from otx.alienvault.com raises the public read-only rate limits; empty = anonymous browsing (throttled) |
 | `TAXII_OBJECTS_SHAPE` | `bundle` | Get Objects response shape (`taxii.objects_shape`): `bundle` (default — OTX-compatible `{type,objects,more,next}`, no envelope; **what Vision One ingests**) or `envelope` (spec TAXII 2.1 Message Resource, §5.3 — set this only for a spec-strict client). |
