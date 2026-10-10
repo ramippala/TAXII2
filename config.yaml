@@ -52,10 +52,11 @@ taxii:
   # Collection id:  threat-intel
   collection_id: 'threat-intel'
   collection_title: 'Custom Threat Intelligence Feed'
-  # TAXII client credentials (HTTP Basic) — enter these in Vision One
+  # TAXII client credentials (HTTP Basic) — enter these in Vision One.
+  # Values live in .env (see .env.example); no default here on purpose.
   auth:
-    username: 'admin'
-    password: 'admin'
+    username: '${TAXII_AUTH_USER}'
+    password: '${TAXII_AUTH_PASSWORD}'
 
 # ---------------------------------------------------------------------------
 # INDICATOR LIFECYCLE / TTL (aging & auto-revocation)
@@ -121,13 +122,13 @@ intel_filter:
 # This is SEPARATE from `taxii.auth` (which is what Vision One uses to poll
 # /taxii2/). The UI signs a session cookie after login; the data endpoints
 # accept EITHER the UI session OR the TAXII credentials (scripts/curl).
-# Keep this private. Set a strong password; set FLASK_SECRET to protect the
-# cookie signature.
+# Keep this private. Values live in .env (see .env.example); set a strong
+# password there. Set FLASK_SECRET to protect the cookie signature.
 # ---------------------------------------------------------------------------
 ui:
   auth:
-    username: 'admin'
-    password: 'admin'
+    username: '${UI_AUTH_USER}'
+    password: '${UI_AUTH_PASSWORD}'
   session_ttl: 43200        # session lifetime, seconds (default 12 h)
 
 # ---------------------------------------------------------------------------

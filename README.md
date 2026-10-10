@@ -887,8 +887,11 @@ domain/UPN/group allow-lists, and session-cookie issuance on success).
 ## Security Considerations
 
 - Use **HTTPS/TLS** for production deployments (configurable via reverse proxy).
-- **Set a strong `ui.auth` password** and change it from the default
-  `admin`/`admin` — anyone who knows it can manage the feed and trigger pulls.
+- **Set strong `ui.auth` / `taxii.auth` credentials** in `.env`
+  (`UI_AUTH_USER`/`UI_AUTH_PASSWORD`, `TAXII_AUTH_USER`/`TAXII_AUTH_PASSWORD`)
+  and change them from the default `admin`/`admin` — the UI creds manage the
+  feed and the TAXII creds authenticate Vision One and any script/curl using
+  TAXII Basic auth on the data endpoints.
 - **Set `FLASK_SECRET`** (in `.env`; it's required — no default) — the UI
   session cookie is signed with it; an unset value leaves cookies unsigned
   and lets a forged cookie authenticate to the data endpoints.
@@ -929,6 +932,8 @@ Rules:
 | `TAXII_CONFIG` | `./config.yaml` | Path to configuration file |
 | `TAXII_ENV_FILE` | `./.env` (next to server.py) | Path to the .env file |
 | `FLASK_SECRET` | *(required, no default)* | Flask secret key (signs UI session + SSO state cookies) — set in `.env` |
+| `TAXII_AUTH_USER` / `TAXII_AUTH_PASSWORD` | *(no default)* | TAXII client credentials (`taxii.auth`) — what Vision One uses on `/taxii2/`. Unset → startup warning; `/taxii2/` rejects all clients |
+| `UI_AUTH_USER` / `UI_AUTH_PASSWORD` | *(no default)* | Dashboard login credentials (`ui.auth`). Unset → startup warning; `/ui/login` fails closed (503) |
 | `DATABASE_URL` | `sqlite:///taxii_feed.db` | Database connection URL |
 | `SSO_CLIENT_SECRET` | *(empty)* | Microsoft Entra client secret (referenced by `sso.client_secret` in config.yaml) |
 

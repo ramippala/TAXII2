@@ -91,6 +91,13 @@ class TestTaxiiServer(unittest.TestCase):
             'X-Taxii-Password': 'test_taxii_pass',
         }
 
+        # Configure test UI credentials (independent of the live .env).
+        self.ui_user = 'test_ui_user'
+        self.ui_pass = 'test_ui_pass'
+        import server
+        server._ui_username = self.ui_user
+        server._ui_password = self.ui_pass
+
     def _get_auth_headers(self):
         """Get auth headers for TAXII 2 requests (valid for data endpoints)."""
         return self.test_auth_headers
@@ -245,33 +252,46 @@ class TestTaxiiServer(unittest.TestCase):
 
     def test_ui_login_success_sets_cookie(self):
         """Test /ui/login with correct ui.auth creds sets a session cookie."""
-        # The UI creds come from ui.auth in config (default admin/admin in tests).
-        import server
-        user, pw = server._ui_username, server._ui_password
+        # UI creds are set to known test values in setUp (independent of .env).
         response = self.client.post(
             '/ui/login',
-            json={'username': user, 'password': pw},
+            json={'username': self.ui_user, 'password': self.ui_pass},
         )
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.set_cookie)  # a session cookie was set
         # The session is now valid.
         session = self.client.get('/ui/session').get_json()
         self.assertTrue(session['authenticated'])
-        self.assertEqual(session['user'], user)
+        self.assertEqual(session['user'], self.ui_user)
 
     def test_ui_login_wrong_password(self):
         """Test /ui/login rejects a wrong password."""
-        import server
         response = self.client.post(
             '/ui/login',
-            json={'username': server._ui_username, 'password': 'wrong-password-xyz'},
+            json={'username': self.ui_user, 'password': 'wrong-password-xyz'},
         )
         self.assertEqual(response.status_code, 401)
+
+    def test_ui_login_unconfigured_fails_closed(self):
+        """With no UI creds configured, /ui/login must reject (503), not
+        accept empty==empty credentials."""
+        import server
+        saved = (server._ui_username, server._ui_password)
+        try:
+            server._ui_username = ''
+            server._ui_password = ''
+            response = self.client.post(
+                '/ui/login', json={'username': '', 'password': ''},
+            )
+            self.assertEqual(response.status_code, 503)
+            self.assertIn('not configured', response.get_json()['error'])
+        finally:
+            server._ui_username, server._ui_password = saved
 
     def test_ui_session_cookie_grants_data_access(self):
         """Test a valid UI session cookie can read /objects (no TAXII headers)."""
         import server
-        user, pw = server._ui_username, server._ui_password
+        user, pw = self.ui_user, self.ui_pass
         login = self.client.post('/ui/login', json={'username': user, 'password': pw})
         cookie = None
         for k, v in login.headers:
@@ -288,9 +308,7 @@ class TestTaxiiServer(unittest.TestCase):
 
     def test_ui_logout_clears_cookie(self):
         """Test /ui/logout clears the session cookie."""
-        import server
-        user, pw = server._ui_username, server._ui_password
-        self.client.post('/ui/login', json={'username': user, 'password': pw})
+        self.client.post('/ui/login', json={'username': self.ui_user, 'password': self.ui_pass})
         response = self.client.post('/ui/logout')
         self.assertEqual(response.status_code, 200)
         set_cookies = [v for k, v in response.headers if k.lower() == 'set-cookie']
@@ -305,7 +323,7 @@ class TestTaxiiServer(unittest.TestCase):
         r1 = self.client.get('/objects', headers=self._get_auth_headers())
         self.assertEqual(r1.status_code, 200)
         # With a session cookie (no headers).
-        self.client.post('/ui/login', json={'username': server._ui_username, 'password': server._ui_password})
+        self.client.post('/ui/login', json={'username': self.ui_user, 'password': self.ui_pass})
         r2 = self.client.get('/objects')
         self.assertEqual(r2.status_code, 200)
 

@@ -519,6 +519,11 @@ app.config['TAXII_AUTH'] = {
     'username': _taxii_auth_cfg.get('username') or '',
     'password': _taxii_auth_cfg.get('password') or '',
 }
+if not app.config['TAXII_AUTH']['username'] or not app.config['TAXII_AUTH']['password']:
+    print('WARNING: TAXII credentials (TAXII_AUTH_USER/TAXII_AUTH_PASSWORD) '
+          'are not set — set them in .env (see .env.example). /taxii2/ and '
+          'the TAXII-cred data endpoints will reject all clients until then.',
+          file=sys.stderr)
 _cors_origins = (CONFIG.get('server', {}) or {}).get('cors_origins') or ['*']
 CORS(app, origins=_cors_origins)
 
@@ -568,8 +573,12 @@ def _validate_taxii_auth(client_user: str, client_pass: str) -> bool:
 
 UI_CFG = CONFIG.get('ui', {}) or {}
 UI_AUTH = UI_CFG.get('auth', {}) or {}
-_ui_username = str(UI_AUTH.get('username') or 'admin')
-_ui_password = str(UI_AUTH.get('password') or 'admin')
+_ui_username = str(UI_AUTH.get('username') or '')
+_ui_password = str(UI_AUTH.get('password') or '')
+if not _ui_username or not _ui_password:
+    print('WARNING: UI credentials (UI_AUTH_USER/UI_AUTH_PASSWORD) are not '
+          'set — set them in .env (see .env.example). The dashboard login '
+          'will reject all users until then.', file=sys.stderr)
 _ui_secret = str(CONFIG.get('security', {}).get('secret_key', 'dev-secret-key-change-in-production'))
 _ui_session_ttl = int(UI_CFG.get('session_ttl', 43200))  # seconds (default 12 h)
 
@@ -2022,6 +2031,10 @@ def ui_login():
     data = request.get_json(silent=True) or {}
     username = str(data.get('username') or '')
     password = str(data.get('password') or '')
+    # Fail closed if creds are unconfigured — otherwise empty==empty would
+    # let anyone in with a blank login.
+    if not _ui_username or not _ui_password:
+        return jsonify({'error': 'Login not configured (UI_AUTH_USER/UI_AUTH_PASSWORD unset)'}), 503
     if username != _ui_username or password != _ui_password:
         return jsonify({'error': 'Invalid credentials'}), 401
     resp = jsonify({'message': 'Logged in', 'user': username})
