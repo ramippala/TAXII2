@@ -10,6 +10,11 @@ cryptography==50.0.2
 requests==2.32.3
 # Excel (.xlsx) import — only used by /feed/import-csv for .xlsx uploads.
 openpyxl==3.1.2
+# Hardens openpyxl's XML parsing of UNTRUSTED workbooks: with this installed
+# openpyxl switches its parser to defusedxml (safe against DTD entity
+# expansion / "billion laughs" in a crafted .xlsx). Verified via
+# openpyxl.xml.DEFUSEDXML.
+defusedxml==0.7.1
 
 # Verification only (tests/verify_reference_client.py) — NOT needed to run the
 # server. The OASIS reference client, for checking the feed the same way a

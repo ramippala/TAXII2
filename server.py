@@ -3560,7 +3560,10 @@ def parse_xlsx_intel(data: bytes) -> Tuple[List[Dict[str, Any]], List[Dict[str, 
             raw_rows.append(row)
         wb.close()
     except Exception as exc:
-        return [], [{'error': f'could not parse workbook: {exc}'}]
+        # Don't echo the parser's message to the caller — it can name internal
+        # zip members / paths. The detail stays in the server log.
+        logger.error("XLSX parse error: %s", exc)
+        return [], [{'error': 'could not parse workbook'}]
     if not raw_rows:
         return [], [{'error': 'empty workbook (no header row found)'}]
 
@@ -3652,6 +3655,9 @@ def import_csv_data():
     except Exception as exc:
         logger.error("CSV ingest error: %s", exc)
         return jsonify({'error': 'could not import the uploaded file'}), 500
+    logger.info("Import via /feed/import-csv from %s: +%d object(s) into '%s' "
+                "(source=manual, skipped %d)",
+                _client_ip(), added, cid, len(skipped))
     return jsonify({
         'imported': added,
         'skipped': skipped[:50],

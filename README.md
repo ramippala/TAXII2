@@ -985,15 +985,36 @@ of the primary (the UI sends the collection selected on the Feed tab).
 ```bash
 # Raw CSV body (also accepts a multipart "file" field from the UI; .xlsx works too)
 curl -X POST http://localhost:5000/feed/import-csv \
-  -u admin:admin -H 'Content-Type: text/csv' \
+  -u "$UI_AUTH_USER:$UI_AUTH_PASSWORD" -H 'Content-Type: text/csv' \
   -d 'IP_Address,Destination,labels
 1.2.3.4,evil.example.com,c2
 5.6.7.8,bot.evil.net,apt'
 # -> {"imported": 4, "skipped": [], "skipped_total": 0}
 ```
 
-> `.xlsx` needs `openpyxl` (already in `requirements.txt`); the server boots
-> without it and returns a clear error only if you upload a workbook.
+> `.xlsx` needs `openpyxl` (in `requirements.txt`) plus `defusedxml`, which
+> openpyxl picks up automatically to parse an untrusted workbook with a
+> hardened XML parser (no DTD entity expansion / "billion laughs"). The
+> server boots without them and returns a clear error only on upload.
+
+### Sanitization / injection behaviour of the upload field
+
+The upload is parsed as **data only** — nothing in a `.csv`/`.xlsx` is ever
+interpreted as code:
+
+| Attack class | Why it does not work |
+|---|---|
+| SQL injection | Rows become Python dicts handed to SQLAlchemy; there is no string-built SQL anywhere (the only `text()` statements are the fixed-column migrations). A value like `1;DROP TABLE stix_objects;--` is stored verbatim as a value. |
+| Command / code execution | The process has no `subprocess`, `os.system`, `eval`, `exec`, `pickle` or `yaml.load` path; the loader uses `yaml.safe_load` for config only. `$(id)` / backticks in a cell are literal text. |
+| STIX-id / object forging | The id is **derived** from the value (slugged to `[A-Za-z0-9-]+`, or a `uuid5`), never taken from the file. A `stix_id`, `source`, `collection_id` or `revoked` column is not a recognized header and is ignored — imports are always `source='manual'` into the `collection` you pass as a form field (validated against the registry, `400` if unknown). |
+| XSS | Values are returned as JSON and rendered by the dashboard with `textContent`/`xmlEsc`; escaping happens at the render boundary, so `<script>` in a cell is displayed as text. |
+| Path traversal | The uploaded filename is used *only* to decide `.xlsx` vs CSV — the body is read into memory (`f.read()`); nothing is written to disk. |
+| Formula injection (CSV/Excel "CSV injection") | **Latent, not exploitable today**: the server never writes feed values back into a CSV/XLSX (there is no export endpoint; the dashboard's "Download sample" is a static template). If an export is ever added, prefix values starting with `= + - @`, tab or CR with `'`. |
+| Zip bomb / oversized body | `security.max_upload_bytes` (25 MB, enforced by Flask → `413`) and `security.max_import_rows` (50 000, with a truncation note) bound the work; `load_workbook(read_only=True, data_only=True)` streams rows and never evaluates formulas. |
+| Error-text disclosure | A workbook that fails to parse returns `could not parse workbook` — the parser's own message stays in the server log. |
+
+Each successful import is logged with the object count, target collection and
+client IP (`Import via /feed/import-csv from …`).
 
 ## Intel Filter (filtering between server and Vision One)
 
@@ -1120,12 +1141,13 @@ group allow-lists, and session-cookie issuance on success).
 |---------|----------|
 | Response headers | Every response carries `Content-Security-Policy` (inline script/style allowed, everything else `'self'`), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy`, `Strict-Transport-Security`. |
 | Session cookie | `taxii2_ui_session` is `HttpOnly`, `SameSite=Lax`, `Secure`, signed (itsdangerous) and time-bounded (`ui.session_ttl`). |
-| Upload caps | `/feed/import-csv` bodies are capped at `security.max_upload_bytes` (25 MB → `413`) and parsed at most `security.max_import_rows` rows (50 000) before truncating with a note. |
+| Upload caps | `/feed/import-csv` bodies are capped at `security.max_upload_bytes` (25 MB → `413`) and parsed at most `security.max_import_rows` rows (50 000) before truncating with a note. A workbook that fails to parse returns a generic `400` (parser detail stays in the log), and `defusedxml` hardens openpyxl's XML parsing of untrusted `.xlsx`. |
 | Response caps | `/objects` accepts `?limit=` and never returns more than `security.max_objects_json` rows (50 000), reporting `"truncated": true` when it trims. |
 | Auth throttling | After `security.auth_fail_limit` (10) failed credentials from one client IP within `security.auth_fail_window` (300 s), further attempts get `429` + `Retry-After` without the credential being evaluated. Only requests that *present* a credential are counted, and a success clears the counter. |
 | Error bodies | 5xx responses return a generic message; driver/exception text goes to the server log only. |
 | CORS | `server.cors_origins` — pin it to your real origin(s). `'*'` reflects any origin (dev only; still no `Allow-Credentials`, so browser reads cannot use a session cookie). |
-| Input validation | All SQL goes through the ORM (no string-built SQL); STIX ids are shape-checked (`<type>--<id>`, type-prefix match); dashboard values are rendered with `textContent`/escaping; the SSO error page HTML-escapes caller input. |
+| Input validation | All SQL goes through the ORM (no string-built SQL); STIX ids are shape-checked (`<type>--<id>`, type-prefix match); uploaded/ingested values are stored as data (ids derived, never taken from input — see [upload sanitization](#sanitization--injection-behaviour-of-the-upload-field)); dashboard values are rendered with `textContent`/escaping; the SSO error page HTML-escapes caller input. |
+| Audit | Successful imports, deletes and revokes log the count/target plus the client IP (`CF-Connecting-IP`). |
 | Client IP | Throttling keys and log lines use `CF-Connecting-IP` (set by the Cloudflare tunnel) with `X-Forwarded-For`/`remote_addr` as fallback. |
 
 > **Upgrading from an older build:** writes used to accept plain TAXII
