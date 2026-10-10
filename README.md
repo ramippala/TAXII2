@@ -249,7 +249,10 @@ Use the top tabs to switch between **Feed**, **Community sources**, and
    feed and only **adds new rows + applies your edits** (value, type, labels,
    confidence). It never wipes, and checkboxes do **not** affect what is saved
    (they only drive *Purge selected*). Empty/invalid rows are skipped with a
-   warning instead of being written or blocking the rest.
+   warning instead of being written or blocking the rest. On success the
+   status line shows the result ("Saved N object(s)… including K new") and
+   the view jumps to the page holding the newest entry and briefly highlights
+   it, so you can see exactly what landed.
 4. **Purge selected** — deletes the entries you **tick** (across the whole
    feed, not just the visible page). Rows start unselected; select a few,
    click it, and only those are dropped. The per-row **×** deletes a single

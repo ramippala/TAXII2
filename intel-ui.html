@@ -73,6 +73,9 @@
   .revbtn:disabled { opacity: .5; cursor: default; }
   .reason { color: var(--muted); font-size: 12px; }
   .mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13px; }
+  /* brief highlight for a freshly-saved row so the user sees it landed */
+  tr.flash td { animation: rowFlash 1.8s ease-out; }
+  @keyframes rowFlash { 0% { background: rgba(63,185,80,.30); } 100% { background: transparent; } }
   .msg { padding: 10px 12px; border-radius: 6px; font-size: 14px; margin-top: 12px; display: none; white-space: pre-wrap; }
   .msg.ok { display: block; background: rgba(63,185,80,.12); border: 1px solid rgba(63,185,80,.4); color: var(--ok); }
   .msg.err { display: block; background: rgba(248,81,73,.12); border: 1px solid rgba(248,81,73,.4); color: var(--err); }
@@ -750,7 +753,27 @@ function updateChkAll() {
 }
 function setFeedPage(p) { feedPage = p; renderFeed(); }
 
-async function loadFeed() {
+// Which 1-based page holds a given STIX id under the current (cleared) filter?
+function feedPageOfId(id) {
+  const filtered = filteredData();
+  const i = filtered.findIndex(o => o.id === id);
+  if (i < 0) return 1;
+  return Math.floor(i / FEED_PAGE_SIZE) + 1;
+}
+
+// Briefly highlight a freshly-saved row (matches after the reload).
+function flashRow(id) {
+  if (!id) return;
+  const esc = (window.CSS && CSS.escape) ? CSS.escape(id) : id;
+  const tr = document.querySelector(`#tbody tr[data-id="${esc}"]`);
+  if (!tr) return;
+  tr.classList.add("flash");
+  if (typeof tr.scrollIntoView === "function") tr.scrollIntoView({ block: "center" });
+  setTimeout(() => tr.classList.remove("flash"), 1800);
+}
+
+async function loadFeed(opts) {
+  opts = opts || {};
   try {
     const r = await api("/objects");
     if (r.status !== 200) {
@@ -767,12 +790,15 @@ async function loadFeed() {
     }));
     newRows = [];
     feedFilter = { q: "", type: "", status: "" };
-    feedPage = 1;
+    // Default to page 1 — but let a caller (e.g. Save) land on a specific page.
+    feedPage = opts.page || 1;
     $("feedSearch").value = "";
     $("feedType").value = "";
     $("feedStatus").value = "";
     renderFeed();
     renderWithheld(objects);
+    if (opts.highlightId) flashRow(opts.highlightId);
+    if (opts.silent) return; // a caller is about to set its own status message
     const wh = r.body.withheld_count || 0;
     showMsg(
       `Loaded ${r.body.count} object(s): ${r.body.served_count} served to Vision One, ` +
@@ -828,6 +854,8 @@ async function save() {
   // affect saving — they only drive "Purge selected". Invalid / empty rows
   // are skipped (and reported) rather than written or blocking the rest, so a
   // half-typed scratch row can't stop a save or get written as garbage.
+  // Flush any still-focused input first so its last-typed value can't be lost.
+  if (document.activeElement && typeof document.activeElement.blur === "function") document.activeElement.blur();
   const all = feedData.concat(newRows).map(o => ({
     id: o.id, type: o.type, value: o.value,
     labels: o.labels || [], confidence: o.confidence ?? 0, name: o.name || null,
@@ -856,11 +884,18 @@ async function save() {
     const r = await api("/feed/ingest", { method: "POST", body: JSON.stringify({ stix_objects, mode: "merge" }) });
     if (r.status === 200) {
       let text = `Saved ${good.length} object(s) (merge — nothing wiped)`;
-      const nNew = good.filter(r => r.isNew).length;
-      if (nNew) text += `, including ${nNew} new`;
+      const newIds = good.filter(r => r.isNew).map(r => r.id);
+      if (newIds.length) text += `, including ${newIds.length} new`;
       if (skipped.length) text += `. Skipped ${skipped.length}: ${skipped.join("; ")}`;
+      // Reload silently so the "Saved…" result stays visible, and jump to the
+      // page holding the newest row (with a highlight) so it's not off-screen.
+      const lastId = newIds.length ? newIds[newIds.length - 1] : null;
+      await loadFeed({
+        silent: true,
+        highlightId: lastId,
+        page: lastId ? feedPageOfId(lastId) : 1,
+      });
       showMsg(text + ".", skipped.length ? false : true);
-      await loadFeed();
     } else {
       showMsg(`Save failed (HTTP ${r.status}): ${r.body && r.body.error || "unknown error"}`, false);
     }
