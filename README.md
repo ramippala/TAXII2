@@ -232,6 +232,9 @@ Use the top tabs to switch between **Feed**, **Community sources**, and
    - **Type / Status filters** — narrow to one type and/or active/revoked.
    - **Pagination** — 15 rows per page (first/prev/next/last) so a large
      feed never runs the page down.
+   - **Select** — tick the checkbox(es) of the rows to drop; the header
+     checkbox selects/deselects every *matching* row (all pages), and the
+     "N selected" counter tracks the selection.
    All of this is **client-side**: the full feed loads once and is filtered +
    paged in the browser (no server round-trips, works offline). Edits and
    deletes write back to the in-memory model, so nothing is lost across page
@@ -276,7 +279,10 @@ Use the top tabs to switch between **Feed**, **Community sources**, and
 
 The UI is a single self-contained `intel-ui.html` (no CDN/JS dependencies,
 works offline), served directly by the Flask app. The browser talks to the
-server over same-origin requests carrying the session cookie.
+server over same-origin requests carrying the session cookie. Destructive
+actions (*Purge selected*, *Purge all*) confirm through a custom,
+theme-matched modal (Esc / backdrop / Cancel = abort, Enter / button =
+proceed) instead of the browser's native dialog.
 
 ## SSO — Microsoft Entra ID (Azure AD) sign-in
 

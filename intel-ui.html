@@ -112,6 +112,22 @@
   .tab.active { background: var(--panel); color: var(--text); }
   section[data-page] { display: none; }
   section[data-page].active { display: block; }
+  /* confirmation modal (replaces the native confirm()) */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(4, 8, 12, .72);
+    display: none; align-items: center; justify-content: center; z-index: 1000;
+  }
+  .modal-overlay.show { display: flex; animation: modalFade .12s ease-out; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px 22px; width: 100%; max-width: 440px; margin: 16px;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, .55); animation: modalPop .14s ease-out;
+  }
+  .modal h3 { margin: 0 0 8px; font-size: 16px; }
+  .modal .modal-msg { color: var(--muted); font-size: 14px; white-space: pre-wrap; word-break: break-word; margin-bottom: 18px; }
+  .modal .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
+  @keyframes modalFade { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes modalPop { from { transform: scale(.96) translateY(6px); opacity: 0; } to { transform: none; opacity: 1; } }
 </style>
 </head>
 <body>
@@ -297,6 +313,18 @@
     </div>
 
     </section>
+  </div>
+
+  <!-- Confirmation modal (custom, styled — replaces the native confirm()) -->
+  <div class="modal-overlay" id="modalOverlay" aria-hidden="true">
+    <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="modalTitle">
+      <h3 id="modalTitle">Confirm</h3>
+      <div class="modal-msg" id="modalMsg"></div>
+      <div class="modal-actions">
+        <button id="modalCancel" class="ghost">Cancel</button>
+        <button id="modalOk">Confirm</button>
+      </div>
+    </div>
   </div>
 
 <script>
@@ -845,7 +873,11 @@ async function purgeSelected() {
   // Explicit removal: delete every row that is SELECTED (all pages/filters).
   const selected = feedData.filter(o => o.checked).map(o => o.id);
   if (!selected.length) { showMsg("Nothing to purge — no rows are selected.", false); return; }
-  if (!confirm(`Purge ${selected.length} selected entr${selected.length === 1 ? "y" : "ies"} from the feed (all pages)?`)) return;
+  if (!await showConfirm(
+      "Purge selected",
+      `Purge ${selected.length} selected entr${selected.length === 1 ? "y" : "ies"} from the feed (all pages, every source)? This cannot be undone.`,
+      { danger: true, okLabel: `Purge ${selected.length}` }
+  )) return;
   try {
     const r = await api("/feed/delete", { method: "POST", body: JSON.stringify({ ids: selected }) });
     if (r.status === 200) {
@@ -860,7 +892,11 @@ async function purgeSelected() {
 }
 
 async function purge() {
-  if (!confirm("Purge ALL intel from the feed (memory + database)?")) return;
+  if (!await showConfirm(
+      "Purge all",
+      "Purge ALL intel from the feed (memory + database), including community entries from pullers? This cannot be undone.",
+      { danger: true, okLabel: "Purge all" }
+  )) return;
   try {
     const r = await api("/feed/purge", { method: "DELETE" });
     if (r.status === 200) {
@@ -1053,6 +1089,41 @@ async function pullNow(name, btn, result) {
 // ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
+
+// Custom styled confirmation dialog (replaces the native confirm()).
+// Returns a Promise<boolean>: resolves true on "Confirm", false on Cancel /
+// Esc / backdrop click. `danger` paints the confirm button red.
+function showConfirm(title, message, { danger = false, okLabel = "Confirm", cancelLabel = "Cancel" } = {}) {
+  const overlay = $("modalOverlay");
+  $("modalTitle").textContent = title;
+  $("modalMsg").textContent = message;
+  const okBtn = $("modalOk");
+  okBtn.textContent = okLabel;
+  okBtn.className = danger ? "danger" : "";
+  $("modalCancel").textContent = cancelLabel;
+  overlay.classList.add("show");
+  overlay.setAttribute("aria-hidden", "false");
+  okBtn.focus();
+
+  return new Promise((resolve) => {
+    let done = false;
+    const close = (val) => {
+      if (done) return; done = true;
+      overlay.classList.remove("show");
+      overlay.setAttribute("aria-hidden", "true");
+      document.removeEventListener("keydown", onKey, true);
+      resolve(val);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") close(false);
+      else if (e.key === "Enter") close(true);
+    };
+    okBtn.onclick = () => close(true);
+    $("modalCancel").onclick = () => close(false);
+    overlay.onclick = (e) => { if (e.target === overlay) close(false); };
+    document.addEventListener("keydown", onKey, true);
+  });
+}
 
 $("chkAll").addEventListener("change", (e) => {
   const v = e.target.checked;
