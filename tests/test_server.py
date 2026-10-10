@@ -128,6 +128,12 @@ class TestTaxiiServer(unittest.TestCase):
             'username': 'test_taxii_user',
             'password': 'test_taxii_pass',
         }
+        # Feed-wide writes (purge-all / delete / revoke / community pull) need
+        # an admin principal; stand one in for the legacy global override.
+        app.config['TAXII_ADMIN_AUTH'] = {
+            'username': 'test_taxii_user',
+            'password': 'test_taxii_pass',
+        }
         self.test_auth_headers = {
             'X-Taxii-Username': 'test_taxii_user',
             'X-Taxii-Password': 'test_taxii_pass',
@@ -710,7 +716,10 @@ class TestTaxiiServer(unittest.TestCase):
         self.assertEqual(stix['type'], 'ipv4-addr')
         self.assertEqual(stix['id'], 'ipv4-addr--203-0-113-7')
         self.assertEqual(stix['object']['ipv4-addr']['value'], '203.0.113.7')
-        self.assertIn('otx', stix['labels'])
+        # The pulse name is the provenance label; the `otx` source tag is not
+        # duplicated as a label.
+        self.assertIn('TestPulse', stix['labels'])
+        self.assertNotIn('otx', stix['labels'])
         self.assertEqual(stix['confidence'], 70)
 
     def test_otx_indicator_mapping_domain(self):
@@ -1030,6 +1039,11 @@ class TestRevocationAndTTL(unittest.TestCase):
             'username': 'test_taxii_user',
             'password': 'test_taxii_pass',
         }
+        # Revoke is a feed-wide write: needs the admin principal in tests.
+        app.config['TAXII_ADMIN_AUTH'] = {
+            'username': 'test_taxii_user',
+            'password': 'test_taxii_pass',
+        }
         self.auth = {
             'X-Taxii-Username': 'test_taxii_user',
             'X-Taxii-Password': 'test_taxii_pass',
@@ -1195,6 +1209,11 @@ class TestCsvImport(unittest.TestCase):
         self.client = app.test_client()
         _reset_db()
         app.config['TAXII_AUTH'] = {
+            'username': 'test_taxii_user',
+            'password': 'test_taxii_pass',
+        }
+        # Import is a write: needs the admin principal in tests.
+        app.config['TAXII_ADMIN_AUTH'] = {
             'username': 'test_taxii_user',
             'password': 'test_taxii_pass',
         }
@@ -1529,6 +1548,10 @@ class TestSaveAndDelete(unittest.TestCase):
         app.config['TAXII_AUTH'] = {
             'username': 'test_taxii_user', 'password': 'test_taxii_pass',
         }
+        # /feed/delete is a feed-wide write: needs the admin principal.
+        app.config['TAXII_ADMIN_AUTH'] = {
+            'username': 'test_taxii_user', 'password': 'test_taxii_pass',
+        }
         self.auth = {
             'X-Taxii-Username': 'test_taxii_user',
             'X-Taxii-Password': 'test_taxii_pass',
@@ -1621,6 +1644,11 @@ class TestExtendedTypesAndValidation(unittest.TestCase):
         self.client = app.test_client()
         _reset_db()
         app.config['TAXII_AUTH'] = {
+            'username': 'test_taxii_user',
+            'password': 'test_taxii_pass',
+        }
+        # Ingest is a write: needs the admin principal in tests.
+        app.config['TAXII_ADMIN_AUTH'] = {
             'username': 'test_taxii_user',
             'password': 'test_taxii_pass',
         }
@@ -1812,6 +1840,8 @@ class TestCommunitySdoAndFidelity(unittest.TestCase):
         self.client = app.test_client()
         _reset_db()
         app.config['TAXII_AUTH'] = {'username': 'u', 'password': 'p'}
+        # Ingest is a write: needs the admin principal in tests.
+        app.config['TAXII_ADMIN_AUTH'] = {'username': 'u', 'password': 'p'}
         self.auth = {'X-Taxii-Username': 'u', 'X-Taxii-Password': 'p'}
 
     def _served(self):
@@ -1885,6 +1915,11 @@ class TestTaxiiPagination(unittest.TestCase):
         self.client = app.test_client()
         _reset_db()
         app.config['TAXII_AUTH'] = {
+            'username': 'test_taxii_user',
+            'password': 'test_taxii_pass',
+        }
+        # Ingest is a write: needs the admin principal in tests.
+        app.config['TAXII_ADMIN_AUTH'] = {
             'username': 'test_taxii_user',
             'password': 'test_taxii_pass',
         }
@@ -2035,6 +2070,11 @@ class TestXlsxImport(unittest.TestCase):
         self.client = app.test_client()
         _reset_db()
         app.config['TAXII_AUTH'] = {
+            'username': 'test_taxii_user',
+            'password': 'test_taxii_pass',
+        }
+        # Import is a write: needs the admin principal in tests.
+        app.config['TAXII_ADMIN_AUTH'] = {
             'username': 'test_taxii_user',
             'password': 'test_taxii_pass',
         }
@@ -2194,6 +2234,8 @@ class TestPullLimit(unittest.TestCase):
         self.client = app.test_client()
         _reset_db()
         app.config['TAXII_AUTH'] = {'username': 'u', 'password': 'p'}
+        # Community pull is a feed-wide write: needs the admin principal.
+        app.config['TAXII_ADMIN_AUTH'] = {'username': 'u', 'password': 'p'}
         self.auth = {'X-Taxii-Username': 'u', 'X-Taxii-Password': 'p'}
 
     def test_fetch_objects_honors_limit(self):
@@ -2259,18 +2301,47 @@ class TestCollectionsRbac(unittest.TestCase):
         _server.TAXII_COLLECTION_TITLE = 'Alpha Feed'
         # NO global credential override: only per-collection creds exist.
         app.config['TAXII_AUTH'] = {'username': '', 'password': ''}
+        # Writes are the dashboard/admin's job; these creds stand in for it.
+        app.config['TAXII_ADMIN_AUTH'] = {'username': 'admin', 'password': 'admin'}
+        self.admin_auth = {'X-Taxii-Username': 'admin', 'X-Taxii-Password': 'admin'}
         self.auth_a = {'X-Taxii-Username': 'a_user', 'X-Taxii-Password': 'a_pass'}
         self.auth_b = {'X-Taxii-Username': 'b_user', 'X-Taxii-Password': 'b_pass'}
 
     def tearDown(self):
         for k, v in self._saved.items():
             setattr(_server, k, v)
+        app.config.pop('TAXII_ADMIN_AUTH', None)
 
-    def _ingest(self, objs, collection, auth):
+    def _ingest(self, objs, collection, auth=None):
+        # Ingest targets a collection but is still a write: the read-only
+        # collection credentials cannot do it, the admin principal can.
         return self.client.post(
             '/feed/ingest',
             json={'stix_objects': objs, 'collection': collection},
-            headers=auth)
+            headers=self.admin_auth)
+
+    def test_collection_credentials_are_read_only(self):
+        """A consumer credential can read, never write."""
+        r = self._ingest([_manual_obj('1.1.1.1')], 'alpha')
+        self.assertEqual(r.status_code, 200)
+        # ... but the SAME principal cannot ingest its own collection ...
+        r = self.client.post(
+            '/feed/ingest',
+            json={'stix_objects': [_manual_obj('9.9.9.9')], 'collection': 'alpha'},
+            headers=self.auth_a)
+        self.assertEqual(r.status_code, 401)
+        # ... nor purge it, revoke, or trigger a community pull.
+        r = self.client.delete('/feed/purge?collection=alpha', headers=self.auth_a)
+        self.assertEqual(r.status_code, 401)
+        r = self.client.post('/objects/ipv4-addr--x/revoke', json={},
+                             headers=self.auth_a)
+        self.assertEqual(r.status_code, 401)
+        r = self.client.post('/community/pull/otx', headers=self.auth_a)
+        self.assertEqual(r.status_code, 401)
+        # The read it IS allowed to do still works.
+        r = self.client.get('/taxii2/collections/alpha/objects/',
+                            headers=self.auth_a)
+        self.assertEqual(r.status_code, 200)
 
     def test_each_principal_sees_only_its_collection(self):
         self._ingest([_manual_obj('1.1.1.1')], 'alpha', self.auth_a)
@@ -2337,7 +2408,7 @@ class TestCollectionsRbac(unittest.TestCase):
             '/feed/ingest',
             json={'stix_objects': [_manual_obj('9.9.9.9')],
                   'collection': 'beta', 'mode': 'replace'},
-            headers=self.auth_b)
+            headers=self.admin_auth)
         self.assertEqual(r.status_code, 200)
         r = self.client.get('/objects', headers=self.auth_a)
         self.assertEqual({o['value'] for o in r.get_json()['objects']},
@@ -2350,7 +2421,7 @@ class TestCollectionsRbac(unittest.TestCase):
         self._ingest([_manual_obj('1.1.1.1')], 'alpha', self.auth_a)
         self._ingest([_manual_obj('2.2.2.2')], 'beta', self.auth_b)
         r = self.client.delete('/feed/purge?collection=beta',
-                               headers=self.auth_b)
+                               headers=self.admin_auth)
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.get_json()['purged'], 1)
         r = self.client.get('/objects', headers=self.auth_a)
@@ -2374,6 +2445,187 @@ class TestCollectionsRbac(unittest.TestCase):
         self.assertEqual(r.get_json()['meta']['count'], 1)
         r = self.client.get('/objects', headers=self.auth_a)
         self.assertEqual(r.get_json()['count'], 1)
+
+
+class TestSecurityHardening(unittest.TestCase):
+    """Response headers, cookie flags, upload guards and auth throttling."""
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        app.config['TAXII_AUTH'] = {'username': 'u', 'password': 'p'}
+        app.config['TAXII_ADMIN_AUTH'] = {'username': 'u', 'password': 'p'}
+        self.auth = {'X-Taxii-Username': 'u', 'X-Taxii-Password': 'p'}
+        self._ui_saved = (_server._ui_username, _server._ui_password)
+        _server._auth_failures.clear()
+
+    def tearDown(self):
+        app.config.pop('TAXII_ADMIN_AUTH', None)
+        _server._ui_username, _server._ui_password = self._ui_saved
+        _server._auth_failures.clear()
+        _server._AUTH_FAIL_LIMIT = 10
+
+    def test_security_headers_on_every_response(self):
+        for path in ('/', '/health'):
+            r = self.client.get(path)
+            self.assertEqual(r.status_code, 200)
+            for header in ('Content-Security-Policy', 'X-Frame-Options',
+                           'X-Content-Type-Options', 'Referrer-Policy',
+                           'Permissions-Policy', 'Strict-Transport-Security'):
+                self.assertIn(header, r.headers, f'{header} missing on {path}')
+            self.assertEqual(r.headers['X-Frame-Options'], 'DENY')
+            self.assertEqual(r.headers['X-Content-Type-Options'], 'nosniff')
+            self.assertIn("frame-ancestors 'none'",
+                          r.headers['Content-Security-Policy'])
+
+    def test_login_cookie_is_hardened(self):
+        _server._ui_username, _server._ui_password = 'ui', 'pw'
+        r = self.client.post('/ui/login',
+                             json={'username': 'ui', 'password': 'pw'})
+        self.assertEqual(r.status_code, 200)
+        cookie = r.headers.get('Set-Cookie', '')
+        self.assertIn('HttpOnly', cookie)
+        self.assertIn('Secure', cookie)
+        self.assertIn('SameSite=Lax', cookie)
+
+    def test_upload_over_cap_is_413(self):
+        original = app.config['MAX_CONTENT_LENGTH']
+        app.config['MAX_CONTENT_LENGTH'] = 1024
+        try:
+            big = b'ip\n' + b'1.2.3.4\n' * 500
+            r = self.client.post(
+                '/feed/import-csv',
+                data={'file': (io.BytesIO(big), 'big.csv')},
+                headers=self.auth)
+            self.assertEqual(r.status_code, 413)
+        finally:
+            app.config['MAX_CONTENT_LENGTH'] = original
+
+    def test_bad_workbook_returns_400_without_internals(self):
+        r = self.client.post(
+            '/feed/import-csv',
+            data={'file': (io.BytesIO(b'not really a zip'), 'x.xlsx')},
+            headers=self.auth)
+        self.assertEqual(r.status_code, 400)
+        body = r.get_data(as_text=True)
+        for leak in ('Traceback', 'zipfile', 'openpyxl', '/app/', 'BadZipFile',
+                     'not a zip', 'not really a zip'):
+            self.assertNotIn(leak, body)
+
+    def test_hostile_csv_values_are_stored_inert(self):
+        """Formula / script / SQLi / traversal values are data, not code."""
+        payload = (
+            'ip,domain,indicator,label\n'
+            '1.1.1.1,evil.example,=cmd|\' /C calc\'!A0,=HYPERLINK("http://x")\n'
+            '2.2.2.2,evil2.example,<script>alert(1)</script>,x\n'
+            '3.3.3.3,evil3.example,1;DROP TABLE stix_objects;--,y\n'
+            '4.4.4.4,evil4.example,../../../../etc/passwd,z\n'
+        )
+        r = self.client.post(
+            '/feed/import-csv',
+            data={'file': (io.BytesIO(payload.encode()), 'hostile.csv')},
+            headers=self.auth)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()['imported'], 12)
+        # Nothing executed: the table is intact and every value round-trips
+        # verbatim as data...
+        served = self.client.get(
+            '/taxii2/collections/threat-intel/objects/',
+            headers=self.auth).get_json()['content']['content']['objects']
+        values = {served_value(o) for o in served}
+        for literal in ("=cmd|' /C calc'!A0", '<script>alert(1)</script>',
+                        '1;DROP TABLE stix_objects;--', '../../../../etc/passwd'):
+            self.assertIn(literal, values)
+        # ... and the dashboard JSON keeps the feed served, not dropped.
+        self.assertEqual(self.client.get('/objects', headers=self.auth
+                                         ).get_json()['count'], 12)
+
+    def test_hostile_csv_headers_cannot_set_privileged_fields(self):
+        """Columns named source/collection_id/stix_id/revoked are ignored."""
+        payload = ('source,collection_id,stix_id,revoked,value\n'
+                   'otx,premium,ipv4-addr--9-9-9-9,true,9.9.9.9\n')
+        r = self.client.post(
+            '/feed/import-csv',
+            data={'file': (io.BytesIO(payload.encode()), 'h.csv')},
+            headers=self.auth)
+        self.assertEqual(r.status_code, 200)
+        obj = self.client.get('/objects', headers=self.auth).get_json()['objects'][0]
+        self.assertEqual(obj['value'], '9.9.9.9')
+        self.assertEqual(obj['source'], 'manual')       # not 'otx'
+        # a 'value:' column is a free-text indicator; the caller's stix_id
+        # and collection_id columns carry no authority at all
+        self.assertEqual(obj['id'], 'indicator--9-9-9-9')
+        self.assertNotEqual(obj['id'], 'ipv4-addr--9-9-9-9')
+        self.assertFalse(obj['revoked'])
+
+    def test_xlsx_zip_bomb_is_bounded(self):
+        """A highly compressible workbook stops at max_import_rows."""
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+            z.writestr('xl/worksheets/sheet1.xml', '<!-- pad -->' * 200000)
+        r = self.client.post(
+            '/feed/import-csv',
+            data={'file': (io.BytesIO(buf.getvalue()), 'bomb.xlsx')},
+            headers=self.auth)
+        # Either rejected outright (400) or truncated — never unbounded/OOM.
+        self.assertIn(r.status_code, (400, 200))
+
+    def test_objects_limit_and_truncation_flag(self):
+        self.client.post('/feed/ingest', json={'stix_objects': [
+            _manual_obj(f'203.0.113.{i}') for i in range(1, 6)]},
+            headers=self.auth)
+        d = self.client.get('/objects?limit=2', headers=self.auth).get_json()
+        self.assertEqual(d['count'], 2)
+        self.assertTrue(d['truncated'])
+        d = self.client.get('/objects', headers=self.auth).get_json()
+        self.assertEqual(d['count'], 5)
+        self.assertFalse(d['truncated'])
+        self.assertEqual(
+            self.client.get('/objects?limit=0', headers=self.auth).status_code,
+            400)
+
+    def test_repeated_credentialed_failures_are_throttled(self):
+        _server._AUTH_FAIL_LIMIT = 3
+        bad = {'X-Taxii-Username': 'u', 'X-Taxii-Password': 'wrong'}
+        codes = [self.client.get('/objects', headers=bad).status_code
+                 for _ in range(4)]
+        self.assertEqual(codes, [401, 401, 401, 429])
+        # while throttled the credential is not even evaluated
+        self.assertEqual(
+            self.client.get('/objects', headers=self.auth).status_code, 429)
+        _server._auth_failures.clear()
+        self.assertEqual(
+            self.client.get('/objects', headers=self.auth).status_code, 200)
+
+    def test_anonymous_401s_are_not_counted(self):
+        for _ in range(12):
+            self.assertEqual(self.client.get('/objects').status_code, 401)
+        self.assertEqual(_server._auth_failures, {})
+
+    def test_sso_error_page_escapes_caller_input(self):
+        with app.test_request_context('/ui/sso/callback'):
+            resp = _server._ui_sso_fail(
+                'Microsoft returned an error: <script>alert(1)</script>')
+            body = resp.get_data(as_text=True)
+        self.assertNotIn('<script>', body)
+        self.assertIn('&lt;script&gt;', body)
+
+    def test_unknown_collection_needs_credentials_to_be_distinguishable(self):
+        # Unauthenticated: 401 whether or not the collection exists (no oracle).
+        self.assertEqual(
+            self.client.get('/taxii2/collections/nope/objects/').status_code,
+            401)
+        self.assertEqual(
+            self.client.get('/taxii2/collections/threat-intel/objects/'
+                            ).status_code, 401)
+        # Authenticated: a real collection resolves, an unknown one 404s.
+        self.assertEqual(
+            self.client.get('/taxii2/collections/nope/objects/',
+                            headers=self.auth).status_code, 404)
+        self.assertEqual(
+            self.client.get('/taxii2/collections/threat-intel/objects/',
+                            headers=self.auth).status_code, 200)
 
 
 class _FakeJwkClient:
