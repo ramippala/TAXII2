@@ -202,6 +202,60 @@ taxii_pullers: []
 The server starts on `http://0.0.0.0:5000` by default. Pollers only start
 when their `enabled` flag is `true` and a real `base_url` is configured.
 
+### Run with Docker (app + PostgreSQL + optional Cloudflare Tunnel)
+
+A `Dockerfile` and `docker-compose.yml` are included: the app, a PostgreSQL
+service, and an optional `cloudflared` tunnel. Secrets are **not** baked into
+the image (`.dockerignore` excludes `.env`); the app container runs
+unprivileged, PostgreSQL is not published to the host, and both services have
+healthchecks.
+
+```bash
+# 1. Provide config/secrets in .env (see .env.example):
+#    FLASK_SECRET, TAXII_AUTH_USER/PASSWORD, UI_AUTH_USER/PASSWORD,
+#    POSTGRES_USER/PASSWORD/DB, and (for the tunnel) CLOUDFLARE_TUNNEL_TOKEN.
+# 2. Build + start the app and database:
+docker compose up -d --build
+
+# App:  http://127.0.0.1:5000/ (loopback only; TAXII at /taxii2/)
+```
+
+Compose injects only the variables the app needs (the DB URL is built from
+`POSTGRES_*` and pointed at the `postgres` service) — the tunnel token is
+never passed to the app container.
+
+**Cloudflare Tunnel (optional).** The `cloudflared` service is behind the
+`tunnel` profile so the stack runs before the token exists:
+
+```bash
+CLOUDFLARE_TUNNEL_TOKEN=<token>   # in .env (Zero Trust → Networks → Tunnels
+                                  # → your tunnel → the value after --token)
+docker compose --profile tunnel up -d
+```
+
+With a **token-based (remotely managed)** tunnel the ingress rules live in the
+Cloudflare Zero Trust dashboard, not in a local config: add a **Public
+hostname** whose service/origin is `http://taxii:5000`. If the token is empty,
+the connector exits on start (see `docker compose logs cloudflared`) — the app
+and database are unaffected either way.
+
+Adding the tunnel to an already-running stack is enough — Compose starts only
+the missing service:
+
+```bash
+docker compose --profile tunnel up -d   # adds cloudflared alongside app + db
+```
+
+```bash
+docker compose logs -f cloudflared     # connector health
+docker compose down                    # stop (keeps the pgdata volume)
+docker compose down -v                 # stop and delete the database volume
+```
+
+> The image installs `psycopg2-binary` so it can talk to the bundled
+> PostgreSQL; the app is still a single process (`python server.py`) so the
+> background pollers and TTL sweeper run as designed.
+
 ## Feeding Intel: Web UI (login → dashboard)
 
 Start the server and open **`http://localhost:5000/`** (or `/ui`) in a

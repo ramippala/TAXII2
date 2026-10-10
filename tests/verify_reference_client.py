@@ -51,13 +51,17 @@ def check(label, ok, detail=''):
 
 
 def envelope(msg):
-    """taxii2client returns the full TAXII message envelope; unwrap safely."""
-    return msg if (isinstance(msg, dict) and 'content' in msg) else {
-        'object': 'message', 'content': {'content': msg}}
+    """Return the response as-is when it is a TAXII message envelope OR an
+    OTX-style bare bundle; only wrap anything else."""
+    if isinstance(msg, dict) and ('content' in msg or msg.get('type') == 'bundle'):
+        return msg
+    return {'object': 'message', 'content': {'content': msg}}
 
 
 def objects(msg):
     env = envelope(msg)
+    if env.get('type') == 'bundle':          # OTX-style bare bundle
+        return env.get('objects', [])
     inner = (env.get('content') or {}).get('content') or {}
     if isinstance(inner, dict) and 'objects' in inner:
         return inner['objects']
@@ -85,27 +89,37 @@ def main():
     objs = objects(env)
     check('poll returns objects', bool(objs), f'{len(objs)} objects')
     if objs:
-        check('STIX 2.1 envelope',
-              env.get('object') == 'message'
-              and (env.get('content') or {}).get('object') == 'content'
-              and isinstance(env.get('more'), bool))
+        # The server may return the spec TAXII envelope or (config
+        # taxii.objects_shape: bundle) the OTX-style bare bundle.
+        envelope_ok = (env.get('object') == 'message'
+                       and (env.get('content') or {}).get('object') == 'content')
+        bundle_ok = (env.get('type') == 'bundle' and 'objects' in env)
+        check('response shape (spec envelope or OTX-style bundle)',
+              envelope_ok or bundle_ok,
+              'envelope' if envelope_ok else ('bundle' if bundle_ok else 'unexpected'))
         check('objects carry id/type/spec_version',
               all(all(k in o for k in ('id', 'type', 'spec_version')) for o in objs))
         check('spec_version is 2.1',
               all(o.get('spec_version') == '2.1' for o in objs))
+        check('served objects are STIX 2.1 indicators (validated shape)',
+              all(o.get('type') == 'indicator' and o.get('pattern') and o.get('valid_from')
+                  for o in objs),
+              f"{sum(1 for o in objs if o.get('type') == 'indicator')}/{len(objs)} indicators")
 
     print('== Filters (spec 5.3) ==')
     one_type = objects(coll.get_objects(type='domain-name'))
-    check('match[type] single', all(o['type'] == 'domain-name' for o in one_type),
-          f'{len(one_type)} domain-name')
+    check('match[type] single',
+          all('[domain-name:value' in (o.get('pattern') or '') for o in one_type),
+          f'{len(one_type)} domain-name indicators')
     ids = [o['id'] for o in objs[:2]]
     if len(ids) == 2:
         both = objects(coll.get_objects(id=ids))
         check('match[id] comma-separated list', len(both) == 2, f'{len(both)} of 2 ids')
     two = objects(coll.get_objects(type=['domain-name', 'ipv4-addr']))
     check('match[type] comma-separated list',
-          all(o['type'] in ('domain-name', 'ipv4-addr') for o in two),
-          f'{len(two)} objects')
+          all(any(k in (o.get('pattern') or '')
+                  for k in ('[domain-name:', '[ipv4-addr:')) for o in two),
+          f'{len(two)} indicators')
     delta = objects(coll.get_objects(added_after='2999-01-01T00:00:00Z'))
     check('added_after (future) is empty', len(delta) == 0, f'{len(delta)}')
 

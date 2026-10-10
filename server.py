@@ -1403,6 +1403,12 @@ def purge_all(collection: Optional[str] = None) -> int:
 
 TAXII_CFG = CONFIG.get('taxii', {}) or {}
 DEFAULT_COLLECTION_ID = 'threat-intel'
+# Get Objects response shape:
+#   'envelope' (default) — the TAXII 2.1 Message Resource (spec §5.3).
+#   'bundle'             — OTX-compatible: the STIX bundle at the top level
+#                          with more/next, no envelope. Some consumers (the
+#                          OTX feed Vision One ingests) use this shape.
+TAXII_OBJECTS_SHAPE = str(TAXII_CFG.get('objects_shape') or 'envelope').lower()
 
 
 @dataclass
@@ -1478,8 +1484,122 @@ _HASH_KEY_BY_ALGO = {
 }
 
 
+# Stored types that carry a single IOC value (rendered as an indicator).
+_IOC_STORED_TYPES = frozenset({
+    'ipv4-addr', 'domain-name', 'file-hash', 'indicator',
+    'url', 'email-addr', 'ipv6-addr', 'mac-addr',
+    'windows-registry-key', 'autonomous-system',
+})
+
+
+def _ioc_value(obj: ThreatIntel) -> Optional[str]:
+    """The single value an IOC object carries (or None)."""
+    return (obj.ip_address or obj.domain or obj.hash_value or obj.value
+            or obj.name or None)
+
+
+def _ioc_pattern(obj: ThreatIntel) -> Optional[str]:
+    """A STIX 2.1 pattern string for an IOC object, or None if none applies."""
+    if obj.object_type == 'file-hash' and obj.hash_value:
+        algo = (obj.labels[0] if obj.labels else 'sha256').lower()
+        key = _HASH_KEY_BY_ALGO.get(algo, 'SHA-256')
+        return f"[file:hashes.'{key}' = '{obj.hash_value}']"
+    if obj.object_type == 'windows-registry-key' and obj.value:
+        return f"[windows-registry-key:key = '{obj.value}']"
+    if obj.object_type == 'autonomous-system' and obj.value:
+        return f"[autonomous-system:number = '{obj.value}']"
+    value = _ioc_value(obj)
+    if not value:
+        return None
+    fixed = {
+        'ipv4-addr': '[ipv4-addr:value = ',
+        'domain-name': '[domain-name:value = ',
+        'url': '[url:value = ',
+        'email-addr': '[email-addr:value = ',
+        'ipv6-addr': '[ipv6-addr:value = ',
+        'mac-addr': '[mac-addr:value = ',
+    }.get(obj.object_type)
+    if fixed:
+        return f"{fixed}'{value}']"
+    # Free-form value: derive the pattern from the value's shape.
+    guessed, algo = _guess_object_type(str(value))
+    if guessed == 'ipv4-addr':
+        return f"[ipv4-addr:value = '{value}']"
+    if guessed == 'domain-name':
+        return f"[domain-name:value = '{value}']"
+    if guessed == 'file-hash':
+        key = _HASH_KEY_BY_ALGO.get(algo or 'sha256', 'SHA-256')
+        return f"[file:hashes.'{key}' = '{value}']"
+    if guessed == 'url':
+        return f"[url:value = '{value}']"
+    if guessed == 'email-addr':
+        return f"[email-addr:value = '{value}']"
+    if guessed == 'ipv6-addr':
+        return f"[ipv6-addr:value = '{value}']"
+    if guessed == 'mac-addr':
+        return f"[mac-addr:value = '{value}']"
+    if guessed == 'autonomous-system':
+        return f"[autonomous-system:number = '{value}']"
+    return None
+
+
+def _ioc_stix_object(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
+    """A spec-valid STIX 2.1 *indicator* for an IOC object.
+
+    Indicators are the shape a threat-intel consumer (Vision One / XDR) maps
+    into detections, and the only one that may legally carry ``revoked`` /
+    ``labels`` / ``confidence``. Free text no STIX pattern can express falls
+    back to the legacy ``x-ti-indicator`` extension object.
+    """
+    now = _stix_now()
+    pattern = _ioc_pattern(obj)
+    if not pattern:
+        value = _ioc_value(obj)
+        if not value:
+            return None
+        # Unrecognizable free text: community extension type (x- prefix).
+        return {
+            'spec_version': '2.1',
+            'type': 'x-ti-indicator',
+            'id': 'x-ti-indicator--' + uuid.uuid5(uuid.NAMESPACE_OID, value).hex,
+            'created': now,
+            'modified': now,
+            'value': value,
+            'labels': obj.labels or [],
+            'confidence': obj.confidence or 0,
+        }
+    out: Dict[str, Any] = {
+        'spec_version': '2.1',
+        'type': 'indicator',
+        'id': 'indicator--' + uuid.uuid5(uuid.NAMESPACE_OID, pattern).hex,
+        'created': now,
+        'modified': now,
+        'revoked': bool(obj.revoked),
+        'labels': obj.labels or [],
+        'confidence': obj.confidence or 0,
+        'pattern': pattern,
+        'pattern_type': 'stix',
+        'pattern_version': '2.1',
+        'valid_from': now,
+    }
+    if obj.name:
+        out['name'] = obj.name
+    if obj.description:
+        out['description'] = obj.description
+    return out
+
+
 def threat_intel_to_stix21(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
-    """Render a stored object as a standard STIX 2.1 object (JSON-able)."""
+    """Render a stored object as a standard STIX 2.1 object (JSON-able).
+
+    IOC values render as STIX 2.1 **indicators** (a ``pattern`` + ``valid_from``)
+    — the shape a threat-intel consumer (Vision One / XDR) maps into
+    Suspicious Object Management, and the only shape that can legally carry
+    ``revoked`` / ``labels`` / ``confidence``. (Serving raw SCOs with those
+    SDO-only fields is *invalid* STIX 2.1 and gets rejected by strict
+    consumers.) Non-IOC objects — malware / threat-actor / campaign /
+    relationship — render as their own SDO/SRO type.
+    """
     now = _stix_now()
     common = {
         'spec_version': '2.1',
@@ -1488,73 +1608,9 @@ def threat_intel_to_stix21(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
         'revoked': bool(obj.revoked),
     }
 
-    if obj.object_type == 'ipv4-addr' and obj.ip_address:
-        return {
-            **common,
-            'type': 'ipv4-addr',
-            'id': f"ipv4-addr--{obj.ip_address.replace('.', '-')}",
-            'value': obj.ip_address,
-            'labels': obj.labels or [],
-            'confidence': obj.confidence or 0,
-        }
-
-    if obj.object_type == 'domain-name' and obj.domain:
-        return {
-            **common,
-            'type': 'domain-name',
-            'id': f"domain-name--{obj.domain.replace('.', '-')}",
-            'value': obj.domain,
-            'labels': obj.labels or [],
-            'confidence': obj.confidence or 0,
-        }
-
-    if obj.object_type == 'file-hash' and obj.hash_value:
-        algo = (obj.labels[0] if obj.labels else 'sha256').lower()
-        return {
-            **common,
-            'type': 'file',
-            'id': 'file--' + uuid.uuid5(uuid.NAMESPACE_OID, obj.hash_value).hex,
-            'hashes': {_HASH_KEY_BY_ALGO.get(algo, 'SHA-256'): obj.hash_value},
-            'labels': obj.labels or [],
-            'confidence': obj.confidence or 0,
-        }
-
-    # Extra single-value SCOs (url / email-addr / ipv6-addr / mac-addr).
-    if obj.object_type in ('url', 'email-addr', 'ipv6-addr', 'mac-addr'):
-        if not obj.value:
-            return None
-        return {
-            **common,
-            'type': obj.object_type,
-            'id': obj.stix_id,
-            'value': obj.value,
-            'labels': obj.labels or [],
-            'confidence': obj.confidence or 0,
-        }
-
-    if obj.object_type == 'windows-registry-key':
-        if not obj.value:
-            return None
-        return {
-            **common,
-            'type': 'windows-registry-key',
-            'id': obj.stix_id,
-            'key': obj.value,
-            'labels': obj.labels or [],
-            'confidence': obj.confidence or 0,
-        }
-
-    if obj.object_type == 'autonomous-system':
-        if not obj.value:
-            return None
-        return {
-            **common,
-            'type': 'autonomous-system',
-            'id': obj.stix_id,
-            'number': int(obj.value),
-            'labels': obj.labels or [],
-            'confidence': obj.confidence or 0,
-        }
+    # IOC values -> indicator (pattern derived from the stored type/value).
+    if obj.object_type in _IOC_STORED_TYPES:
+        return _ioc_stix_object(obj)
 
     # SDOs beyond the free-text indicator: malware / threat-actor / campaign.
     if obj.object_type in ('malware', 'threat-actor', 'campaign'):
@@ -1590,52 +1646,8 @@ def threat_intel_to_stix21(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
             'confidence': obj.confidence or 0,
         }
 
-    # indicator / free-text: emit an STIX indicator with a pattern derived
-    # from the value when its kind is recognizable.
-    value = obj.name or obj.ip_address or obj.domain or obj.hash_value or ''
-    if not value:
-        return None
-    guessed, algo = _guess_object_type(value)
-    if guessed == 'ipv4-addr':
-        pattern = f"[ipv4-addr:value = '{value}']"
-    elif guessed == 'domain-name':
-        pattern = f"[domain-name:value = '{value}']"
-    elif guessed == 'file-hash':
-        key = _HASH_KEY_BY_ALGO.get(algo or 'sha256', 'SHA-256')
-        pattern = f"[file:hashes.'{key}' = '{value}']"
-    elif guessed == 'url':
-        pattern = f"[url:value = '{value}']"
-    elif guessed == 'email-addr':
-        pattern = f"[email-addr:value = '{value}']"
-    elif guessed == 'ipv6-addr':
-        pattern = f"[ipv6-addr:value = '{value}']"
-    elif guessed == 'mac-addr':
-        pattern = f"[mac-addr:value = '{value}']"
-    elif guessed == 'autonomous-system':
-        pattern = f"[autonomous-system:number = '{value}']"
-    else:
-        # Unrecognizable free text: community extension type (x- prefix is
-        # spec-legal); TAXII clients that only want typed indicators skip it.
-        return {
-            **common,
-            'type': 'x-ti-indicator',
-            'id': 'x-ti-indicator--' + uuid.uuid5(uuid.NAMESPACE_OID, value).hex,
-            'value': value,
-            'labels': obj.labels or [],
-            'confidence': obj.confidence or 0,
-        }
-
-    return {
-        **common,
-        'type': 'indicator',
-        'id': 'indicator--' + uuid.uuid5(uuid.NAMESPACE_OID, pattern).hex,
-        'pattern': pattern,
-        'pattern_type': 'stix',
-        'pattern_version': '2.1',
-        'valid_from': now,
-        'labels': obj.labels or [],
-        'confidence': obj.confidence or 0,
-    }
+    # Any other stored type is not servable.
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1846,11 +1858,17 @@ def build_stix_bundle(since: Optional[str] = None,
             q = q.filter(STIXObject.modified >= cutoff_dt)
         if collection:
             q = q.filter(STIXObject.collection_id == collection)
-        if match_ids:
-            q = q.filter(STIXObject.stix_id.in_(match_ids))
+        # match[id] is applied after rendering (a client may reference either
+        # the served indicator id or our stored id), so it is not a SQL filter.
+        match_id_set = {str(i) for i in match_ids} if match_ids else None
         # Apply match[type] at the SQL level too so page limits stay correct
         # even when most rows don't match the requested types.
         type_filter = ({str(t) for t in match_types} if match_types else None)
+        if type_filter and 'indicator' in type_filter:
+            # Every IOC value is *served* as an `indicator`, so a client
+            # asking for match[type]=indicator must match all of them — not
+            # only rows whose stored type happens to be 'indicator'.
+            type_filter = type_filter | _IOC_STORED_TYPES
         if type_filter:
             q = q.filter(STIXObject.object_type.in_(type_filter))
 
@@ -1869,11 +1887,13 @@ def build_stix_bundle(since: Optional[str] = None,
                 and_(STIXObject.modified == m_dt,
                      STIXObject.stix_id > after_id),
             ))
-        if limit is not None:
+        if limit is not None and match_id_set is None:
             rows = q.limit(limit + 1).all()
             more = len(rows) > limit
             rows = rows[:limit]
         else:
+            # No limit, or a targeted match[id] lookup: fetch the candidates
+            # and apply the id filter after rendering.
             rows = q.all()
             more = False
     except Exception:
@@ -1899,8 +1919,15 @@ def build_stix_bundle(since: Optional[str] = None,
                 withheld += 1
                 continue
             stix = threat_intel_to_stix21(obj)
-            if stix is not None:
-                objects.append(stix)
+            if stix is None:
+                continue
+            # match[id]: accept the id the client RECEIVED (the served
+            # indicator id) or our stored id.
+            if match_id_set is not None and (
+                    row.stix_id not in match_id_set
+                    and stix.get('id') not in match_id_set):
+                continue
+            objects.append(stix)
 
     if withheld:
         logger.info(
@@ -2181,6 +2208,18 @@ def taxii_objects(collection_id: str):
         )
     except ValueError as exc:
         return _taxii_error(400, 'Bad Request', str(exc), 'malformed')
+
+    if TAXII_OBJECTS_SHAPE == 'bundle':
+        # OTX-compatible shape: the STIX bundle at the top level with
+        # more/next (no TAXII message envelope). Some consumers (e.g. the
+        # OTX feed Vision One already ingests) expect this rather than the
+        # spec envelope. Off by default; see taxii.objects_shape.
+        body: Dict[str, Any] = {'type': 'bundle', 'objects': bundle.get('objects', [])}
+        body['more'] = bool(more)
+        if more and nxt:
+            body['next'] = nxt
+        return _taxii_response(body)
+
     return _taxii_response(
         _taxii_message(collection_id, bundle, more=more, next_cursor=nxt)
     )

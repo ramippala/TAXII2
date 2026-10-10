@@ -1,0 +1,68 @@
+# Docker Compose for the TAXII 2.1 server: the app + PostgreSQL, plus an
+# optional Cloudflare Tunnel.
+#
+#   docker compose up -d                     # app + database
+#   docker compose --profile tunnel up -d    # + cloudflared (needs the token)
+#
+# Secrets/config come from the .env file next to this file (git-ignored).
+# Tunnel token: CLOUDFLARE_TUNNEL_TOKEN. With a token-based (remotely managed)
+# tunnel, the public hostname's origin is set in the Cloudflare Zero Trust
+# dashboard — point it at  http://taxii:5000 .
+name: taxii2
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-taxii}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-taxii_feed}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Not published — only the app (and the tunnel) reach it, over the compose network.
+
+  taxii:
+    build: .
+    image: taxii2-server:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Only what the app needs — deliberately NOT the whole .env, so the
+      # Cloudflare token never lands in the app container.
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-taxii}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-taxii_feed}
+      FLASK_SECRET: ${FLASK_SECRET:?set FLASK_SECRET in .env}
+      TAXII_AUTH_USER: ${TAXII_AUTH_USER}
+      TAXII_AUTH_PASSWORD: ${TAXII_AUTH_PASSWORD}
+      UI_AUTH_USER: ${UI_AUTH_USER}
+      UI_AUTH_PASSWORD: ${UI_AUTH_PASSWORD}
+      OTX_API_KEY: ${OTX_API_KEY:-}
+      PREMIUM_TAXII_USER: ${PREMIUM_TAXII_USER:-}
+      PREMIUM_TAXII_PASS: ${PREMIUM_TAXII_PASS:-}
+      # Get Objects response shape: envelope (spec) | bundle (OTX-compatible)
+      TAXII_OBJECTS_SHAPE: ${TAXII_OBJECTS_SHAPE:-envelope}
+    ports:
+      # Loopback-only by default: reach it via the tunnel (public) or an SSH
+      # port-forward. Adjust TAXII_HOST_PORT in .env if 5000 is taken.
+      - "127.0.0.1:${TAXII_HOST_PORT:-5000}:5000"
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    depends_on:
+      - taxii
+    # Token-based (remotely managed) tunnel: ingress/public-hostname rules are
+    # configured in the Cloudflare Zero Trust dashboard, not here. Opt-in via
+    # the "tunnel" profile so the stack still runs before the token is set.
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    profiles: ["tunnel"]
+
+volumes:
+  pgdata:

@@ -8,6 +8,7 @@ Vision One integration, and the OTX community-intel puller.
 import sys
 import os
 import io
+import re
 import tempfile
 import types
 import unittest
@@ -24,6 +25,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 # setting this before importing server pins the test DB.
 os.environ['DATABASE_URL'] = 'sqlite:///' + os.path.join(
     tempfile.gettempdir(), 'taxii2-tests.db')
+# Also pin the Get Objects response shape to the spec envelope so a local
+# .env (e.g. TAXII_OBJECTS_SHAPE=bundle for a Vision One experiment) can't
+# change what the suite asserts.
+os.environ['TAXII_OBJECTS_SHAPE'] = 'envelope'
 
 from server import (
     app,
@@ -78,6 +83,35 @@ def _row(last_seen=None, modified=None):
     r.last_seen = last_seen
     r.modified = modified
     return r
+
+
+# Served objects are STIX 2.1 *indicators* (pattern + valid_from); these read
+# the underlying IOC value/kind back out of the pattern so tests assert on the
+# intel rather than the wire type.
+_PATTERN_VALUE_RE = re.compile(r"= '([^']+)'")
+
+
+def served_value(o):
+    """The IOC value a served STIX object carries (indicator pattern / SCO value)."""
+    if isinstance(o, dict) and o.get('value'):
+        return o['value']
+    m = _PATTERN_VALUE_RE.search((o or {}).get('pattern') or '')
+    return m.group(1) if m else None
+
+
+def served_kind(o):
+    """The underlying IOC kind of a served object (derived from its pattern)."""
+    p = (o or {}).get('pattern') or ''
+    for kind, prefix in (
+        ('ipv4-addr', '[ipv4-addr:'), ('domain-name', '[domain-name:'),
+        ('file-hash', '[file:'), ('url', '[url:'), ('email-addr', '[email-addr:'),
+        ('ipv6-addr', '[ipv6-addr:'), ('mac-addr', '[mac-addr:'),
+        ('autonomous-system', '[autonomous-system:'),
+        ('windows-registry-key', '[windows-registry-key:'),
+    ):
+        if p.startswith(prefix):
+            return kind
+    return (o or {}).get('type')
 
 
 class TestTaxiiServer(unittest.TestCase):
@@ -738,13 +772,7 @@ class TestTaxiiServer(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         envelope = r.get_json()
         content = envelope['content']['content']  # STIX 2.1 bundle
-        vals = []
-        for o in content['objects']:
-            if o.get('type') == 'ipv4-addr':
-                vals.append(o['value'])
-            elif o.get('type') == 'domain-name':
-                vals.append(o['value'])
-        return set(vals)
+        return {served_value(o) for o in content['objects'] if served_value(o)}
 
     def test_gate_private_ip_withheld(self):
         """Community private IP is withheld from TAXII but still stored."""
@@ -1091,21 +1119,36 @@ class TestRevocationAndTTL(unittest.TestCase):
             {'id': 'domain-name--a-b-c', 'type': 'domain-name',
              'object': {'domain-name': {'value': 'a.b.c'}}, 'labels': [], 'confidence': 50},
         ])
+        # Served objects are indicators; match[type] filters by the underlying
+        # intel kind (the pattern shows what each one is).
         objs = self._bundle('?match%5Btype%5D=domain-name')  # match[type]=domain-name
         self.assertEqual(len(objs), 1)
-        self.assertEqual(objs[0]['type'], 'domain-name')
+        self.assertEqual(objs[0]['type'], 'indicator')
+        self.assertEqual(served_kind(objs[0]), 'domain-name')
+        self.assertEqual(served_value(objs[0]), 'a.b.c')
         objs = self._bundle('?match%5Btype%5D=ipv4-addr')
         self.assertEqual(len(objs), 1)
-        self.assertEqual(objs[0]['type'], 'ipv4-addr')
+        self.assertEqual(served_kind(objs[0]), 'ipv4-addr')
+        self.assertEqual(served_value(objs[0]), '1.1.1.1')
+        # match[type]=indicator matches every IOC row (all served as indicators)
+        objs = self._bundle('?match%5Btype%5D=indicator')
+        self.assertEqual(len(objs), 2)
 
     def test_match_id_filter(self):
         self._ingest([
             _manual_obj('1.1.1.1'),
             _manual_obj('2.2.2.2'),
         ])
+        # match[id] filters by the stored id; the served object is its indicator.
         objs = self._bundle('?match%5Bid%5D=ipv4-addr--1-1-1-1')
         self.assertEqual(len(objs), 1)
-        self.assertEqual(objs[0]['id'], 'ipv4-addr--1-1-1-1')
+        self.assertEqual(objs[0]['type'], 'indicator')
+        self.assertEqual(served_value(objs[0]), '1.1.1.1')
+        # ...and a client can re-fetch by the id it RECEIVED (the served id).
+        served_id = objs[0]['id']
+        again = self._bundle('?match%5Bid%5D=' + served_id)
+        self.assertEqual(len(again), 1)
+        self.assertEqual(again[0]['id'], served_id)
 
     def test_added_after_param(self):
         self._ingest([_manual_obj('7.7.7.7')])
@@ -1583,10 +1626,11 @@ class TestExtendedTypesAndValidation(unittest.TestCase):
         self.assertEqual(r.get_json()['objects_count'], 3)
 
         objs = self._bundle()
-        by_type = {o['type']: o for o in objs}
-        self.assertEqual(by_type['url']['value'], 'http://evil.example.com/x')
-        self.assertEqual(by_type['email-addr']['value'], 'a@evil.example.com')
-        self.assertEqual(by_type['ipv6-addr']['value'], '2001:db8::1')
+        by_kind = {served_kind(o): o for o in objs}
+        self.assertEqual(served_value(by_kind['url']), 'http://evil.example.com/x')
+        self.assertEqual(served_value(by_kind['email-addr']), 'a@evil.example.com')
+        self.assertEqual(served_value(by_kind['ipv6-addr']), '2001:db8::1')
+        self.assertTrue(all(o['type'] == 'indicator' for o in objs))
 
         # /objects lists them with their value
         r = self.client.get('/objects', headers=self.auth)
@@ -1604,10 +1648,11 @@ class TestExtendedTypesAndValidation(unittest.TestCase):
         ])
         self.assertEqual(r.status_code, 200)
         objs = self._bundle()
-        by_type = {o['type']: o for o in objs}
-        self.assertEqual(by_type['windows-registry-key']['key'],
-                         'HKEY_CURRENT_USER\\Software\\Evil')
-        self.assertEqual(by_type['autonomous-system']['number'], 64512)
+        by_kind = {served_kind(o): o for o in objs}
+        self.assertEqual(by_kind['windows-registry-key']['pattern'],
+                         "[windows-registry-key:key = 'HKEY_CURRENT_USER\\Software\\Evil']")
+        self.assertEqual(by_kind['autonomous-system']['pattern'],
+                         "[autonomous-system:number = '64512']")
 
     def test_indicator_over_url_renders_url_pattern(self):
         self._ingest([
@@ -1764,7 +1809,7 @@ class TestTaxiiPagination(unittest.TestCase):
 
     def test_pages_walk_without_duplicates_or_loss(self):
         self._ingest_n(7)
-        ids = []
+        vals = []
         more = True
         nxt = None
         pages = 0
@@ -1775,15 +1820,14 @@ class TestTaxiiPagination(unittest.TestCase):
             msg = self._page(qs)
             objs = msg['content']['content']['objects']
             self.assertLessEqual(len(objs), 3)
-            ids.extend(o['id'] for o in objs)
+            vals.extend(served_value(o) for o in objs)
             more = msg['more']
             nxt = msg.get('next')
             pages += 1
             self.assertLess(pages, 10)  # guard against infinite loops
         self.assertEqual(pages, 3)
-        self.assertEqual(sorted(ids), sorted(
-            f'ipv4-addr--1-1-1-{i}' for i in range(1, 8)))
-        self.assertEqual(len(set(ids)), 7)
+        self.assertEqual(sorted(vals), sorted(f'1.1.1.{i}' for i in range(1, 8)))
+        self.assertEqual(len(set(vals)), 7)
 
     def test_single_page_when_fewer_than_limit(self):
         self._ingest_n(2)
@@ -1834,13 +1878,14 @@ class TestTaxiiPagination(unittest.TestCase):
         self.assertTrue(msg['more'])
         # follow to the end — only domains ever returned
         more, nxt = msg['more'], msg.get('next')
-        seen = [o['id'] for o in objs]
+        seen = [served_value(o) for o in objs]
         while more:
             msg = self._page('?limit=1&match%5Btype%5D=domain-name&next='
                              + urllib.parse.quote(nxt))
-            seen.extend(o['id'] for o in msg['content']['content']['objects'])
+            seen.extend(served_value(o)
+                        for o in msg['content']['content']['objects'])
             more, nxt = msg['more'], msg.get('next')
-        self.assertEqual(sorted(seen), ['domain-name--a-b', 'domain-name--c-d'])
+        self.assertEqual(sorted(seen), ['a.b', 'c.d'])
 
     def test_pagination_not_changed_by_since_for_old_rows(self):
         # rows ingested at the same batch share a timestamp; the cursor must
@@ -1872,8 +1917,7 @@ class TestTaxiiPagination(unittest.TestCase):
         objs = self._page(
             '?match%5Bid%5D=ipv4-addr--1-1-1-1,domain-name--a-b'
         )['content']['content']['objects']
-        self.assertEqual(sorted(o['id'] for o in objs),
-                         ['domain-name--a-b', 'ipv4-addr--1-1-1-1'])
+        self.assertEqual(sorted(served_value(o) for o in objs), ['1.1.1.1', 'a.b'])
         # a non-matching single value is still a real filter (not a no-op)
         objs = self._page('?match%5Btype%5D=nope')['content']['content']['objects']
         self.assertEqual(len(objs), 0)
@@ -2040,7 +2084,7 @@ class TestCollectionsRbac(unittest.TestCase):
                             headers=self.auth_a)
         objs = r.get_json()['content']['content']['objects']
         self.assertEqual(len(objs), 1)
-        self.assertEqual(objs[0]['value'], '1.1.1.1')
+        self.assertEqual(served_value(objs[0]), '1.1.1.1')
 
     def test_unknown_collection_404_and_bad_creds_401(self):
         self._ingest([_manual_obj('1.1.1.1')], 'alpha', self.auth_a)

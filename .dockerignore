@@ -1,0 +1,20 @@
+# Keep the build context small and, critically, never bake secrets in.
+.git
+.gitignore
+.qwen
+venv
+.venv
+__pycache__
+*.py[cod]
+*.db
+*.sqlite*
+*.log
+.env
+.env.*
+!.env.example
+tests
+docs
+*.md
+Dockerfile
+.dockerignore
+docker-compose.yml

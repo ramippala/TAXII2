@@ -47,6 +47,12 @@ taxii:
   response_format: 'STIX_JSON'
   max_objects: 10000
   bundle_id: 'Bundle-{timestamp}'
+  # Get Objects response shape:
+  #   envelope (default) — spec TAXII 2.1 Message Resource (§5.3)
+  #   bundle            — OTX-compatible: the STIX bundle at the top level
+  #                       with more/next, no envelope. Set TAXII_OBJECTS_SHAPE=bundle
+  #                       in .env if a consumer expects the OTX shape.
+  objects_shape: '${TAXII_OBJECTS_SHAPE:-envelope}'
   # === The ONE place Vision One is configured on THIS server ===
   # Trend Micro Vision One is a TAXII 2.1 CLIENT. It polls this server's
   #   http://<this-server>:5000/taxii2/
