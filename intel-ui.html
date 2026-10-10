@@ -482,7 +482,7 @@ function rowElement(o) {
 
   const cChk = document.createElement("td");
   const chk = document.createElement("input");
-  chk.type = "checkbox"; chk.checked = true; chk.dataset.kind = o.kind || "new";
+  chk.type = "checkbox"; chk.checked = o.checked !== false; chk.dataset.kind = o.kind || "new";
   cChk.appendChild(chk);
 
   const cType = document.createElement("td");
