@@ -8,6 +8,7 @@ Vision One integration, and the OTX community-intel puller.
 import sys
 import os
 import io
+import tempfile
 import types
 import unittest
 import urllib.parse
@@ -16,6 +17,13 @@ from datetime import datetime, timedelta
 import jwt
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+# Tests always run on an isolated SQLite file DB — never pick up DATABASE_URL
+# from a local .env (e.g. a dev checkout pointed at PostgreSQL). The .env
+# loader only sets vars that are not already in the process environment, so
+# setting this before importing server pins the test DB.
+os.environ['DATABASE_URL'] = 'sqlite:///' + os.path.join(
+    tempfile.gettempdir(), 'taxii2-tests.db')
 
 from server import (
     app,
@@ -377,9 +385,41 @@ class TestTaxiiServer(unittest.TestCase):
     def test_stix21_object_mapping_unsupported(self):
         """Test unsupported/invalid STIX objects are dropped."""
         import server
-        self.assertIsNone(server._stix21_object_to_our({'type': 'malware', 'name': 'x'}))
+        # attack-pattern is not a supported store type -> dropped.
+        self.assertIsNone(
+            server._stix21_object_to_our({'type': 'attack-pattern', 'name': 'x'}))
         self.assertIsNone(server._stix21_object_to_our({'type': 'ipv4-addr', 'value': '999.1.1.1'}))
         self.assertIsNone(server._stix21_object_to_our({'type': 'file'}))
+
+    def test_stix21_object_mapping_extended_types(self):
+        """Test the extended SCO / SDO / relationship mapping (graph)."""
+        import server
+        # url
+        d = server._stix21_object_to_our({'type': 'url', 'value': 'http://evil.example.com/x'})
+        self.assertIsNotNone(d)
+        self.assertEqual(d['type'], 'url')
+        self.assertEqual(d['object']['url']['value'], 'http://evil.example.com/x')
+        # email-addr
+        d = server._stix21_object_to_our({'type': 'email-addr', 'value': 'a@evil.example.com'})
+        self.assertEqual(d['type'], 'email-addr')
+        # invalid email -> dropped
+        self.assertIsNone(server._stix21_object_to_our({'type': 'email-addr', 'value': 'not-an-email'}))
+        # malware SDO (previously unsupported)
+        d = server._stix21_object_to_our({'type': 'malware', 'name': 'trickbot'})
+        self.assertEqual(d['type'], 'malware')
+        self.assertEqual(d['object']['malware']['name'], 'trickbot')
+        # relationship (graph edge preserved)
+        d = server._stix21_object_to_our({
+            'type': 'relationship',
+            'source_ref': 'malware--a',
+            'relationship_type': 'uses',
+            'target_ref': 'tool--b',
+        })
+        self.assertEqual(d['type'], 'relationship')
+        self.assertEqual(d['object']['relationship']['relationship_type'], 'uses')
+        # incomplete relationship -> dropped
+        self.assertIsNone(server._stix21_object_to_our({
+            'type': 'relationship', 'source_ref': 'malware--a'}))
 
     def test_taxii_puller_init(self):
         """Test TaxiiPuller initialization and URL building."""
@@ -423,7 +463,7 @@ class TestTaxiiServer(unittest.TestCase):
             {'type': 'ipv4-addr', 'value': '8.8.8.8', 'confidence': 60},
             {'type': 'domain-name', 'value': 'c2.example.com'},
             {'type': 'ipv4-addr', 'value': '10.1.1.1'},  # private -> still stored, gated
-            {'type': 'malware', 'name': 'drop'},           # unsupported -> skipped
+            {'type': 'attack-pattern', 'name': 'drop'},   # unsupported -> skipped
         ]
         added, err = p._poll_once()
         self.assertIsNone(err)
@@ -1398,7 +1438,11 @@ class TestDotenv(unittest.TestCase):
         finally:
             del os.environ['TAXII_ENV_FILE']
         default = str(_server._dotenv_path())
-        self.assertTrue(default.endswith(os.path.join('TAXII', '.env')))
+        # Default .env lives next to server.py, whatever the repo dir is named.
+        self.assertEqual(
+            default,
+            os.path.join(os.path.dirname(os.path.abspath(_server.__file__)), '.env'),
+        )
         self.assertFalse(default.startswith(self.tmp.name))
 
 
@@ -1491,6 +1535,589 @@ class TestSaveAndDelete(unittest.TestCase):
     def test_delete_unauth_401(self):
         r = self.client.post('/feed/delete', json={'ids': ['x']})
         self.assertEqual(r.status_code, 401)
+
+
+class TestExtendedTypesAndValidation(unittest.TestCase):
+    """New STIX object types (url / email-addr / ipv6-addr / mac-addr /
+    windows-registry-key / autonomous-system), the STIX graph objects
+    (relationship / malware / threat-actor / campaign) and ingest validation.
+    """
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        app.config['TAXII_AUTH'] = {
+            'username': 'test_taxii_user',
+            'password': 'test_taxii_pass',
+        }
+        self.auth = {
+            'X-Taxii-Username': 'test_taxii_user',
+            'X-Taxii-Password': 'test_taxii_pass',
+        }
+
+    def _ingest(self, objs):
+        return self.client.post(
+            '/feed/ingest', json={'stix_objects': objs}, headers=self.auth)
+
+    def _bundle(self, qs=''):
+        r = self.client.get(
+            '/taxii2/collections/threat-intel/objects/' + qs,
+            headers=self.auth,
+        )
+        self.assertEqual(r.status_code, 200)
+        return r.get_json()['content']['content']['objects']
+
+    def test_ingest_and_serve_url_email_ipv6(self):
+        r = self._ingest([
+            {'id': 'url--evil-x', 'type': 'url',
+             'object': {'url': {'value': 'http://evil.example.com/x'}},
+             'labels': ['malicious'], 'confidence': 80},
+            {'id': 'email-addr--a-b', 'type': 'email-addr',
+             'object': {'email-addr': {'value': 'a@evil.example.com'}},
+             'labels': ['malicious'], 'confidence': 60},
+            {'id': 'ipv6-addr--2001-0db8--1', 'type': 'ipv6-addr',
+             'object': {'ipv6-addr': {'value': '2001:db8::1'}},
+             'labels': ['malicious'], 'confidence': 70},
+        ])
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()['objects_count'], 3)
+
+        objs = self._bundle()
+        by_type = {o['type']: o for o in objs}
+        self.assertEqual(by_type['url']['value'], 'http://evil.example.com/x')
+        self.assertEqual(by_type['email-addr']['value'], 'a@evil.example.com')
+        self.assertEqual(by_type['ipv6-addr']['value'], '2001:db8::1')
+
+        # /objects lists them with their value
+        r = self.client.get('/objects', headers=self.auth)
+        by_type = {o['type']: o for o in r.get_json()['objects']}
+        self.assertEqual(by_type['url']['value'], 'http://evil.example.com/x')
+
+    def test_windows_registry_key_and_asn(self):
+        r = self._ingest([
+            {'id': 'windows-registry-key--hkcu', 'type': 'windows-registry-key',
+             'object': {'windows-registry-key': {'key': 'HKEY_CURRENT_USER\\Software\\Evil'}},
+             'labels': ['registry'], 'confidence': 55},
+            {'id': 'autonomous-system--12345', 'type': 'autonomous-system',
+             'object': {'autonomous-system': {'number': 64512}},
+             'labels': ['asn'], 'confidence': 50},
+        ])
+        self.assertEqual(r.status_code, 200)
+        objs = self._bundle()
+        by_type = {o['type']: o for o in objs}
+        self.assertEqual(by_type['windows-registry-key']['key'],
+                         'HKEY_CURRENT_USER\\Software\\Evil')
+        self.assertEqual(by_type['autonomous-system']['number'], 64512)
+
+    def test_indicator_over_url_renders_url_pattern(self):
+        self._ingest([
+            {'id': 'indicator--cafe', 'type': 'indicator',
+             'object': {'indicator': {'value': 'http://evil.example.com/x'}},
+             'labels': ['url'], 'confidence': 90},
+        ])
+        objs = self._bundle()
+        self.assertEqual(len(objs), 1)
+        o = objs[0]
+        self.assertEqual(o['type'], 'indicator')
+        self.assertEqual(o['pattern'], "[url:value = 'http://evil.example.com/x']")
+
+    def test_guess_object_type_extended(self):
+        import server
+        cases = {
+            'http://a.example.com/x': ('url', 'url'),
+            'https://a.example.com/x?q=1': ('url', 'url'),
+            'a@evil.example.com': ('email-addr', 'email-addr'),
+            '2001:db8::1': ('ipv6-addr', 'ipv6-addr'),
+            'aa:bb:cc:dd:ee:ff': ('mac-addr', 'mac-addr'),
+            'AS12345': ('autonomous-system', 'autonomous-system'),
+            '1.2.3.4': ('ipv4-addr', 'ipv4-addr'),
+            'evil.example.com': ('domain-name', 'domain-name'),
+            'free text': ('indicator', 'indicator'),
+        }
+        for value, (otype, algo_marker) in cases.items():
+            guessed, _ = server._guess_object_type(value)
+            self.assertEqual(guessed, otype, f'value {value!r}')
+
+    def test_validation_rejects_bad_id_prefix(self):
+        # type url but id says ipv4-addr -> skipped, not stored
+        r = self._ingest([
+            {'id': 'ipv4-addr--oops', 'type': 'url',
+             'object': {'url': {'value': 'http://evil.example.com/x'}},
+             'labels': ['x'], 'confidence': 50},
+        ])
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()['objects_count'], 0)
+        self.assertEqual(self.client.get('/objects', headers=self.auth).get_json()['count'], 0)
+
+    def test_validation_rejects_unsupported_type_and_bad_confidence(self):
+        r = self._ingest([
+            {'id': 'banana--1', 'type': 'banana',
+             'object': {'banana': {'value': 'x'}}, 'labels': [], 'confidence': 50},
+            {'id': 'ipv4-addr--1-2-3-4', 'type': 'ipv4-addr',
+             'object': {'ipv4-addr': {'value': '1.2.3.4'}},
+             'labels': ['x'], 'confidence': 999},
+            {'id': 'ipv4-addr--5-6-7-8', 'type': 'ipv4-addr',
+             'object': {'ipv4-addr': {'value': '5.6.7.8'}},
+             'labels': ['x'], 'confidence': 50, 'modified': 'not-a-date'},
+        ])
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()['objects_count'], 0)
+
+    def test_validation_skips_only_bad_rows(self):
+        r = self._ingest([
+            {'id': 'banana--1', 'type': 'banana',
+             'object': {'banana': {'value': 'x'}}, 'labels': [], 'confidence': 50},
+            {'id': 'ipv4-addr--9-9-9-9', 'type': 'ipv4-addr',
+             'object': {'ipv4-addr': {'value': '9.9.9.9'}},
+             'labels': ['x'], 'confidence': 50},
+        ])
+        self.assertEqual(r.get_json()['objects_count'], 1)
+        objs = self.client.get('/objects', headers=self.auth).get_json()['objects']
+        self.assertEqual([o['value'] for o in objs], ['9.9.9.9'])
+
+    def test_graph_relationship_ingest_and_serve(self):
+        r = self._ingest([
+            {'id': 'malware--trickbot', 'type': 'malware',
+             'object': {'malware': {'name': 'TrickBot'}},
+             'labels': ['malware'], 'confidence': 70},
+            {'id': 'threat-actor--apt41', 'type': 'threat-actor',
+             'object': {'threat-actor': {'name': 'APT41'}},
+             'labels': ['apt'], 'confidence': 70},
+            {'id': 'relationship--r1', 'type': 'relationship',
+             'object': {'relationship': {
+                 'relationship_type': 'uses',
+                 'source_ref': 'malware--trickbot',
+                 'target_ref': 'threat-actor--apt41'}},
+             'labels': ['graph'], 'confidence': 70},
+        ])
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()['objects_count'], 3)
+
+        objs = self._bundle()
+        by_type = {o['type']: o for o in objs}
+        self.assertEqual(by_type['malware']['name'], 'TrickBot')
+        self.assertTrue(by_type['malware']['is_family'])
+        self.assertEqual(by_type['threat-actor']['name'], 'APT41')
+        self.assertEqual(by_type['threat-actor']['threat_actor_types'], ['unknown'])
+        rel = by_type['relationship']
+        self.assertEqual(rel['relationship_type'], 'uses')
+        self.assertEqual(rel['source_ref'], 'malware--trickbot')
+        self.assertEqual(rel['target_ref'], 'threat-actor--apt41')
+
+        # /objects shows the edge as a readable summary
+        r = self.client.get('/objects', headers=self.auth)
+        rel_row = next(o for o in r.get_json()['objects'] if o['type'] == 'relationship')
+        self.assertIn('malware--trickbot → uses → threat-actor--apt41', rel_row['value'])
+
+    def test_incomplete_relationship_rejected(self):
+        r = self._ingest([
+            {'id': 'relationship--r1', 'type': 'relationship',
+             'object': {'relationship': {'source_ref': 'malware--a'}},
+             'labels': [], 'confidence': 50},
+        ])
+        self.assertEqual(r.get_json()['objects_count'], 0)
+
+    def test_campaign_ingest(self):
+        r = self._ingest([
+            {'id': 'campaign--c1', 'type': 'campaign',
+             'object': {'campaign': {'name': 'Operation Beep'}},
+             'labels': ['campaign'], 'confidence': 60},
+        ])
+        objs = self._bundle()
+        self.assertEqual(objs[0]['type'], 'campaign')
+        self.assertEqual(objs[0]['name'], 'Operation Beep')
+
+
+class TestTaxiiPagination(unittest.TestCase):
+    """TAXII 2.1 Get Objects pagination: limit / next / more (keyset)."""
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        app.config['TAXII_AUTH'] = {
+            'username': 'test_taxii_user',
+            'password': 'test_taxii_pass',
+        }
+        self.auth = {
+            'X-Taxii-Username': 'test_taxii_user',
+            'X-Taxii-Password': 'test_taxii_pass',
+        }
+
+    def _ingest_n(self, n):
+        objs = [{
+            'id': f'ipv4-addr--1-1-1-{i}',
+            'type': 'ipv4-addr',
+            'object': {'ipv4-addr': {'value': f'1.1.1.{i}'}},
+            'labels': ['t'], 'confidence': 50,
+        } for i in range(1, n + 1)]
+        r = self.client.post('/feed/ingest', json={'stix_objects': objs},
+                             headers=self.auth)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()['objects_count'], n)
+
+    def _page(self, qs):
+        r = self.client.get(
+            '/taxii2/collections/threat-intel/objects/' + qs,
+            headers=self.auth)
+        self.assertEqual(r.status_code, 200)
+        return r.get_json()
+
+    def test_pages_walk_without_duplicates_or_loss(self):
+        self._ingest_n(7)
+        ids = []
+        more = True
+        nxt = None
+        pages = 0
+        while more:
+            qs = '?limit=3'
+            if nxt:
+                qs += '&next=' + urllib.parse.quote(nxt)
+            msg = self._page(qs)
+            objs = msg['content']['content']['objects']
+            self.assertLessEqual(len(objs), 3)
+            ids.extend(o['id'] for o in objs)
+            more = msg['more']
+            nxt = msg.get('next')
+            pages += 1
+            self.assertLess(pages, 10)  # guard against infinite loops
+        self.assertEqual(pages, 3)
+        self.assertEqual(sorted(ids), sorted(
+            f'ipv4-addr--1-1-1-{i}' for i in range(1, 8)))
+        self.assertEqual(len(set(ids)), 7)
+
+    def test_single_page_when_fewer_than_limit(self):
+        self._ingest_n(2)
+        msg = self._page('?limit=5')
+        self.assertFalse(msg['more'])
+        self.assertNotIn('next', msg)
+        self.assertEqual(len(msg['content']['content']['objects']), 2)
+
+    def test_more_flag_off_without_limit(self):
+        self._ingest_n(4)
+        msg = self._page('')
+        self.assertFalse(msg['more'])
+        self.assertNotIn('next', msg)
+        self.assertEqual(len(msg['content']['content']['objects']), 4)
+
+    def test_limit_zero_and_non_numeric_400(self):
+        self._ingest_n(3)
+        for bad in ('0', '-1', 'abc', '1.5'):
+            r = self.client.get(
+                '/taxii2/collections/threat-intel/objects/?limit=' + bad,
+                headers=self.auth)
+            self.assertEqual(r.status_code, 400, f'limit={bad}')
+
+    def test_bad_since_and_bad_next_400(self):
+        self._ingest_n(2)
+        r = self.client.get(
+            '/taxii2/collections/threat-intel/objects/?since=garbage',
+            headers=self.auth)
+        self.assertEqual(r.status_code, 400)
+        r = self.client.get(
+            '/taxii2/collections/threat-intel/objects/?next=%%%',
+            headers=self.auth)
+        self.assertEqual(r.status_code, 400)
+
+    def test_pagination_respects_match_type(self):
+        self._ingest_n(3)
+        self.client.post('/feed/ingest', json={'stix_objects': [
+            {'id': 'domain-name--a-b', 'type': 'domain-name',
+             'object': {'domain-name': {'value': 'a.b'}},
+             'labels': [], 'confidence': 50},
+            {'id': 'domain-name--c-d', 'type': 'domain-name',
+             'object': {'domain-name': {'value': 'c.d'}},
+             'labels': [], 'confidence': 50},
+        ]}, headers=self.auth)
+        msg = self._page('?limit=1&match%5Btype%5D=domain-name')
+        objs = msg['content']['content']['objects']
+        self.assertEqual(len(objs), 1)
+        self.assertTrue(msg['more'])
+        # follow to the end — only domains ever returned
+        more, nxt = msg['more'], msg.get('next')
+        seen = [o['id'] for o in objs]
+        while more:
+            msg = self._page('?limit=1&match%5Btype%5D=domain-name&next='
+                             + urllib.parse.quote(nxt))
+            seen.extend(o['id'] for o in msg['content']['content']['objects'])
+            more, nxt = msg['more'], msg.get('next')
+        self.assertEqual(sorted(seen), ['domain-name--a-b', 'domain-name--c-d'])
+
+    def test_pagination_not_changed_by_since_for_old_rows(self):
+        # rows ingested at the same batch share a timestamp; the cursor must
+        # still separate them by stix_id (no skipped/duplicate rows).
+        self._ingest_n(4)
+        msg = self._page('?limit=2')
+        objs1 = msg['content']['content']['objects']
+        msg2 = self._page('?limit=2&next=' + urllib.parse.quote(msg['next']))
+        objs2 = msg2['content']['content']['objects']
+        all_ids = [o['id'] for o in objs1] + [o['id'] for o in objs2]
+        self.assertEqual(len(set(all_ids)), 4)
+        self.assertFalse(msg2['more'])
+
+    def test_multi_value_match_filters(self):
+        """match[type]/match[id] accept comma-separated lists (spec 5.3):
+        every listed value is a disjunction (a real client joins them this
+        way — e.g. taxii2client sends match[type]=domain-name,file-hash)."""
+        self._ingest_n(3)
+        self.client.post('/feed/ingest', json={'stix_objects': [
+            {'id': 'domain-name--a-b', 'type': 'domain-name',
+             'object': {'domain-name': {'value': 'a.b'}},
+             'labels': [], 'confidence': 50},
+        ], 'mode': 'merge'}, headers=self.auth)
+        # comma-separated match[type] -> union of the listed types
+        objs = self._page(
+            '?match%5Btype%5D=domain-name,ipv4-addr')['content']['content']['objects']
+        self.assertEqual(len(objs), 4)  # 3 ipv4 + 1 domain
+        # comma-separated match[id] -> union of the listed ids
+        objs = self._page(
+            '?match%5Bid%5D=ipv4-addr--1-1-1-1,domain-name--a-b'
+        )['content']['content']['objects']
+        self.assertEqual(sorted(o['id'] for o in objs),
+                         ['domain-name--a-b', 'ipv4-addr--1-1-1-1'])
+        # a non-matching single value is still a real filter (not a no-op)
+        objs = self._page('?match%5Btype%5D=nope')['content']['content']['objects']
+        self.assertEqual(len(objs), 0)
+
+
+class TestXlsxImport(unittest.TestCase):
+    """Excel (.xlsx) import through /feed/import-csv + column typing."""
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        app.config['TAXII_AUTH'] = {
+            'username': 'test_taxii_user',
+            'password': 'test_taxii_pass',
+        }
+        self.auth = {
+            'X-Taxii-Username': 'test_taxii_user',
+            'X-Taxii-Password': 'test_taxii_pass',
+        }
+
+    def _xlsx_bytes(self, rows):
+        """Build an .xlsx workbook in memory: rows[0] = headers."""
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        for row in rows:
+            ws.append([c if c is not None else '' for c in row])
+        buf = io.BytesIO()
+        wb.save(buf)
+        wb.close()
+        return buf.getvalue()
+
+    def _post_xlsx(self, rows, filename='intel.xlsx'):
+        return self.client.post(
+            '/feed/import-csv',
+            data={'file': (io.BytesIO(self._xlsx_bytes(rows)), filename)},
+            headers=self.auth,
+        )
+
+    def test_xlsx_upload_fuzzy_headers(self):
+        # Note: "Destination" maps to the IP role (dstip) — a domain there is
+        # dropped, exactly like the CSV path. Domains need a 'domain' header.
+        r = self._post_xlsx([
+            ['IP_Address', 'domain', 'labels', 'confidence'],
+            ['1.2.3.4', 'evil.example.com', 'c2', 90],
+            ['5.6.7.8', 'bot.evil.net', 'apt', 80],
+        ])
+        self.assertEqual(r.status_code, 200, r.get_json())
+        body = r.get_json()
+        self.assertEqual(body['imported'], 4)
+        self.assertEqual(body['skipped_total'], 0)
+        r = self.client.get('/objects', headers=self.auth)
+        objs = r.get_json()['objects']
+        self.assertEqual({o['value'] for o in objs},
+                         {'1.2.3.4', '5.6.7.8', 'evil.example.com', 'bot.evil.net'})
+
+    def test_xlsx_indicator_column_promotes_url(self):
+        r = self._post_xlsx([
+            ['indicator', 'labels', 'confidence'],
+            ['http://evil.example.com/x', 'url-ioc', 70],
+            ['free text note', 'note', 50],
+        ])
+        self.assertEqual(r.status_code, 200)
+        objs = self.client.get('/objects', headers=self.auth).get_json()['objects']
+        by_type = {o['type']: o for o in objs}
+        self.assertEqual(by_type['url']['value'], 'http://evil.example.com/x')
+        self.assertEqual(by_type['indicator']['value'], 'free text note')
+
+    def test_csv_indicator_column_promotes_url_and_ipv6(self):
+        r = self.client.post(
+            '/feed/import-csv',
+            data={'file': (io.BytesIO(
+                ('indicator,labels\n'
+                 'http://evil.example.com/x,c2\n'
+                 '2001:db8::1,ip\n').encode()), 'intel.csv')},
+            headers=self.auth,
+        )
+        self.assertEqual(r.status_code, 200)
+        objs = self.client.get('/objects', headers=self.auth).get_json()['objects']
+        types = {o['type'] for o in objs}
+        self.assertIn('url', types)
+        self.assertIn('ipv6-addr', types)
+
+    def test_xlsx_ip_column_accepts_ipv6(self):
+        r = self._post_xlsx([
+            ['ip'],
+            ['2001:db8::42'],
+        ])
+        self.assertEqual(r.status_code, 200)
+        objs = self.client.get('/objects', headers=self.auth).get_json()['objects']
+        self.assertEqual(len(objs), 1)
+        self.assertEqual(objs[0]['type'], 'ipv6-addr')
+
+    def test_xlsx_bad_file_400(self):
+        r = self.client.post(
+            '/feed/import-csv',
+            data={'file': (io.BytesIO(b'this is not a real xlsx'), 'intel.xlsx')},
+            headers=self.auth,
+        )
+        # unparseable workbook -> no objects -> 400 (or openpyxl error)
+        self.assertEqual(r.status_code, 400)
+
+
+class TestCollectionsRbac(unittest.TestCase):
+    """Multi-collection support: per-collection credentials, isolated
+    Get Objects, collection-scoped data endpoints, and the legacy
+    single-collection default.
+    """
+
+    _GLOBALS = ('TAXII_COLLECTIONS', 'TAXII_COLLECTION_MAP',
+                'TAXII_COLLECTION_ID', 'TAXII_COLLECTION_TITLE')
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        self._saved = {k: getattr(_server, k) for k in self._GLOBALS}
+        cc = _server.CollectionConfig
+        self.coll_a = cc(id='alpha', title='Alpha Feed',
+                         description='first',
+                         username='a_user', password='a_pass')
+        self.coll_b = cc(id='beta', title='Beta Feed',
+                         description='second',
+                         username='b_user', password='b_pass')
+        _server.TAXII_COLLECTIONS = [self.coll_a, self.coll_b]
+        _server.TAXII_COLLECTION_MAP = {c.id: c for c in _server.TAXII_COLLECTIONS}
+        _server.TAXII_COLLECTION_ID = 'alpha'
+        _server.TAXII_COLLECTION_TITLE = 'Alpha Feed'
+        # NO global credential override: only per-collection creds exist.
+        app.config['TAXII_AUTH'] = {'username': '', 'password': ''}
+        self.auth_a = {'X-Taxii-Username': 'a_user', 'X-Taxii-Password': 'a_pass'}
+        self.auth_b = {'X-Taxii-Username': 'b_user', 'X-Taxii-Password': 'b_pass'}
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(_server, k, v)
+
+    def _ingest(self, objs, collection, auth):
+        return self.client.post(
+            '/feed/ingest',
+            json={'stix_objects': objs, 'collection': collection},
+            headers=auth)
+
+    def test_each_principal_sees_only_its_collection(self):
+        self._ingest([_manual_obj('1.1.1.1')], 'alpha', self.auth_a)
+        self._ingest([_manual_obj('2.2.2.2')], 'beta', self.auth_b)
+        # alpha creds (collection A) list only A
+        r = self.client.get('/taxii2/collections/', headers=self.auth_a)
+        ids = [c['id'] for c in r.get_json()['collections']]
+        self.assertEqual(ids, ['alpha'])
+        # beta creds list only B
+        r = self.client.get('/taxii2/collections/', headers=self.auth_b)
+        ids = [c['id'] for c in r.get_json()['collections']]
+        self.assertEqual(ids, ['beta'])
+
+    def test_get_objects_isolated_per_collection(self):
+        self._ingest([_manual_obj('1.1.1.1')], 'alpha', self.auth_a)
+        self._ingest([_manual_obj('2.2.2.2')], 'beta', self.auth_b)
+        # A's creds cannot read B
+        r = self.client.get('/taxii2/collections/beta/objects/',
+                            headers=self.auth_a)
+        self.assertEqual(r.status_code, 401)
+        # A's creds read only A's object
+        r = self.client.get('/taxii2/collections/alpha/objects/',
+                            headers=self.auth_a)
+        objs = r.get_json()['content']['content']['objects']
+        self.assertEqual(len(objs), 1)
+        self.assertEqual(objs[0]['value'], '1.1.1.1')
+
+    def test_unknown_collection_404_and_bad_creds_401(self):
+        self._ingest([_manual_obj('1.1.1.1')], 'alpha', self.auth_a)
+        r = self.client.get('/taxii2/collections/nope/objects/',
+                            headers=self.auth_a)
+        self.assertEqual(r.status_code, 404)
+        r = self.client.get('/taxii2/collections/nope/',
+                            headers=self.auth_a)
+        self.assertEqual(r.status_code, 404)
+        # wrong creds entirely
+        bad = {'X-Taxii-Username': 'x', 'X-Taxii-Password': 'y'}
+        r = self.client.get('/taxii2/collections/alpha/objects/', headers=bad)
+        self.assertEqual(r.status_code, 401)
+
+    def test_data_endpoints_collection_scoping(self):
+        self._ingest([_manual_obj('1.1.1.1')], 'alpha', self.auth_a)
+        self._ingest([_manual_obj('2.2.2.2')], 'beta', self.auth_b)
+        # /objects defaults to the primary collection (alpha)
+        r = self.client.get('/objects', headers=self.auth_a)
+        vals = {o['value'] for o in r.get_json()['objects']}
+        self.assertEqual(vals, {'1.1.1.1'})
+        # ... unless ?collection= says otherwise
+        r = self.client.get('/objects?collection=beta', headers=self.auth_b)
+        vals = {o['value'] for o in r.get_json()['objects']}
+        self.assertEqual(vals, {'2.2.2.2'})
+        # unknown collection -> 400
+        r = self.client.get('/objects?collection=nope', headers=self.auth_a)
+        self.assertEqual(r.status_code, 400)
+        # ingest with unknown collection -> 400
+        r = self._ingest([_manual_obj('3.3.3.3')], 'nope', self.auth_a)
+        self.assertEqual(r.status_code, 400)
+
+    def test_replace_ingest_is_per_collection(self):
+        # a replace-save of beta must not touch alpha's manual rows
+        self._ingest([_manual_obj('1.1.1.1')], 'alpha', self.auth_a)
+        self._ingest([_manual_obj('2.2.2.2')], 'beta', self.auth_b)
+        r = self.client.post(
+            '/feed/ingest',
+            json={'stix_objects': [_manual_obj('9.9.9.9')],
+                  'collection': 'beta', 'mode': 'replace'},
+            headers=self.auth_b)
+        self.assertEqual(r.status_code, 200)
+        r = self.client.get('/objects', headers=self.auth_a)
+        self.assertEqual({o['value'] for o in r.get_json()['objects']},
+                         {'1.1.1.1'})
+        r = self.client.get('/objects?collection=beta', headers=self.auth_b)
+        self.assertEqual({o['value'] for o in r.get_json()['objects']},
+                         {'9.9.9.9'})
+
+    def test_purge_scoped_to_collection(self):
+        self._ingest([_manual_obj('1.1.1.1')], 'alpha', self.auth_a)
+        self._ingest([_manual_obj('2.2.2.2')], 'beta', self.auth_b)
+        r = self.client.delete('/feed/purge?collection=beta',
+                               headers=self.auth_b)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()['purged'], 1)
+        r = self.client.get('/objects', headers=self.auth_a)
+        self.assertEqual({o['value'] for o in r.get_json()['objects']},
+                         {'1.1.1.1'})
+
+    def test_ui_collections_endpoint(self):
+        r = self.client.get('/ui/collections', headers=self.auth_a)
+        self.assertEqual(r.status_code, 200)
+        ids = [c['id'] for c in r.get_json()['collections']]
+        self.assertEqual(ids, ['alpha', 'beta'])
+        self.assertEqual(r.get_json()['primary'], 'alpha')
+
+    def test_single_collection_compat_uses_primary(self):
+        # With the registry pointing at one collection, the API behaves like
+        # the legacy single-collection server.
+        _server.TAXII_COLLECTIONS = [self.coll_a]
+        _server.TAXII_COLLECTION_MAP = {'alpha': self.coll_a}
+        self._ingest([_manual_obj('1.1.1.1')], 'alpha', self.auth_a)
+        r = self.client.get('/taxii2/collections/', headers=self.auth_a)
+        self.assertEqual(r.get_json()['meta']['count'], 1)
+        r = self.client.get('/objects', headers=self.auth_a)
+        self.assertEqual(r.get_json()['count'], 1)
 
 
 class _FakeJwkClient:

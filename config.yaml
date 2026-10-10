@@ -6,8 +6,10 @@ server:
   cors_origins: ['*']
 
 database:
-  # --- Development default: in-process SQLite (zero setup, single writer) ---
-  url: sqlite:///taxii_feed.db
+  # --- Development default: in-process SQLite (zero setup, single writer).
+  # For production (or local Postgres testing) set DATABASE_URL in .env — e.g.
+  #   postgresql+psycopg2://taxii:CHANGE_ME@127.0.0.1:5432/taxii_feed
+  url: ${DATABASE_URL:-sqlite:///taxii_feed.db}
 
   # --- PRODUCTION: point at a real database instead of SQLite. ---
   # Recommended: PostgreSQL (best concurrent read/write — Vision One polls
@@ -57,6 +59,31 @@ taxii:
   auth:
     username: '${TAXII_AUTH_USER}'
     password: '${TAXII_AUTH_PASSWORD}'
+
+  # === MULTI-COLLECTION / per-client RBAC (optional) ===
+  # Serve MORE than one consumer with SEPARATE credentials. When the
+  # `collections:` list is present it REPLACES the legacy `collection_id` /
+  # `auth` keys above (each collection is self-contained). A TAXII client
+  # authenticating with a collection's credentials can only LIST and READ the
+  # collection(s) its credentials authorize — GET /taxii2/collections/ shows
+  # only what the principal may read, and Get Objects for another collection
+  # returns 401. `GET /objects` / `POST /feed/ingest` (and the web UI) accept
+  # an optional `collection` field/?collection= to target a specific
+  # collection (default: the first one listed, the primary).
+  #
+  # collections:
+  #   - id: threat-intel
+  #     title: Custom Threat Intelligence Feed
+  #     description: Primary feed for Vision One
+  #     auth:
+  #       username: '${TAXII_AUTH_USER}'
+  #       password: '${TAXII_AUTH_PASSWORD}'
+  #   - id: premium
+  #     title: Premium Feed
+  #     description: Second consumer feed
+  #     auth:
+  #       username: '${PREMIUM_TAXII_USER}'
+  #       password: '${PREMIUM_TAXII_PASS}'
 
 # ---------------------------------------------------------------------------
 # INDICATOR LIFECYCLE / TTL (aging & auto-revocation)
@@ -192,7 +219,10 @@ sso:
 otx:
   enabled: false               # set true to start pulling community intel from OTX
   base_url: 'https://otx.alienvault.com'   # OTX API base (no trailing slash)
-  api_key: ''                  # optional free OTX API key (raises rate limits)
+  # Optional free OTX API key — put the real value in .env (OTX_API_KEY=...)
+  # so it never lands in version control. Unset = anonymous read-only browsing
+  # (works, but stricter rate limits).
+  api_key: '${OTX_API_KEY:-}'
   poll_interval: 300           # seconds between poll cycles (5 min)
   max_pulses: 25               # recently-updated pulses inspected per poll
   min_indicator_count: 1       # skip pulses with fewer indicators than this

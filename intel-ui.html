@@ -115,6 +115,8 @@
   .tab.active { background: var(--panel); color: var(--text); }
   section[data-page] { display: none; }
   section[data-page].active { display: block; }
+  .colsel { font-size: 12px; color: var(--muted); margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+  .colsel select { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 4px 8px; }
   /* confirmation modal (replaces the native confirm()) */
   .modal-overlay {
     position: fixed; inset: 0; background: rgba(4, 8, 12, .72);
@@ -174,7 +176,7 @@
     <div class="tabs" id="tabs">
       <button class="tab active" data-page="feed">Feed</button>
       <button class="tab" data-page="sources">Community sources</button>
-      <button class="tab" data-page="import">Import CSV</button>
+      <button class="tab" data-page="import">Import CSV / Excel</button>
     </div>
 
     <!-- ============ PAGE: FEED ============ -->
@@ -186,14 +188,21 @@
       <div class="row" style="margin-bottom:12px">
         <button id="btnLoad" class="ghost">Load current feed</button>
         <button id="btnAdd" class="ghost">+ Add new entry</button>
+        <label class="colsel" title="Which TAXII collection this dashboard shows and edits">
+          Collection
+          <select id="collectionSel"></select>
+        </label>
       </div>
       <div class="feedtools">
-        <input type="search" id="feedSearch" placeholder="Search value, label, type or ID…" autocomplete="off">
+        <input type="search" id="feedSearch" placeholder="Search value, label, type, source or ID…" autocomplete="off">
         <select id="feedType" title="Filter by type">
           <option value="">All types</option>
           <option>ipv4-addr</option>
           <option>domain-name</option>
           <option>file-hash</option>
+          <option>url</option>
+          <option>email-addr</option>
+          <option>ipv6-addr</option>
           <option>indicator</option>
         </select>
         <select id="feedStatus" title="Filter by status">
@@ -207,7 +216,7 @@
         <thead>
           <tr>
             <th style="width:32px"><input type="checkbox" id="chkAll" title="Select all matching"></th>
-            <th>Type</th><th>Value</th><th>Labels</th><th>Confidence</th><th>Status</th><th>ID</th><th></th>
+            <th>Type</th><th>Source</th><th>Value</th><th>Labels</th><th>Confidence</th><th>Status</th><th>ID</th><th></th>
           </tr>
         </thead>
         <tbody id="tbody"></tbody>
@@ -291,25 +300,26 @@
 
     </section>
 
-    <!-- ============ PAGE: IMPORT CSV ============ -->
+    <!-- ============ PAGE: IMPORT CSV / EXCEL ============ -->
     <section data-page="import">
 
-    <!-- CSV import (GT team ad-hoc intel) -->
+    <!-- CSV / Excel import (GT team ad-hoc intel) -->
     <div class="panel">
-      <h2>Import CSV (GT team)</h2>
+      <h2>Import CSV / Excel (GT team)</h2>
       <div class="hint" style="margin:0 0 10px">
-        Upload a CSV with <b>any</b> headers — fuzzy-mapped automatically:
-        <span class="mono">IP_Address / src_ip / Destination → IPv4</span>,
+        Upload a CSV or .xlsx with <b>any</b> headers — fuzzy-mapped automatically:
+        <span class="mono">IP_Address / src_ip / Destination → IPv4/IPv6</span>,
         <span class="mono">domain / hostname / fqdn → domain</span>,
         <span class="mono">md5 / sha1 / sha256 / sha512 → file hash</span>,
+        <span class="mono">indicator / value → URL, email, or free text</span>,
         plus optional <span class="mono">label(s)</span> and
         <span class="mono">confidence</span> columns. Imports <b>append</b>
         to the manual feed (does not wipe existing rows).
         New here? <b>Download the sample CSV</b>, edit the values, and upload it back.
       </div>
       <div class="row">
-        <input type="file" id="csvFile" accept=".csv,text/csv,text/plain" style="max-width:320px">
-        <button id="btnCsvImport" class="ghost" disabled>Import CSV</button>
+        <input type="file" id="csvFile" accept=".csv,text/csv,text/plain,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="max-width:380px">
+        <button id="btnCsvImport" class="ghost" disabled>Import CSV / Excel</button>
         <button id="btnCsvSample" class="ghost" title="Download a ready-to-edit template with all header styles">Download sample CSV</button>
       </div>
       <div id="csvMsg" class="msg" style="margin-top:10px"></div>
@@ -344,6 +354,10 @@ let newRows = [];           // "+ Add new entry" rows (not yet on the server)
 let feedPage = 1;
 const FEED_PAGE_SIZE = 15;
 let feedFilter = { q: "", type: "", status: "" };
+let currentCollection = ""; // "" = primary collection (server default)
+
+// Types the "+ Add new entry" flow can create (editable row type dropdown).
+const EDITABLE_TYPES = ["ipv4-addr", "domain-name", "file-hash", "url", "email-addr", "ipv6-addr", "indicator"];
 
 // --- Community sources model (same search/pagination pattern as the feed) ---
 let pullerData = [];        // every configured puller, in server order
@@ -384,6 +398,8 @@ function autoId(type, value) {
   if (type === "ipv4-addr") return "ipv4-addr--" + value.replace(/\./g, "-");
   if (type === "domain-name") return "domain-name--" + value.replace(/\./g, "-");
   if (type === "file-hash") return "file-hash--" + value.slice(0, 16);
+  if (type === "url" || type === "email-addr" || type === "ipv6-addr")
+    return type + "--" + value.replace(/[^A-Za-z0-9-]/g, "-").replace(/-+/g, "-").slice(0, 64);
   return "indicator--" + value.slice(0, 16);
 }
 
@@ -391,6 +407,9 @@ function buildObject(type, value) {
   if (type === "ipv4-addr") return { "ipv4-addr": { value } };
   if (type === "domain-name") return { "domain-name": { value } };
   if (type === "file-hash") return { hash_value: { algorithm: hashAlgo(value), value } };
+  if (type === "url") return { url: { value } };
+  if (type === "email-addr") return { "email-addr": { value } };
+  if (type === "ipv6-addr") return { "ipv6-addr": { value } };
   return { indicator: { value } };
 }
 
@@ -406,12 +425,44 @@ function validateValue(type, value) {
     return "Not a valid FQDN (e.g. evil.example.com)";
   if (type === "file-hash" && !/^[0-9a-f]{32}|^[0-9a-f]{40}|^[0-9a-f]{64}$/i.test(value))
     return "Not a valid MD5/SHA-1/SHA-256 hash";
+  if (type === "url" && !/^[a-z][a-z0-9+.-]*:\/\/\S+$/i.test(value))
+    return "Not a valid URL (e.g. http://evil.example.com/x)";
+  if (type === "email-addr" && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(value))
+    return "Not a valid email address (e.g. a@evil.example.com)";
+  if (type === "ipv6-addr" && (!/^[0-9a-fA-F:.%]+$/.test(value) || !value.includes(":")))
+    return "Not a valid IPv6 address";
   return null;
 }
 
 // ---------------------------------------------------------------------------
-// Auth / session
+// Auth / session / collections
 // ---------------------------------------------------------------------------
+
+// Populate the collection selector from /ui/collections. The selection is
+// remembered; switching reloads the feed for that collection.
+async function loadCollections() {
+  try {
+    const r = await api("/ui/collections");
+    if (r.status !== 200 || !r.body || !r.body.collections) return;
+    const sel = $("collectionSel");
+    const prev = currentCollection;
+    sel.innerHTML = "";
+    r.body.collections.forEach(c => {
+      const op = document.createElement("option");
+      op.value = c.id;
+      op.textContent = c.id + (c.id === r.body.primary ? " (primary)" : "");
+      if (c.id === prev) op.selected = true;
+      sel.appendChild(op);
+    });
+    if (sel.options.length && ![...sel.options].some(o => o.selected)) {
+      sel.value = r.body.primary || sel.options[0].value;
+    }
+    currentCollection = sel.options[sel.selectedIndex]
+      ? sel.options[sel.selectedIndex].value : "";
+    if (r.body.collections.length > 1) sel.closest(".colsel").style.display = "inline-flex";
+    else sel.closest(".colsel").style.display = "none";
+  } catch (e) { /* registry unavailable — stay on the primary collection */ }
+}
 
 function showLogin(ssoEnabled) {
   $("loginPanel").style.display = "block";
@@ -427,7 +478,7 @@ function showDashboard(user) {
   showPage(currentPageFromHash());
 }
 
-// --- Dashboard page tabs (Feed / Community sources / Import CSV) ---
+// --- Dashboard page tabs (Feed / Community sources / Import CSV / Excel) ---
 const PAGE_NAMES = ["feed", "sources", "import"];
 function currentPageFromHash() {
   const h = (location.hash || "").replace(/^#/, "");
@@ -456,6 +507,7 @@ async function init() {
     SSO_ENABLED = !!(r.body && r.body.sso && r.body.sso.enabled);
     if (r.status === 200 && r.body && r.body.authenticated) {
       showDashboard(r.body.user);
+      await loadCollections();
       loadFeed();
       loadPullers();
     } else {
@@ -477,6 +529,7 @@ async function doLogin() {
     if (r.status === 200) {
       showDashboard(r.body && r.body.user);
       $("loginPass").value = "";
+      await loadCollections();
       loadFeed();
       loadPullers();
     } else {
@@ -518,7 +571,10 @@ function rowElement(o) {
 
   const cType = document.createElement("td");
   const sel = document.createElement("select");
-  ["ipv4-addr", "domain-name", "file-hash", "indicator"].forEach(t => {
+  // Editable types; a loaded row of any other type (relationship, malware,
+  // campaign, …) keeps its actual type as a selectable option.
+  const options = EDITABLE_TYPES.includes(o.type) ? EDITABLE_TYPES : [o.type].concat(EDITABLE_TYPES);
+  options.forEach(t => {
     const op = document.createElement("option");
     op.value = t; op.textContent = t;
     if (o.type === t) op.selected = true;
@@ -526,13 +582,9 @@ function rowElement(o) {
   });
   cType.appendChild(sel);
 
-  // Source + gate badges (only for loaded "existing" rows; new rows are manual/served).
+  // Gate badge (served / withheld) stays in the Type cell; the source
+  // gets its own column (new rows are manual until saved).
   if (o.kind === "existing") {
-    const src = o.source || "manual";
-    const srcSpan = document.createElement("span");
-    srcSpan.className = "src " + (src === "manual" ? "manual" : "otx");
-    srcSpan.textContent = src;
-    cType.appendChild(srcSpan);
     const gate = document.createElement("span");
     if (o.gated) {
       gate.className = "gate withheld"; gate.textContent = "withheld";
@@ -542,6 +594,17 @@ function rowElement(o) {
     }
     cType.appendChild(gate);
   }
+
+  // Source column: manual / otx / a third-party puller's name.
+  const cSrc = document.createElement("td");
+  const src = o.source || "manual";
+  const srcSpan = document.createElement("span");
+  srcSpan.className = "src" + (src === "manual" ? " manual" : "");
+  srcSpan.textContent = src;
+  srcSpan.title = src === "manual"
+    ? "Added manually (web UI / API / CSV)"
+    : "Pulled from a community source";
+  cSrc.appendChild(srcSpan);
 
   const cVal = document.createElement("td");
   const inp = document.createElement("input");
@@ -592,7 +655,7 @@ function rowElement(o) {
   del.addEventListener("click", () => removeRow(tr));
   cDel.appendChild(del);
 
-  tr.append(cChk, cType, cVal, cLbl, cConf, cStatus, cId, cDel);
+  tr.append(cChk, cType, cSrc, cVal, cLbl, cConf, cStatus, cId, cDel);
   tr.dataset.key = o._key || o.id;
   // Keep the model in sync as the user edits. 'change' fires on blur/commit.
   // A commit must NOT rebuild the table: rebuilding on blur destroys the row
@@ -661,14 +724,15 @@ function syncIdCell(tr) {
 }
 
 // Read a row's editable fields from its DOM into a plain object.
+// Cell order: 0 checkbox, 1 type, 2 source, 3 value, 4 labels, 5 confidence.
 function rowFromTr(tr) {
   return {
     _key: tr.dataset.key || tr.dataset.id || "",
     id: tr.dataset.id || "",
     type: tr.children[1].querySelector("select").value,
-    value: tr.children[2].querySelector("input").value.trim(),
-    labels: tr.children[3].querySelector("input").value.split(",").map(s => s.trim()).filter(Boolean),
-    confidence: parseInt(tr.children[4].querySelector("input").value || "0", 10),
+    value: tr.children[3].querySelector("input").value.trim(),
+    labels: tr.children[4].querySelector("input").value.split(",").map(s => s.trim()).filter(Boolean),
+    confidence: parseInt(tr.children[5].querySelector("input").value || "0", 10),
     checked: tr.children[0].querySelector("input").checked,
   };
 }
@@ -678,7 +742,8 @@ function matches(o, f) {
   if (f.status === "active" && o.revoked) return false;
   if (f.status === "revoked" && !o.revoked) return false;
   if (f.q) {
-    const hay = (o.value + " " + (o.labels || []).join(" ") + " " + o.type + " " + o.id).toLowerCase();
+    const hay = (o.value + " " + (o.labels || []).join(" ") + " " + o.type + " "
+      + (o.source || "") + " " + o.id).toLowerCase();
     if (!hay.includes(f.q)) return false;
   }
   return true;
@@ -795,7 +860,8 @@ function flashRow(id) {
 async function loadFeed(opts) {
   opts = opts || {};
   try {
-    const r = await api("/objects");
+    const q = currentCollection ? "?collection=" + encodeURIComponent(currentCollection) : "";
+    const r = await api("/objects" + q);
     if (r.status !== 200) {
       if (r.status === 401) { showLogin(); }
       else showMsg(`Load failed (HTTP ${r.status})`, false);
@@ -864,7 +930,7 @@ function addRow() {
   // (where the new row lives) — otherwise it would be off-screen on a big feed.
   feedPage = Math.ceil(filteredData().length / FEED_PAGE_SIZE);
   renderFeed();
-  const inp = document.querySelector(`#tbody tr[data-key="${k}"] td:nth-child(3) input`);
+  const inp = document.querySelector(`#tbody tr[data-key="${k}"] td:nth-child(4) input`);
   if (inp) inp.focus();
 }
 
@@ -906,7 +972,9 @@ async function save() {
     return obj;
   });
   try {
-    const r = await api("/feed/ingest", { method: "POST", body: JSON.stringify({ stix_objects, mode: "merge" }) });
+    const body = { stix_objects, mode: "merge" };
+    if (currentCollection) body.collection = currentCollection;
+    const r = await api("/feed/ingest", { method: "POST", body: JSON.stringify(body) });
     if (r.status === 200) {
       let text = `Saved ${good.length} object(s) (merge — nothing wiped)`;
       const newIds = good.filter(r => r.isNew).map(r => r.id);
@@ -952,18 +1020,22 @@ async function purgeSelected() {
 }
 
 async function purge() {
+  const target = currentCollection
+    ? ` the "${currentCollection}" collection` : " the entire feed (all collections)";
   if (!await showConfirm(
       "Purge all",
-      "Purge ALL intel from the feed (memory + database), including community entries from pullers? This cannot be undone.",
+      `Purge ALL intel from${target} (memory + database), including community entries from pullers? This cannot be undone.`,
       { danger: true, okLabel: "Purge all" }
   )) return;
   try {
-    const r = await api("/feed/purge", { method: "DELETE" });
+    const q = currentCollection ? "?collection=" + encodeURIComponent(currentCollection) : "";
+    const r = await api("/feed/purge" + q, { method: "DELETE" });
     if (r.status === 200) {
       feedData = [];
       newRows = [];
+      const col = currentCollection ? ` ("${currentCollection}")` : "";
       renderFeed();
-      showMsg("Feed purged.", true);
+      showMsg("Feed purged" + col + ".", true);
     } else {
       showMsg(`Purge failed (HTTP ${r.status})`, false);
     }
@@ -981,6 +1053,7 @@ async function importCsv() {
   btn.disabled = true;
   const fd = new FormData();
   fd.append("file", file);
+  if (currentCollection) fd.append("collection", currentCollection);
   try {
     const r = await apiRaw("/feed/import-csv", { method: "POST", body: fd });
     if (r.status === 200) {
@@ -1201,6 +1274,14 @@ $("btnAdd").addEventListener("click", addRow);
 $("btnSave").addEventListener("click", save);
 $("btnPurgeSelected").addEventListener("click", purgeSelected);
 $("btnPurge").addEventListener("click", purge);
+
+// Collection selector: switching collections reloads that collection's feed.
+$("collectionSel").addEventListener("change", () => {
+  currentCollection = $("collectionSel").value || "";
+  feedData = [];
+  newRows = [];
+  loadFeed();
+});
 
 // Dashboard page tabs (Feed / Community sources / Import CSV) + deep links.
 document.querySelectorAll("#tabs .tab").forEach(b => b.addEventListener("click", onTabClick));

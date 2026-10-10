@@ -49,8 +49,8 @@ Vision One (see [Intel Filter](#intel-filter-filtering-between-server-and-vision
 ### Components
 
 1. **Flask REST API (TAXII 2 Server)** — Hosts TAXII 2.1 protocol endpoints and custom REST endpoints for feed management, UI login/session, community-source control, auth, subscriptions, and health.
-2. **Web UI dashboard** — Single self-contained `intel-ui.html` behind a login (`ui.auth`). Organized into three tabs: **Feed** (the current feed with per-row **source** and **gate** badges, **search / type & status filters / pagination**, withheld-by-filter panel, and manual entry/publish), **Community sources** (puller status + "Pull now", with the same **search + pagination**), and **Import CSV** (GT-team ad-hoc import). Serves all intel (the gate only affects what Vision One gets).
-3. **STIX 2.1 Store** — Stores threat intelligence objects (IPs, file hashes, domains, indicators) in SQLite with an in-memory store for fast polling. Every object carries a `source` tag (`manual` | `otx` | a `taxii_pullers` name) so manual and community intel coexist. Puller sync state (`last_sync`, `last_added`) is persisted in a `puller_state` table so delta pulls survive restarts.
+2. **Web UI dashboard** — Single self-contained `intel-ui.html` behind a login (`ui.auth`). Organized into three tabs: **Feed** (the current feed with per-row **source** and **gate** badges, a **collection** selector when multiple collections exist, **search / type & status filters / pagination**, withheld-by-filter panel, and manual entry/publish), **Community sources** (puller status + "Pull now", with the same **search + pagination**), and **Import CSV / Excel** (GT-team ad-hoc import: `.csv` or `.xlsx`). Serves all intel (the gate only affects what Vision One gets).
+3. **STIX 2.1 Store** — Stores threat intelligence objects (IPs, file hashes, domains, URLs, emails, indicators, malware / threat-actor / campaign SDOs, and STIX *relationships* — a real graph, not just flat IOCs) in SQLite with an in-memory store for fast polling. Every object carries a `source` tag (`manual` | `otx` | a `taxii_pullers` name) and a `collection_id` (see [Multiple collections](#multiple-collections--per-client-rbac)) so manual and community intel coexist cleanly. Puller sync state (`last_sync`, `last_added`) is persisted in a `puller_state` table so delta pulls survive restarts.
 4. **OTX Community Puller** — Background thread that periodically pulls indicators (IPv4, domains, file hashes) from **AlienVault OTX** public pulses and merges them into the feed tagged `source='otx'`. Off by default; can also be fired on demand from the UI.
 5. **Third-party TAXII 2.1 Pullers** — One generic puller per `taxii_pullers:` entry. Polls `GET {api_root}collections/{collection}/objects/?since=` from any TAXII 2.1 server (Basic auth, `application/taxii+json;version=2.1`), maps STIX 2.1 objects into the feed in merge mode tagged with the puller's `name`. Off by default per entry.
 6. **Self-check Poller** — Background thread that periodically fetches the local `/feed` endpoint to verify the feed is reachable and well-formed. Off by default.
@@ -391,10 +391,23 @@ Accepts STIX 2.1 JSON objects into the feed. The `mode` field selects the
 write semantics:
 
 - **`"replace"`** (default, legacy) — wipes and rebuilds the *manual* feed
-  from the list (community-sourced rows are untouched).
+  of the **target collection** (community-sourced rows are untouched).
 - **`"merge"`** — upsert by STIX id: edits/labels/confidence are refreshed,
   new ids are added, **everything else is preserved**. This is what the web
   UI **Save changes** button sends.
+
+Optional `collection` field targets a TAXII collection (default: the primary
+collection — see [Multiple Collections](#multiple-collections--per-client-rbac)).
+
+**Supported STIX 2.1 types:** `ipv4-addr`, `domain-name`, `file-hash`,
+`indicator`, `url`, `email-addr`, `ipv6-addr`, `mac-addr`,
+`windows-registry-key`, `autonomous-system`, `malware`, `malware-family`,
+`threat-actor`, `campaign`, and `relationship` (a full STIX graph, not just
+flat IOCs). Every object is validated before storage — id/type shape
+(`<type>--<value>`, prefix must match the type), confidence 0–100,
+list-shaped labels, parseable timestamps, and complete relationship
+triples. Invalid objects are **skipped with a warning** (never block the
+batch) — the response's `objects_count` reflects what was actually stored.
 
 **Request Body:**
 ```json
@@ -608,9 +621,9 @@ wrapped in a TAXII 2.1 message.
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /taxii2/` | API Root + Server Discovery |
-| `GET /taxii2/collections/` | List collections |
-| `GET /taxii2/collections/<id>/` | Collection info (`can_read`) |
-| `GET /taxii2/collections/<id>/objects/` | **Poll STIX 2.1 objects** (supports `?since=`/`?added_after=`, `?match[type]=`, `?match[id]=`) |
+| `GET /taxii2/collections/` | List collections — **only the collections the authenticated principal's credentials may read** (multi-collection RBAC; one collection = one credential set) |
+| `GET /taxii2/collections/<id>/` | Collection info (`can_read`) — `404` unknown id, `401` with another collection's credentials |
+| `GET /taxii2/collections/<id>/objects/` | **Poll STIX 2.1 objects** (supports `?since=`/`?added_after=`, `?match[type]=`, `?match[id]=` — comma-separated lists allowed — and `?limit=` + `?next=` pagination) |
 | `POST /taxii2/collections/<id>/objects/` | Add-objects ack (read-only feed → no-op) |
 | `GET /taxii2/status/<id>/` | Status (reports `complete`) |
 | `GET /taxii2/subscriptions/` | Subscription list (empty) |
@@ -627,11 +640,32 @@ curl -u admin:admin 'http://localhost:5000/taxii2/collections/threat-intel/objec
 curl -u admin:admin 'http://localhost:5000/taxii2/collections/threat-intel/objects/?match[id]=domain-name--evil-example-com'
 ```
 
+**Pagination (TAXII 2.1 §5.3):** `?limit=N` caps a page and the response
+carries `more` + a `next` cursor (keyset-based on `(modified, stix_id)`, so
+pages stay consistent while the feed changes and never loop):
+
+```bash
+curl -u admin:admin 'http://localhost:5000/taxii2/collections/threat-intel/objects/?limit=100'
+# -> {..., "more": true, "next": "<opaque-cursor>", ...}
+curl -u admin:admin 'http://localhost:5000/taxii2/collections/threat-intel/objects/?limit=100&next=<opaque-cursor>'
+```
+
+Malformed `limit`/`since`/`next` values return a TAXII `400` (error code
+`malformed`) instead of being silently ignored.
+
 > **Revoked objects** are included in the bundle with `revoked: true` (see
 > [Indicator Lifecycle](#indicator-lifecycle-ttl--revocation)) so clients can
 > purge them — they are never silently omitted.
 
 ### Verifying it works (without Vision One)
+
+Trend Micro Vision One / XDR are **TAXII 2.1 clients**, so the authoritative
+stand-in is the OASIS reference client, `taxii2-client`.
+
+> **Not Cabby.** [Cabby](https://cabby.readthedocs.io) is a **TAXII 1.0/1.1**
+> client ("supports all TAXII services according to TAXII specification
+> (v1.0 and v1.1)"); it cannot talk to a TAXII 2.1 server and will fail at
+> discovery. Use `taxii2-client` (below) for 2.1.
 
 ```bash
 # 1. Discover the API root
@@ -640,8 +674,20 @@ curl -u admin:admin http://localhost:5000/taxii2/
 # 2. Poll objects (raw TAXII 2.1 message envelope)
 curl -u admin:admin http://localhost:5000/taxii2/collections/threat-intel/objects/
 
-# 3. With the official OASIS reference client (recommended)
+# 3. One-liner with the official OASIS reference client (recommended)
+pip install taxii2-client
 python -c "from taxii2client import ApiRoot; r=ApiRoot('http://localhost:5000/taxii2/',user='admin',password='admin'); r.refresh_collections(); print(r.collections[0].get_objects())"
+```
+
+**Repeatable check** (discovery, Get Objects, the spec filters — including
+*comma-separated* `match[type]`/`match[id]` — pagination, and per-collection
+RBAC). Exits non-zero on any failure, so it can gate a deploy:
+
+```bash
+pip install taxii2-client requests
+TAXII_URL=http://localhost:5000/taxii2/ TAXII_USER=admin TAXII_PASSWORD=admin \
+  TAXII_PREMIUM_USER=<2nd-collection-user> TAXII_PREMIUM_PASSWORD=<2nd-collection-pass> \
+  python tests/verify_reference_client.py
 ```
 
 ### Optional background pollers (all off by default)
@@ -663,12 +709,61 @@ own (see Step 3). They are optional helpers (all off by default):
   that name has been dropped, but old `vision_one:` configs still work.)
 
 > **Note on ingest modes.** `POST /feed/ingest` takes an optional `mode`:
-> *replace* (default — wipes and rebuilds the `source='manual'` feed) or
-> *merge* (upsert by STIX id, append-only). The web UI **Save changes**
-> button uses *merge*, so a save never wipes anything (manual **or**
-> community intel); dropping entries is an explicit action (*Purge selected*
-> / × / *Purge all*). The OTX and TAXII pullers also use *merge* mode. This
-> keeps hand-fed intel and pulled community intel independent of each other.
+> *replace* (default — wipes and rebuilds the `source='manual'` feed of the
+> **target collection**) or *merge* (upsert by STIX id, append-only). The
+> web UI **Save changes** button uses *merge*, so a save never wipes
+> anything (manual **or** community intel); dropping entries is an explicit
+> action (*Purge selected* / × / *Purge all*). The OTX and TAXII pullers
+> also use *merge* mode. This keeps hand-fed intel and pulled community
+> intel independent of each other.
+
+## Multiple Collections (per-client RBAC)
+
+The server ships as a **single collection** (`threat-intel`, one credential
+set) — Vision One's setup. To serve a *second* consumer (a firewall, a SIEM,
+a partner) a **different view with different credentials**, list collections
+under `taxii.collections:` in `config.yaml`. When that list is present it
+**replaces** the legacy `collection_id` / `auth` keys:
+
+```yaml
+taxii:
+  collections:
+    - id: threat-intel          # feeds Vision One (primary)
+      title: Custom Threat Intelligence Feed
+      auth:
+        username: '${TAXII_AUTH_USER}'
+        password: '${TAXII_AUTH_PASSWORD}'
+    - id: premium                # a second consumer's view
+      title: Premium Feed
+      auth:
+        username: '${PREMIUM_TAXII_USER}'
+        password: '${PREMIUM_TAXII_PASS}'
+```
+
+**How RBAC works:**
+
+- **One credential set per collection.** A TAXII client authenticates with
+  the collection's own HTTP Basic credentials (or `X-Taxii-*` headers).
+- **Collection listing is scoped.** `GET /taxii2/collections/` returns only
+  the collections the authenticated principal's credentials may read, so a
+  premium-only client never sees the primary feed's existence, let alone
+  its objects. Get Objects for a collection the credentials can't read
+  returns `401`.
+- **The legacy single credential set is a "global" principal.** If you keep
+  the old `taxii.auth` / app-level credentials, they can read every
+  collection (backward compatible — existing clients keep working).
+- **Objects are stored per collection.** Every object carries a
+  `collection_id`; the data endpoints take an optional `collection` field /
+  `?collection=` (web UI: the **Collection** selector on the Feed tab;
+  default = the primary collection). `POST /feed/ingest {"collection":
+  "premium", ...}` targets a specific collection, `GET /objects?collection=
+  premium` views it, and "Purge all" now wipes *only the selected
+  collection* (a bare `DELETE /feed/purge` without `?collection=` still
+  wipes everything, for scripts). Community pullers (OTX / third-party
+  TAXII) always feed the primary collection.
+
+See the commented `collections:` block in `config.yaml` and the
+`PREMIUM_TAXII_USER` / `PREMIUM_TAXII_PASS` keys in `.env.example`.
 
 ## Indicator Lifecycle (TTL & revocation)
 
@@ -768,17 +863,18 @@ enable it** — the server ships with all pullers off.
 
 ### 3. CSV import (GT-team ad-hoc intel)
 
-For one-off intel uploads that don't fit the other paths. Upload a `.csv` in
-the **Import CSV (GT team)** dashboard panel (or `POST /feed/import-csv`),
-with **any** headers — they are fuzzy-mapped, then each value is validated
-and typed:
+For one-off intel uploads that don't fit the other paths. Upload a `.csv`
+**or `.xlsx`** in the **Import CSV / Excel (GT team)** dashboard panel (or
+`POST /feed/import-csv`, multipart `file` field — the first row is the
+header), with **any** headers — they are fuzzy-mapped, then each value is
+validated and typed:
 
 | Header contains (case-insensitive) | Mapped to |
 |------------------------------------|-----------|
-| `ip_address`, `src_ip`, `dst_ip`, `destination`, `ip` | `ipv4-addr` (only if a valid IPv4) |
+| `ip_address`, `src_ip`, `dst_ip`, `destination`, `ip` | `ipv4-addr` (valid IPv4) **or** `ipv6-addr` (valid IPv6) |
 | `domain`, `hostname`, `host`, `fqdn` | `domain-name` (only if domain-shaped) |
 | `md5`, `sha1`, `sha256`, `sha512`, `hash` | `file-hash` (hex, algo from length) |
-| `indicator`, `value`, `ioc` (free text) | `indicator` |
+| `indicator`, `value`, `ioc` (free text) | `url` / `email-addr` / `ipv6-addr` / `mac-addr` / `autonomous-system` (value-shaped) or `indicator` (other text) |
 | `label` / `tags` | labels (comma-separated) |
 | `confidence` / `conf` | confidence (0–100, default 50) |
 
@@ -786,10 +882,12 @@ A row may carry **several** recognized values (e.g. both `src_ip` and a
 domain) — each valid value becomes its own object. Rows with no
 recognizable value are reported in `skipped`. Import uses **merge** mode
 tagged `source='manual'`, so it **appends** to your manual feed and never
-wipes existing rows (unlike the "Save feed (replace)" button).
+wipes existing rows (unlike the "Save feed (replace)" button). Pass a
+`collection` form field to import into a specific TAXII collection instead
+of the primary (the UI sends the collection selected on the Feed tab).
 
 ```bash
-# Raw CSV body (also accepts a multipart "file" field from the UI)
+# Raw CSV body (also accepts a multipart "file" field from the UI; .xlsx works too)
 curl -X POST http://localhost:5000/feed/import-csv \
   -u admin:admin -H 'Content-Type: text/csv' \
   -d 'IP_Address,Destination,labels
@@ -797,6 +895,9 @@ curl -X POST http://localhost:5000/feed/import-csv \
 5.6.7.8,bot.evil.net,apt'
 # -> {"imported": 4, "skipped": [], "skipped_total": 0}
 ```
+
+> `.xlsx` needs `openpyxl` (already in `requirements.txt`); the server boots
+> without it and returns a clear error only if you upload a workbook.
 
 ## Intel Filter (filtering between server and Vision One)
 
@@ -864,7 +965,17 @@ Run the test suite:
 python tests/test_server.py
 ```
 
-This covers all TAXII 2.1 endpoints, ingestion (replace + merge modes),
+This covers all TAXII 2.1 endpoints, **Get Objects pagination**
+(`limit` / `next` / `more`, keyset consistency, `400`s on malformed
+params), **extended STIX object types** (url / email-addr / ipv6-addr /
+mac-addr / windows-registry-key / autonomous-system), **the STIX graph**
+(relationship / malware / threat-actor / campaign ingest + serving,
+third-party puller mapping, community-sourced gating of the new types),
+**multi-collection RBAC** (per-collection credentials, scoped collection
+listing, isolated Get Objects, collection-scoped data endpoints and
+purge), ingestion (replace + merge modes, validation skipping), Excel
+(**.xlsx**) + CSV import (fuzzy header mapping, indicator-column URL/IPv6
+promotion, merge-not-replace, auth, bad-input handling),
 authentication (TAXII creds **and** the UI session cookie), subscription
 management, STIX 2.1 object mapping (IP / domain / file-hash / indicator
 patterns), TAXII bundle generation (including `match[type]`, `match[id]`,
@@ -878,11 +989,10 @@ data access), the **intel gate** (private-IP drop, freshness, confidence
 floor, blocklist, and that manual intel is never gated), **manual
 revocation** (`POST /objects/<id>/revoke`, stickiness across saves,
 `revoked: true` in the TAXII bundle) and **TTL auto-revocation** (per-type
-aging sweep), **CSV import** (fuzzy header mapping, merge-not-replace,
-auth, bad-input handling), and **SSO** (Microsoft Entra OIDC: PKCE
-authorize redirect + challenge math, signed-state CSRF rejection, real
-RS256 ID-token validation against a local key for signature/audience/nonce,
-domain/UPN/group allow-lists, and session-cookie issuance on success).
+aging sweep), and **SSO** (Microsoft Entra OIDC: PKCE authorize redirect +
+challenge math, signed-state CSRF rejection, real RS256 ID-token
+validation against a local key for signature/audience/nonce, domain/UPN/
+group allow-lists, and session-cookie issuance on success).
 
 ## Security Considerations
 
@@ -934,7 +1044,8 @@ Rules:
 | `FLASK_SECRET` | *(required, no default)* | Flask secret key (signs UI session + SSO state cookies) — set in `.env` |
 | `TAXII_AUTH_USER` / `TAXII_AUTH_PASSWORD` | *(no default)* | TAXII client credentials (`taxii.auth`) — what Vision One uses on `/taxii2/`. Unset → startup warning; `/taxii2/` rejects all clients |
 | `UI_AUTH_USER` / `UI_AUTH_PASSWORD` | *(no default)* | Dashboard login credentials (`ui.auth`). Unset → startup warning; `/ui/login` fails closed (503) |
-| `DATABASE_URL` | `sqlite:///taxii_feed.db` | Database connection URL |
+| `DATABASE_URL` | `sqlite:///taxii_feed.db` | Database connection URL (set to e.g. `postgresql+psycopg2://taxii:...@127.0.0.1:5432/taxii_feed` to run on PostgreSQL) |
+| `OTX_API_KEY` | *(empty)* | Optional AlienVault OTX API key (`otx.api_key` in config.yaml, `${OTX_API_KEY:-}`). Free key from otx.alienvault.com raises the public read-only rate limits; empty = anonymous browsing (throttled) |
 | `SSO_CLIENT_SECRET` | *(empty)* | Microsoft Entra client secret (referenced by `sso.client_secret` in config.yaml) |
 
 ## Troubleshooting
@@ -985,8 +1096,14 @@ because they are either off-mission for this single-consumer feed (Vision One)
 or conflict with the offline / low-attack-surface design. Recorded here so
 they are explicit, not forgotten:
 
-- **Excel (.xlsx) import** — CSV is supported; .xlsx would add `openpyxl`
-  (still offline-installable). Do only if the GT team actually ships .xlsx.
+> **Implemented since this list was written:** `limit`/`next` pagination on
+> Get Objects (now spec §5.3 keyset pagination), Excel (.xlsx) import, extra
+> STIX 2.1 object types (url / email-addr / ipv6-addr / mac-addr /
+> windows-registry-key / autonomous-system), a real STIX graph subset
+> (relationships + malware / threat-actor / campaign), and multiple
+> collections with per-client credentials (RBAC). See the relevant sections
+> above.
+
 - **Non-TAXII HTTP feed connectors** — Abuse.ch / ThreatFox style pullers
   (OTX and *any* TAXII 2.1 server are already covered by the generic puller;
   MISP in particular can be added today as a `taxii_pullers:` entry).
@@ -999,14 +1116,11 @@ they are explicit, not forgotten:
 - **AI/ML scoring & quarantine** — the rule-based intel gate already covers
   false-positive reduction in an auditable, offline way; an ML layer is a
   large scope addition with little to gain at this scale.
-- **STIX relationships / threat actors / malware objects** — the store is flat
-  IOCs; a full STIX 2.1 graph (relationships, `malware`, `threat-actor`) is a
-  model-level change.
-- **Collection-based RBAC** (multiple collections, per-client subscriptions)
-  — single collection + single credential set fits one consumer; add when a
-  second SIEM / firewall needs a different view.
-- **`limit` / `offset` pagination** on Get Objects — objects are small; add
-  only if a bundle ever grows too large.
+- **Full STIX 2.1 graph** (the whole SDO/SRO catalog: `attack-pattern`,
+  `tool`, `infrastructure`, `intrusion-set`, `campaign`-to-indicator link
+  tables, object-level `created_by_ref`) — the store now supports
+  relationships + the core SDOs; a complete catalog is a model-level
+  extension of the same pattern.
 
 ## License
 

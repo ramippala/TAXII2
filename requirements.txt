@@ -7,3 +7,13 @@ pyyaml==6.0.1
 # Verifies the ID-token JWT the identity provider returns.
 PyJWT==2.15.1
 cryptography==50.0.2
+requests==2.32.3
+# Excel (.xlsx) import — only used by /feed/import-csv for .xlsx uploads.
+openpyxl==3.1.2
+
+# Verification only (tests/verify_reference_client.py) — NOT needed to run the
+# server. The OASIS reference client, for checking the feed the same way a
+# TAXII 2.1 client (Vision One / XDR) does.
+# taxii2-client==2.3.0
+# PostgreSQL driver — only if database.url / DATABASE_URL points at Postgres.
+# psycopg2-binary==2.9.9

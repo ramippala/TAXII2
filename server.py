@@ -47,7 +47,9 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    and_,
     create_engine,
+    or_,
     text,
 )
 from sqlalchemy.ext.declarative import declarative_base
@@ -188,6 +190,13 @@ class STIXObject(Base):
     hash_value = Column(String, nullable=True)  # file hash
     ip_address = Column(String, nullable=True)   # IP address
     domain = Column(String, nullable=True)       # FQDN
+    value = Column(String, nullable=True)        # generic single-value SCOs (url,
+                                                 # email-addr, ipv6-addr, mac-addr, ...)
+    source_ref = Column(String, nullable=True)   # STIX relationship source_ref
+    target_ref = Column(String, nullable=True)   # STIX relationship target_ref
+    relationship_type = Column(String, nullable=True)  # STIX relationship_type
+    collection_id = Column(String, default='threat-intel', index=True)  # which TAXII
+                                                 # collection this object belongs to
     source = Column(String, nullable=True)       # origin: 'manual' | 'otx'
     first_seen = Column(DateTime, nullable=True)
     last_seen = Column(DateTime, nullable=True)
@@ -232,6 +241,18 @@ def _utc_now_iso() -> str:
     return datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
+def _parse_iso_ts(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp (with or without a trailing 'Z') to a naive
+    UTC datetime, or None if it cannot be parsed."""
+    s = str(value)
+    for candidate in (s.replace('Z', '+00:00'), s):
+        try:
+            return datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+    return None
+
+
 def create_session():
     """Create a new database session (caller is responsible for closing)."""
     return SessionLocal()
@@ -257,6 +278,30 @@ def init_db() -> None:
                     text('ALTER TABLE stix_objects ADD COLUMN revoked_at DATETIME')
                 )
             logger.info("Migrated stix_objects: added 'revoked_at' column")
+        # Extended STIX types (url/email/ipv6/mac/...), relationships, and
+        # multi-collection support (idempotent; databases created after these
+        # columns existed already have them).
+        for col, ddl in (
+            ('value', 'VARCHAR'),
+            ('source_ref', 'VARCHAR'),
+            ('target_ref', 'VARCHAR'),
+            ('relationship_type', 'VARCHAR'),
+            ('collection_id', 'VARCHAR'),
+        ):
+            if col not in cols:
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(f'ALTER TABLE stix_objects ADD COLUMN {col} {ddl}')
+                    )
+                logger.info("Migrated stix_objects: added '%s' column", col)
+        # Backfill: pre-collection rows belong to the primary collection.
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE stix_objects SET collection_id = 'threat-intel' "
+                    "WHERE collection_id IS NULL"
+                )
+            )
     logger.info("Database initialized")
 
 
@@ -286,6 +331,11 @@ def rehydrate_memory() -> int:
                     hash_value=row.hash_value,
                     ip_address=row.ip_address,
                     domain=row.domain,
+                    value=row.value,
+                    source_ref=row.source_ref,
+                    target_ref=row.target_ref,
+                    relationship_type=row.relationship_type,
+                    collection=row.collection_id or 'threat-intel',
                     source=row.source or 'manual',
                     revoked=bool(row.revoked),
                 )
@@ -458,6 +508,12 @@ class ThreatIntel:
     hash_value: Optional[str] = None
     ip_address: Optional[str] = None
     domain: Optional[str] = None
+    value: Optional[str] = None           # generic single-value SCOs (url, email-addr,
+                                          # ipv6-addr, mac-addr, windows-registry-key, AS)
+    source_ref: Optional[str] = None      # STIX relationship source_ref
+    target_ref: Optional[str] = None      # STIX relationship target_ref
+    relationship_type: Optional[str] = None  # STIX relationship_type
+    collection: str = 'threat-intel'      # TAXII collection this object belongs to
     source: str = 'manual'
     revoked: bool = False  # once revoked -> served as STIX revoked: true
 
@@ -477,8 +533,16 @@ class ThreatIntel:
             }
         elif self.object_type == "domain-name":
             obj_dict["value"] = self.domain or self.stix_id
-        elif self.object_type in ("indicator", "malware", "malware-family"):
+        elif self.object_type in ("url", "email-addr", "ipv6-addr", "mac-addr",
+                                  "windows-registry-key", "autonomous-system"):
+            obj_dict["value"] = self.value or self.stix_id
+        elif self.object_type in ("indicator", "malware", "malware-family",
+                                  "threat-actor", "campaign"):
             obj_dict["value"] = self.name or "Threat Intel Indicator"
+        elif self.object_type == "relationship":
+            obj_dict["source_ref"] = self.source_ref or ''
+            obj_dict["relationship_type"] = self.relationship_type or ''
+            obj_dict["target_ref"] = self.target_ref or ''
         else:
             obj_dict["value"] = self.stix_id
 
@@ -520,10 +584,19 @@ app.config['TAXII_AUTH'] = {
     'password': _taxii_auth_cfg.get('password') or '',
 }
 if not app.config['TAXII_AUTH']['username'] or not app.config['TAXII_AUTH']['password']:
-    print('WARNING: TAXII credentials (TAXII_AUTH_USER/TAXII_AUTH_PASSWORD) '
-          'are not set — set them in .env (see .env.example). /taxii2/ and '
-          'the TAXII-cred data endpoints will reject all clients until then.',
-          file=sys.stderr)
+    # No legacy override; check whether per-collection credentials are
+    # configured instead (taxii.collections:) before warning.
+    taxii_entries = (CONFIG.get('taxii', {}) or {}).get('collections')
+    has_collection_creds = isinstance(taxii_entries, list) and any(
+        isinstance(e, dict) and (e.get('auth') or {}).get('username')
+        and (e.get('auth') or {}).get('password')
+        for e in taxii_entries
+    )
+    if not has_collection_creds:
+        print('WARNING: TAXII credentials (TAXII_AUTH_USER/TAXII_AUTH_PASSWORD) '
+              'are not set — set them in .env (see .env.example). /taxii2/ and '
+              'the TAXII-cred data endpoints will reject all clients until then.',
+              file=sys.stderr)
 _cors_origins = (CONFIG.get('server', {}) or {}).get('cors_origins') or ['*']
 CORS(app, origins=_cors_origins)
 
@@ -533,7 +606,12 @@ CORS(app, origins=_cors_origins)
 # ---------------------------------------------------------------------------
 
 def _get_taxii_auth_config() -> Dict[str, str]:
-    """Get TAXII 2 authentication credentials (app.config overridable in tests)."""
+    """Legacy override credentials (app.config overridable in tests).
+
+    This is the old single-credential model: tests (and old configs) set
+    app.config['TAXII_AUTH'] and expect every endpoint to accept it. It is
+    treated as a *global* principal: valid anywhere, reads every collection.
+    """
     auth = app.config.get('TAXII_AUTH') or {}
     return {
         'username': auth.get('username', ''),
@@ -557,14 +635,39 @@ def _request_taxii_credentials() -> Tuple[str, str]:
 
 
 def _validate_taxii_auth(client_user: str, client_pass: str) -> bool:
-    """Validate TAXII 2 authentication credentials."""
-    auth = _get_taxii_auth_config()
-    if not auth.get('username'):
-        return False
-    return (
-        client_user == auth.get('username')
-        and client_pass == auth.get('password')
+    """Validate TAXII 2 authentication credentials.
+
+    True when the credentials match ANY configured collection, or the
+    legacy/test override (which can read every collection).
+    """
+    override = _get_taxii_auth_config()
+    if override.get('username'):
+        if (client_user == override.get('username')
+                and client_pass == override.get('password')):
+            return True
+    return any(
+        c.username and c.username == client_user and c.password == client_pass
+        for c in TAXII_COLLECTIONS
     )
+
+
+def _collections_readable_by(client_user: str, client_pass: str
+                             ) -> 'List[CollectionConfig]':
+    """Collections a principal (TAXII credentials) may read.
+
+    The legacy/test override is a global principal: it reads every
+    collection. Otherwise a principal reads exactly the collection(s)
+    whose configured username/password match its credentials.
+    """
+    override = _get_taxii_auth_config()
+    if override.get('username'):
+        if (client_user == override.get('username')
+                and client_pass == override.get('password')):
+            return list(TAXII_COLLECTIONS)
+    return [
+        c for c in TAXII_COLLECTIONS
+        if c.username and c.username == client_user and c.password == client_pass
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -975,13 +1078,74 @@ def _unauthorized_feed_response() -> Response:
 # Feed Ingestion (shared by REST endpoint and pollers)
 # ---------------------------------------------------------------------------
 
+# STIX 2.1 object types this server can store and serve. The classic IOC
+# types (ipv4-addr / domain-name / file-hash / indicator) are joined by
+# extra single-value SCOs (url, email-addr, ipv6-addr, mac-addr,
+# windows-registry-key, autonomous-system), the SDOs the UI feeds
+# (malware / threat-actor / campaign), and STIX relationships (the graph).
+_SUPPORTED_STIX_TYPES = frozenset({
+    'ipv4-addr', 'domain-name', 'file-hash', 'indicator',
+    'url', 'email-addr', 'ipv6-addr', 'mac-addr',
+    'windows-registry-key', 'autonomous-system',
+    'malware', 'malware-family', 'threat-actor', 'campaign', 'relationship',
+})
+
+
+def _validate_stix_object(obj: Any) -> Optional[str]:
+    """Validate an ingest payload; returns a warning string or None (valid).
+
+    Loose by design — community pullers and the web UI generate these, and
+    a bad row must not block the batch: the caller skips the object and
+    logs the warning instead. Checks id/type shape and prefix consistency,
+    a supported type, integer confidence in [0, 100], list-shaped labels,
+    and parseable created/modified timestamps.
+    """
+    if not isinstance(obj, dict):
+        return 'not an object'
+    stix_id = obj.get('id')
+    obj_type = obj.get('type')
+    if not isinstance(stix_id, str) or not stix_id:
+        return 'missing/empty id'
+    if not isinstance(obj_type, str) or not obj_type:
+        return 'missing/empty type'
+    if obj_type not in _SUPPORTED_STIX_TYPES:
+        return f'unsupported type {obj_type!r}'
+    if not re.fullmatch(r'[A-Za-z0-9\-]+--[A-Za-z0-9\-]+', stix_id):
+        return f'bad STIX id shape {stix_id!r} (expected <type>--<value>)'
+    if not stix_id.startswith(obj_type + '--'):
+        return (f'id prefix {stix_id.split("--", 1)[0]!r} '
+                f'does not match type {obj_type!r}')
+    confidence = obj.get('confidence')
+    if confidence is not None:
+        try:
+            if not 0 <= int(confidence) <= 100:
+                return f'confidence out of range: {confidence}'
+        except (TypeError, ValueError):
+            return f'confidence not an integer: {confidence!r}'
+    labels = obj.get('labels')
+    if labels is not None and not isinstance(labels, list):
+        return 'labels must be a list'
+    if obj_type == 'relationship':
+        od = obj.get('object') or {}
+        nested = od.get('relationship') if isinstance(od, dict) else None
+        inner = nested if isinstance(nested, dict) else od
+        for field in ('source_ref', 'relationship_type', 'target_ref'):
+            if not inner.get(field):
+                return f'relationship missing {field!r}'
+    for key in ('created', 'modified'):
+        if obj.get(key) is not None and _parse_iso_ts(obj.get(key)) is None:
+            return f'{key} not parseable: {obj.get(key)!r}'
+    return None
+
+
 def _extract_object_fields(
     obj_type: str, object_dict: Any
 ) -> Dict[str, Optional[str]]:
     """Extract typed values from an ingested STIX object payload.
 
     Accepts both flat ({"value": ...}) and type-nested
-    ({"ipv4-addr": {"value": ...}}) payload shapes.
+    ({"ipv4-addr": {"value": ...}}) payload shapes, plus the
+    relationship fields (source_ref / target_ref / relationship_type).
     """
     if not isinstance(object_dict, dict):
         object_dict = {}
@@ -993,6 +1157,10 @@ def _extract_object_fields(
         'hash_value': None,
         'ip_address': None,
         'domain': None,
+        'value': None,
+        'source_ref': None,
+        'target_ref': None,
+        'relationship_type': None,
     }
 
     if obj_type == 'file-hash':
@@ -1005,13 +1173,26 @@ def _extract_object_fields(
         result['ip_address'] = inner.get('value')
     elif obj_type == 'domain-name':
         result['domain'] = inner.get('value')
-    elif obj_type in ('indicator', 'malware', 'malware-family'):
+    elif obj_type in ('url', 'email-addr', 'ipv6-addr', 'mac-addr'):
+        result['value'] = inner.get('value')
+    elif obj_type == 'windows-registry-key':
+        # STIX uses `key` for registry keys; accept value as a fallback.
+        result['value'] = inner.get('key') or inner.get('value')
+    elif obj_type == 'autonomous-system':
+        num = inner.get('number')
+        result['value'] = str(num) if num is not None else inner.get('value')
+    elif obj_type == 'relationship':
+        result['source_ref'] = inner.get('source_ref')
+        result['relationship_type'] = inner.get('relationship_type')
+        result['target_ref'] = inner.get('target_ref')
+    elif obj_type in ('indicator', 'malware', 'malware-family',
+                      'threat-actor', 'campaign'):
         result['name'] = inner.get('value') or inner.get('name')
     return result
 
 
 def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
-                   source: str = 'manual') -> int:
+                   source: str = 'manual', collection: str = 'threat-intel') -> int:
     """Store STIX objects into the feed (memory + DB).
 
     ``mode``:
@@ -1025,10 +1206,13 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
         appended, never dropped by a poller.
 
     ``source`` tags each stored object with its origin (``'manual'`` for
-    web-UI/API ingest, ``'otx'`` for the OTX puller, ...).
+    web-UI/API ingest, ``'otx'`` for the OTX puller, ...). ``collection``
+    is the TAXII collection the objects belong to (defaults to the primary
+    collection).
 
-    Returns the number of objects stored in the mode-specific batch.
-    Raises on failure.
+    Objects failing :func:`_validate_stix_object` are skipped with a warning
+    (never blocking the batch). Returns the number of objects stored in the
+    mode-specific batch. Raises on failure.
     """
     session = create_session()
     try:
@@ -1048,26 +1232,33 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                 else:
                     existing = {}
             else:
-                # Replace: wipe only the manual feed; community-sourced rows
-                # survive so a UI save cannot delete pulled intel.
+                # Replace: wipe only the manual feed OF THIS COLLECTION;
+                # community-sourced rows and other collections survive so a
+                # UI save cannot delete pulled intel or a sibling collection.
                 preserved_revoked = {
                     r.stix_id: bool(r.revoked)
                     for r in session.query(STIXObject.stix_id, STIXObject.revoked).filter_by(
-                        source=source
+                        source=source, collection_id=collection
                     ).all()
                 }
-                session.query(STIXObject).filter_by(source=source).delete()
-                for s in [s for s in memory_store if memory_store[s].source == source]:
+                session.query(STIXObject).filter_by(
+                    source=source, collection_id=collection
+                ).delete()
+                for s in [s for s in memory_store
+                          if memory_store[s].source == source
+                          and memory_store[s].collection == collection]:
                     memory_store.pop(s, None)
                 session.flush()
                 existing = {}
 
             count = 0
             for obj_dict in stix_objects:
+                warn = _validate_stix_object(obj_dict)
+                if warn:
+                    logger.warning("Skipping invalid STIX object: %s", warn)
+                    continue
                 stix_id = obj_dict.get('id')
                 obj_type = obj_dict.get('type')
-                if not stix_id or not obj_type:
-                    continue
 
                 object_dict = obj_dict.get('object') or {}
                 labels = obj_dict.get('labels') or []
@@ -1103,6 +1294,11 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                     hash_value=fields['hash_value'],
                     ip_address=fields['ip_address'],
                     domain=fields['domain'],
+                    value=fields['value'],
+                    source_ref=fields['source_ref'],
+                    target_ref=fields['target_ref'],
+                    relationship_type=fields['relationship_type'],
+                    collection=collection,
                     source=source,
                     revoked=revoked,
                 )
@@ -1117,6 +1313,11 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                     row.hash_value = fields['hash_value']
                     row.ip_address = fields['ip_address']
                     row.domain = fields['domain']
+                    row.value = fields['value']
+                    row.source_ref = fields['source_ref']
+                    row.target_ref = fields['target_ref']
+                    row.relationship_type = fields['relationship_type']
+                    row.collection_id = collection
                     row.last_seen = now
                     row.revoked = revoked  # sticky (see above); keeps first revoked_at
                 else:
@@ -1131,6 +1332,11 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                         hash_value=fields['hash_value'],
                         ip_address=fields['ip_address'],
                         domain=fields['domain'],
+                        value=fields['value'],
+                        source_ref=fields['source_ref'],
+                        target_ref=fields['target_ref'],
+                        relationship_type=fields['relationship_type'],
+                        collection_id=collection,
                         source=source,
                         first_seen=now,
                         last_seen=now,
@@ -1150,14 +1356,29 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
         session.close()
 
 
-def purge_all() -> None:
-    """Purge all threat intelligence data (memory + DB)."""
+def purge_all(collection: Optional[str] = None) -> int:
+    """Purge threat intelligence data (memory + DB).
+
+    With ``collection=None`` wipes EVERYTHING (all collections, all
+    sources). With a collection id, wipes only that collection's objects.
+    Returns the number of rows purged.
+    """
     session = create_session()
     try:
         with memory_lock:
-            memory_store.clear()
-            session.query(STIXObject).delete()
+            if collection:
+                rows = session.query(STIXObject).filter_by(
+                    collection_id=collection).all()
+                for s in [s for s in memory_store
+                          if memory_store[s].collection == collection]:
+                    memory_store.pop(s, None)
+            else:
+                rows = session.query(STIXObject).all()
+                memory_store.clear()
+            for r in rows:
+                session.delete(r)
             session.commit()
+            return len(rows)
     finally:
         session.close()
 
@@ -1171,13 +1392,80 @@ def purge_all() -> None:
 # ---------------------------------------------------------------------------
 # Trend Micro Vision One is a TAXII 2.1 *client* (it polls e.g. AlienVault OTX,
 # which is a TAXII 2.1 server). This section exposes a standards-compliant
-# TAXII 2.1 API root, one collection of STIX 2.1 JSON objects, and a
+# TAXII 2.1 API root, collections of STIX 2.1 JSON objects, and a
 # subscriptions stub — the same surface Vision One polls from OTX.
+#
+# Collections: the legacy single-collection keys (`collection_id` +
+# `auth`) still work. To serve more than one consumer with separate
+# credentials, list them under `taxii.collections:` — each entry is a
+# collection with its OWN HTTP Basic credentials, so a client can only see
+# and read the collections its credentials authorize (per-client RBAC).
 
 TAXII_CFG = CONFIG.get('taxii', {}) or {}
-TAXII_COLLECTION_ID = str(TAXII_CFG.get('collection_id') or 'threat-intel')
-TAXII_COLLECTION_TITLE = str(
-    TAXII_CFG.get('collection_title') or 'Custom Threat Intelligence Feed'
+DEFAULT_COLLECTION_ID = 'threat-intel'
+
+
+@dataclass
+class CollectionConfig:
+    """One TAXII collection: identity + the credentials that may read it."""
+    id: str
+    title: str
+    description: str
+    username: str
+    password: str
+
+    def __post_init__(self) -> None:
+        self.id = str(self.id or DEFAULT_COLLECTION_ID)
+        self.title = str(self.title or self.id)
+        self.description = str(self.description or '')
+        self.username = str(self.username or '')
+        self.password = str(self.password or '')
+
+
+def _build_collection_configs(taxii_cfg: Dict[str, Any]) -> List[CollectionConfig]:
+    """Parse the TAXII collection registry from config.
+
+    ``taxii.collections:`` (a list) wins when present; otherwise the legacy
+    single-collection keys (``collection_id`` / ``collection_title`` /
+    ``auth``) build one collection, so existing configs behave unchanged.
+    """
+    entries = taxii_cfg.get('collections')
+    if isinstance(entries, list) and entries:
+        cfgs: List[CollectionConfig] = []
+        for e in entries:
+            if not isinstance(e, dict) or not e.get('id'):
+                continue
+            auth = e.get('auth') or {}
+            cfgs.append(CollectionConfig(
+                id=str(e['id']),
+                title=str(e.get('title') or ''),
+                description=str(e.get('description') or ''),
+                username=str(auth.get('username') or ''),
+                password=str(auth.get('password') or ''),
+            ))
+        return cfgs or _build_collection_configs({})
+    auth = taxii_cfg.get('auth') or {}
+    return [CollectionConfig(
+        id=str(taxii_cfg.get('collection_id') or DEFAULT_COLLECTION_ID),
+        title=str(taxii_cfg.get('collection_title') or 'Custom Threat Intelligence Feed'),
+        description=(
+            'Custom threat intelligence objects: IPv4/IPv6 addresses, domain '
+            'names, file hashes, URLs, and indicators.'
+        ),
+        username=str(auth.get('username') or ''),
+        password=str(auth.get('password') or ''),
+    )]
+
+
+TAXII_COLLECTIONS: List[CollectionConfig] = _build_collection_configs(TAXII_CFG)
+TAXII_COLLECTION_MAP: Dict[str, CollectionConfig] = {
+    c.id: c for c in TAXII_COLLECTIONS
+}
+# The primary collection: legacy single-collection id (kept for back-compat),
+# or the first configured collection.
+TAXII_COLLECTION_ID = TAXII_COLLECTIONS[0].id if TAXII_COLLECTIONS else DEFAULT_COLLECTION_ID
+TAXII_COLLECTION_TITLE = (
+    TAXII_COLLECTIONS[0].title if TAXII_COLLECTIONS else 'Custom Threat Intelligence Feed'
 )
 
 
@@ -1231,8 +1519,79 @@ def threat_intel_to_stix21(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
             'confidence': obj.confidence or 0,
         }
 
-    # indicator / malware / free-text: emit an STIX indicator with a pattern
-    # derived from the value when its kind is recognizable.
+    # Extra single-value SCOs (url / email-addr / ipv6-addr / mac-addr).
+    if obj.object_type in ('url', 'email-addr', 'ipv6-addr', 'mac-addr'):
+        if not obj.value:
+            return None
+        return {
+            **common,
+            'type': obj.object_type,
+            'id': obj.stix_id,
+            'value': obj.value,
+            'labels': obj.labels or [],
+            'confidence': obj.confidence or 0,
+        }
+
+    if obj.object_type == 'windows-registry-key':
+        if not obj.value:
+            return None
+        return {
+            **common,
+            'type': 'windows-registry-key',
+            'id': obj.stix_id,
+            'key': obj.value,
+            'labels': obj.labels or [],
+            'confidence': obj.confidence or 0,
+        }
+
+    if obj.object_type == 'autonomous-system':
+        if not obj.value:
+            return None
+        return {
+            **common,
+            'type': 'autonomous-system',
+            'id': obj.stix_id,
+            'number': int(obj.value),
+            'labels': obj.labels or [],
+            'confidence': obj.confidence or 0,
+        }
+
+    # SDOs beyond the free-text indicator: malware / threat-actor / campaign.
+    if obj.object_type in ('malware', 'threat-actor', 'campaign'):
+        base: Dict[str, Any] = {
+            **common,
+            'type': obj.object_type,
+            'id': obj.stix_id,
+            'labels': obj.labels or [],
+            'confidence': obj.confidence or 0,
+        }
+        if obj.object_type == 'malware':
+            base['name'] = obj.name or 'Unnamed malware'
+            base['is_family'] = True  # stored model is family-level, not binary
+        elif obj.object_type == 'threat-actor':
+            base['name'] = obj.name or 'Unknown threat actor'
+            base['threat_actor_types'] = ['unknown']  # open-vocab, required
+        else:  # campaign
+            base['name'] = obj.name or 'Unnamed campaign'
+        return base
+
+    # STIX relationship (the graph edge).
+    if obj.object_type == 'relationship':
+        if not obj.source_ref or not obj.relationship_type or not obj.target_ref:
+            return None
+        return {
+            **common,
+            'type': 'relationship',
+            'id': obj.stix_id,
+            'relationship_type': obj.relationship_type,
+            'source_ref': obj.source_ref,
+            'target_ref': obj.target_ref,
+            'labels': obj.labels or [],
+            'confidence': obj.confidence or 0,
+        }
+
+    # indicator / free-text: emit an STIX indicator with a pattern derived
+    # from the value when its kind is recognizable.
     value = obj.name or obj.ip_address or obj.domain or obj.hash_value or ''
     if not value:
         return None
@@ -1244,6 +1603,16 @@ def threat_intel_to_stix21(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
     elif guessed == 'file-hash':
         key = _HASH_KEY_BY_ALGO.get(algo or 'sha256', 'SHA-256')
         pattern = f"[file:hashes.'{key}' = '{value}']"
+    elif guessed == 'url':
+        pattern = f"[url:value = '{value}']"
+    elif guessed == 'email-addr':
+        pattern = f"[email-addr:value = '{value}']"
+    elif guessed == 'ipv6-addr':
+        pattern = f"[ipv6-addr:value = '{value}']"
+    elif guessed == 'mac-addr':
+        pattern = f"[mac-addr:value = '{value}']"
+    elif guessed == 'autonomous-system':
+        pattern = f"[autonomous-system:number = '{value}']"
     else:
         # Unrecognizable free text: community extension type (x- prefix is
         # spec-legal); TAXII clients that only want typed indicators skip it.
@@ -1333,13 +1702,18 @@ def community_intel_reason(obj: ThreatIntel, row: 'STIXObject') -> Optional[str]
     is never passed here.
     """
     # 1) Explicit blocklist (exact value match).
-    for value in (obj.ip_address, obj.domain, obj.hash_value, obj.name):
+    for value in (obj.ip_address, obj.domain, obj.hash_value, obj.name, obj.value):
         if value and value.lower() in FILTER_BLOCKLIST:
             return 'blocklist'
 
     # 2) Private / reserved IPs (honors the drop_private_ips toggle).
-    if FILTER_DROP_PRIVATE_IPS and obj.ip_address and _is_private_or_reserved_ip(obj.ip_address):
-        return 'private-ip'
+    if FILTER_DROP_PRIVATE_IPS:
+        for ipv in (
+            obj.ip_address,
+            obj.value if obj.object_type == 'ipv6-addr' else None,
+        ):
+            if ipv and _is_private_or_reserved_ip(ipv):
+                return 'private-ip'
 
     # 3) Confidence floor.
     if _FILTER_MIN_CONFIDENCE is not None:
@@ -1416,38 +1790,97 @@ def gate_verdict(obj: ThreatIntel, row: 'STIXObject') -> Dict[str, Any]:
     }
 
 
+def _encode_cursor(modified_iso: str, stix_id: str) -> str:
+    """Opaque keyset cursor: base64url({"m": modified ISO, "i": stix_id})."""
+    raw = json.dumps({'m': modified_iso, 'i': stix_id}, separators=(',', ':'))
+    return base64.urlsafe_b64encode(raw.encode('utf-8')).decode('ascii').rstrip('=')
+
+
+def _decode_cursor(cursor: str) -> Optional[Tuple[str, str]]:
+    """Decode a cursor back to (modified_iso, stix_id), or None if malformed."""
+    try:
+        padded = cursor + '=' * (-len(cursor) % 4)
+        data = json.loads(base64.urlsafe_b64decode(padded).decode('utf-8'))
+        m, i = str(data['m']), str(data['i'])
+        if not m or not i:
+            return None
+        return m, i
+    except Exception:
+        return None
+
+
 def build_stix_bundle(since: Optional[str] = None,
                       match_types: Optional[List[str]] = None,
                       match_ids: Optional[List[str]] = None,
-                      added_after: Optional[str] = None) -> Dict[str, Any]:
-    """Build a STIX 2.1 bundle of the current feed (optionally filtered).
+                      added_after: Optional[str] = None,
+                      collection: Optional[str] = None,
+                      limit: Optional[int] = None,
+                      next_cursor: Optional[str] = None) -> Tuple[Dict[str, Any], bool, Optional[str]]:
+    """Build a STIX 2.1 bundle of the current feed (optionally filtered/paged).
 
     TAXII 2.1 Get Objects parameters:
       * ``since`` / ``added_after``: only objects modified after this
         ISO-8601 timestamp (``added_after`` is the spec name; ``since`` is
-        accepted for back-compat).
+        accepted for back-compat). A malformed timestamp raises ValueError
+        (the endpoint turns it into a 400).
       * ``match_types``: ``match[type]`` - only these STIX object types.
       * ``match_ids``: ``match[id]`` - only these exact object ids.
+      * ``collection``: only objects of this TAXII collection (None = all).
+      * ``limit`` / ``next_cursor``: keyset pagination in (modified, stix_id)
+        order — pages stay consistent while the feed changes underneath and
+        never loop. Returns ``more`` (more pages exist) and ``next_cursor``
+        (opaque; pass it back as ?next=).
 
     Revoked objects are INCLUDED but rendered with ``revoked: true`` (clients
-    purge them); they are never silently dropped."""
+    purge them); they are never silently dropped.
+    Returns ``(bundle, more, next_cursor)``.
+    """
     session = create_session()
     try:
         q = session.query(STIXObject)
         cutoff = since or added_after
         if cutoff:
-            try:
-                cutoff_dt = datetime.fromisoformat(cutoff.replace('Z', ''))
-                q = q.filter(STIXObject.modified >= cutoff_dt)
-            except ValueError:
-                pass
+            cutoff_dt = _parse_iso_ts(cutoff)
+            if cutoff_dt is None:
+                raise ValueError(f'bad since/added_after timestamp: {cutoff!r}')
+            q = q.filter(STIXObject.modified >= cutoff_dt)
+        if collection:
+            q = q.filter(STIXObject.collection_id == collection)
         if match_ids:
             q = q.filter(STIXObject.stix_id.in_(match_ids))
-        rows = q.all()
+        # Apply match[type] at the SQL level too so page limits stay correct
+        # even when most rows don't match the requested types.
+        type_filter = ({str(t) for t in match_types} if match_types else None)
+        if type_filter:
+            q = q.filter(STIXObject.object_type.in_(type_filter))
+
+        # Keyset pagination: consistent (modified, stix_id) ordering.
+        q = q.order_by(STIXObject.modified.asc(), STIXObject.stix_id.asc())
+        if next_cursor:
+            parsed = _decode_cursor(next_cursor)
+            if parsed is None:
+                raise ValueError('bad next cursor')
+            m_iso, after_id = parsed
+            m_dt = _parse_iso_ts(m_iso)
+            if m_dt is None:
+                raise ValueError('bad next cursor')
+            q = q.filter(or_(
+                STIXObject.modified > m_dt,
+                and_(STIXObject.modified == m_dt,
+                     STIXObject.stix_id > after_id),
+            ))
+        if limit is not None:
+            rows = q.limit(limit + 1).all()
+            more = len(rows) > limit
+            rows = rows[:limit]
+        else:
+            rows = q.all()
+            more = False
+    except Exception:
+        session.rollback()
+        raise
     finally:
         session.close()
-
-    type_filter = ({str(t) for t in match_types} if match_types else None)
 
     objects: List[Dict[str, Any]] = []
     withheld = 0
@@ -1456,7 +1889,8 @@ def build_stix_bundle(since: Optional[str] = None,
             obj = memory_store.get(row.stix_id)
             if obj is None:
                 continue
-            # match[type] - filter on the stored type we would render.
+            # match[type] - filter on the stored type we would render
+            # (matches the SQL-level filter above; kept for direct callers).
             if type_filter is not None and row.object_type not in type_filter:
                 continue
             # Community-intel gate (manual intel is never gated).
@@ -1474,19 +1908,34 @@ def build_stix_bundle(since: Optional[str] = None,
             withheld,
         )
 
+    # Next-page cursor: key of the last row in the slice (SQL-level key, so
+    # following ?next= continues the same keyset even if the gate/type filter
+    # drops pages' worth of objects).
+    nxt = None
+    if more and rows:
+        last = rows[-1]
+        nxt = _encode_cursor(last.modified.isoformat(), last.stix_id)
+
     return {
         'type': 'bundle',
         'id': 'bundle--' + uuid.uuid4().hex,
         'spec_version': '2.1',
         'objects': objects,
-    }
+    }, more, nxt
 
 
 def _taxii_message(collection: Optional[str] = None,
-                   content: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                   content: Optional[Dict[str, Any]] = None,
+                   more: bool = False,
+                   next_cursor: Optional[str] = None) -> Dict[str, Any]:
     msg: Dict[str, Any] = {'object': 'message', 'meta': {'timestamp': _stix_now()}}
     if collection:
         msg['meta']['collection'] = collection
+    # TAXII 2.1 §5.3: more is REQUIRED on Get Objects responses; next is
+    # REQUIRED when more is true (the opaque cursor for the next page).
+    msg['more'] = bool(more)
+    if more and next_cursor:
+        msg['next'] = next_cursor
     if content is not None:
         msg['content'] = {
             'object': 'content',
@@ -1495,6 +1944,24 @@ def _taxii_message(collection: Optional[str] = None,
             'content': content,
         }
     return msg
+
+
+def _taxii_error(status: int, title: str, detail: str,
+                 code: Optional[str] = None) -> Response:
+    """TAXII 2.1 error response (spec §3.2): status_code as a string."""
+    payload: Dict[str, Any] = {
+        'status_code': str(status),
+        'title': title,
+        'detail': detail,
+    }
+    if code:
+        payload['errors'] = {'code': code}
+    return Response(
+        json.dumps(payload),
+        status=status,
+        mimetype='application/taxii+json;version=2.1',
+        headers={'TAXII-ServiceVersion': '2.1'},
+    )
 
 
 def _taxii_response(payload: Dict[str, Any], status: int = 200) -> Response:
@@ -1524,9 +1991,22 @@ def _taxii_unauthorized() -> Response:
 
 
 def _taxii_check_auth() -> bool:
-    """Accept HTTP Basic auth (TAXII standard) or the X-Taxii-* headers."""
+    """Accept HTTP Basic auth (TAXII standard) or the X-Taxii-* headers.
+
+    Any valid principal (any collection's credentials, or the legacy/test
+    override) passes — collection-level scoping happens in
+    :func:`_taxii_collection_auth`.
+    """
     user, pw = _request_taxii_credentials()
     return _validate_taxii_auth(user, pw)
+
+
+def _taxii_collection_auth(collection_id: str) -> bool:
+    """True if the request's credentials may read ``collection_id``."""
+    user, pw = _request_taxii_credentials()
+    return any(
+        c.id == collection_id for c in _collections_readable_by(user, pw)
+    )
 
 
 def _taxii_base_url() -> str:
@@ -1537,20 +2017,21 @@ def _collection_url(base_url: str, collection_id: str) -> str:
     return f'{base_url}collections/{collection_id}/'
 
 
-def _collection_resource(base_url: str, collection_id: str) -> Dict[str, Any]:
+def _collection_resource(base_url: str, cfg: CollectionConfig) -> Dict[str, Any]:
     """A single Collection Resource (flat — fields at top level per spec 5.2.1)."""
     return {
-        'id': collection_id,
-        'title': TAXII_COLLECTION_TITLE,
+        'id': cfg.id,
+        'title': cfg.title,
         'description': (
-            'Custom threat intelligence objects: IPv4 addresses, domain names, '
-            'file hashes, and indicators.'
+            cfg.description
+            or 'Custom threat intelligence objects: IPv4/IPv6 addresses, '
+               'domain names, file hashes, URLs, and indicators.'
         ),
         'can_read': True,
         'can_write': False,
         'version': '2.1',
         'created': _stix_now(),
-        'meta': {'collection_url': _collection_url(base_url, collection_id)},
+        'meta': {'collection_url': _collection_url(base_url, cfg.id)},
     }
 
 
@@ -1609,14 +2090,21 @@ def taxii_api_root():
 @app.route('/taxii2/collections', methods=['GET'])
 @app.route('/taxii2/collections/', methods=['GET'])
 def taxii_collections():
-    """TAXII 2.1 Get Collections (section 5.1)."""
+    """TAXII 2.1 Get Collections (section 5.1).
+
+    RBAC: lists only the collections the authenticated principal's
+    credentials may read (each collection has its own credentials).
+    """
     if not _taxii_check_auth():
         return _taxii_unauthorized()
+    user, pw = _request_taxii_credentials()
+    readable = _collections_readable_by(user, pw)
     base = _taxii_base_url()
+    collections = [_collection_resource(base, c) for c in readable]
     return _taxii_response({
         'object': 'collections',
-        'meta': {'count': 1, 'first': 0, 'last': 0},
-        'collections': [_collection_resource(base, TAXII_COLLECTION_ID)],
+        'meta': {'count': len(collections), 'first': 0, 'last': len(collections) - 1},
+        'collections': collections,
     })
 
 
@@ -1624,15 +2112,14 @@ def taxii_collections():
 @app.route('/taxii2/collections/<collection_id>/', methods=['GET'])
 def taxii_collection_info(collection_id: str):
     """TAXII 2.1 Get a Collection (section 5.2)."""
-    if collection_id != TAXII_COLLECTION_ID:
-        return _taxii_response({
-            'status_code': '404', 'title': 'Not Found',
-            'detail': f'Collection {collection_id} not found.',
-        }, 404)
-    if not _taxii_check_auth():
+    cfg = TAXII_COLLECTION_MAP.get(collection_id)
+    if cfg is None:
+        return _taxii_error(404, 'Not Found',
+                            f'Collection {collection_id} not found.')
+    if not _taxii_collection_auth(collection_id):
         return _taxii_unauthorized()
     base = _taxii_base_url()
-    info = _collection_resource(base, collection_id)
+    info = _collection_resource(base, cfg)
     info['url'] = _collection_url(base, collection_id)
     return _taxii_response(info)
 
@@ -1641,12 +2128,11 @@ def taxii_collection_info(collection_id: str):
 @app.route('/taxii2/collections/<collection_id>/objects/', methods=['GET', 'POST'])
 def taxii_objects(collection_id: str):
     """TAXII 2.1 Get Objects (5.3) / Add Objects (5.4) for a collection."""
-    if collection_id != TAXII_COLLECTION_ID:
-        return _taxii_response({
-            'status_code': '404', 'title': 'Not Found',
-            'detail': f'Collection {collection_id} not found.',
-        }, 404)
-    if not _taxii_check_auth():
+    cfg = TAXII_COLLECTION_MAP.get(collection_id)
+    if cfg is None:
+        return _taxii_error(404, 'Not Found',
+                            f'Collection {collection_id} not found.')
+    if not _taxii_collection_auth(collection_id):
         return _taxii_unauthorized()
 
     if request.method == 'POST':
@@ -1657,14 +2143,47 @@ def taxii_objects(collection_id: str):
     #   since / added_after  -> only objects modified after the timestamp
     #   match[type]          -> only these STIX object types
     #   match[id]            -> only these exact object ids
+    #   limit                -> max objects in this page (positive integer)
+    #   next                 -> opaque cursor for the next page
     # (?since= kept as an accepted alias of added_after.)
+    #
+    # match[type] / match[id] accept comma-separated value lists (and a
+    # parameter may be repeated); all values are a disjunction, per spec.
+    def _match_values(name: str) -> List[str]:
+        vals: List[str] = []
+        for raw in request.args.getlist(name):
+            vals.extend(p.strip() for p in str(raw).split(',') if p.strip())
+        return vals
+
     since = request.args.get('since') or request.args.get('added_after')
-    match_types = [t for t in request.args.getlist('match[type]') if t]
-    match_ids = [i for i in request.args.getlist('match[id]') if i]
-    bundle = build_stix_bundle(
-        since=since, match_types=match_types, match_ids=match_ids
+    match_types = _match_values('match[type]')
+    match_ids = _match_values('match[id]')
+    limit = None
+    raw_limit = request.args.get('limit')
+    if raw_limit is not None and raw_limit != '':
+        try:
+            limit = int(raw_limit)
+            if limit <= 0:
+                raise ValueError
+            max_objects = int((TAXII_CFG.get('max_objects') or 10000))
+            if max_objects > 0:
+                limit = min(limit, max_objects)
+        except (TypeError, ValueError):
+            return _taxii_error(400, 'Bad Request',
+                                f'limit must be a positive integer, got {raw_limit!r}',
+                                'malformed')
+    next_cursor = request.args.get('next')
+
+    try:
+        bundle, more, nxt = build_stix_bundle(
+            since=since, match_types=match_types, match_ids=match_ids,
+            collection=collection_id, limit=limit, next_cursor=next_cursor,
+        )
+    except ValueError as exc:
+        return _taxii_error(400, 'Bad Request', str(exc), 'malformed')
+    return _taxii_response(
+        _taxii_message(collection_id, bundle, more=more, next_cursor=nxt)
     )
-    return _taxii_response(_taxii_message(collection_id, bundle))
 
 
 @app.route('/taxii2/status/<status_id>', methods=['GET'])
@@ -1688,15 +2207,41 @@ def taxii_subscriptions():
     })
 
 
+def _collection_param(value: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Validate a ?collection= / body ``collection`` against the registry.
+
+    Returns ``(collection_id, None)``, ``(None, None)`` when omitted, or
+    ``(None, error)`` for an unknown collection id.
+    """
+    if value is None or value == '':
+        return None, None
+    cid = str(value)
+    if cid not in TAXII_COLLECTION_MAP:
+        return None, f'unknown collection: {cid!r}'
+    return cid, None
+
+
 @app.route('/feed', methods=['GET'])
 def get_feed():
-    """GET /feed — latest STIX feed in TAXII 2 XML format (authenticated)."""
+    """GET /feed — latest STIX feed in TAXII 2 XML format (authenticated).
+
+    Optional ``?collection=<id>`` limits the feed to one collection
+    (default: the primary collection).
+    """
     if not _request_allowed():
         return _unauthorized_feed_response()
 
+    cid, err = _collection_param(request.args.get('collection'))
+    if err:
+        return jsonify({'error': err}), 400
+    cid = cid or TAXII_COLLECTION_ID
+
     session = create_session()
     try:
-        db_objects = session.query(STIXObject).all()
+        q = session.query(STIXObject)
+        if cid:
+            q = q.filter(STIXObject.collection_id == cid)
+        db_objects = q.all()
     finally:
         session.close()
 
@@ -1723,14 +2268,24 @@ def list_objects():
     """GET /objects — JSON view of current feed objects (same auth as /feed).
 
     Used by the web UI (and handy for scripting): lists what is currently
-    in the feed so entries can be reviewed before re-ingesting.
+    in the feed so entries can be reviewed before re-ingesting. Optional
+    ``?collection=<id>`` limits the view to one collection (default: the
+    primary collection).
     """
     if not _request_allowed():
         return jsonify({'error': 'Unauthorized'}), 401
 
+    cid, err = _collection_param(request.args.get('collection'))
+    if err:
+        return jsonify({'error': err}), 400
+    cid = cid or TAXII_COLLECTION_ID
+
     session = create_session()
     try:
-        db_objects = session.query(STIXObject).all()
+        q = session.query(STIXObject)
+        if cid:
+            q = q.filter(STIXObject.collection_id == cid)
+        db_objects = q.all()
     finally:
         session.close()
 
@@ -1748,7 +2303,10 @@ def list_objects():
                     obj.ip_address
                     or obj.domain
                     or obj.hash_value
+                    or obj.value
                     or obj.name
+                    or (f'{obj.source_ref} → {obj.relationship_type} → {obj.target_ref}'
+                        if obj.object_type == 'relationship' else None)
                 ),
                 'labels': obj.labels or [],
                 'confidence': row.confidence,
@@ -1837,6 +2395,9 @@ def ingest_data():
       * ``'merge'`` — upsert by STIX id: edits/labels/confidence are
         refreshed, new ids are added, everything else (including other
         sources) is preserved. This is what the web UI "Save changes" uses.
+
+    Optional JSON body field ``collection``: target TAXII collection
+    (default: the primary collection).
     """
     if not _request_allowed():
         return jsonify({'error': 'Unauthorized'}), 401
@@ -1852,8 +2413,13 @@ def ingest_data():
     if mode not in ('replace', 'merge'):
         return jsonify({'error': "mode must be 'replace' or 'merge'"}), 400
 
+    cid, err = _collection_param(data.get('collection'))
+    if err:
+        return jsonify({'error': err}), 400
+    cid = cid or TAXII_COLLECTION_ID
+
     try:
-        count = ingest_objects(stix_objects, mode=mode)
+        count = ingest_objects(stix_objects, mode=mode, collection=cid)
     except Exception as exc:
         logger.error("Ingest error: %s", exc)
         return jsonify({'error': str(exc)}), 500
@@ -1861,6 +2427,7 @@ def ingest_data():
     return jsonify({
         'message': 'Data ingested successfully',
         'mode': mode,
+        'collection': cid,
         'objects_count': count,
     }), 200
 
@@ -1903,15 +2470,30 @@ def delete_objects_data():
 
 @app.route('/feed/purge', methods=['DELETE'])
 def purge_data():
-    """DELETE /feed/purge — purge all threat intelligence data."""
+    """DELETE /feed/purge — purge threat intelligence data.
+
+    Without ``?collection=`` purges EVERYTHING (all collections, all
+    sources — the documented legacy behavior). With ``?collection=<id>``
+    only that collection's objects are removed (what the web UI sends, so
+    "Purge all" can't wipe a sibling collection).
+    """
     if not _request_allowed():
         return jsonify({'error': 'Unauthorized'}), 401
+    cid, err = _collection_param(request.args.get('collection'))
+    if err:
+        return jsonify({'error': err}), 400
     try:
-        purge_all()
+        purged = purge_all(collection=cid)
     except Exception as exc:
         logger.error("Purge error: %s", exc)
         return jsonify({'error': str(exc)}), 500
-    return jsonify({'message': 'All data purged successfully'}), 200
+    if cid:
+        return jsonify({
+            'message': f"Collection '{cid}' purged successfully",
+            'collection': cid,
+            'purged': purged,
+        }), 200
+    return jsonify({'message': 'All data purged successfully', 'purged': purged}), 200
 
 
 @app.route('/auth', methods=['POST'])
@@ -2054,6 +2636,18 @@ def ui_logout():
     resp = jsonify({'message': 'Logged out'})
     resp.delete_cookie('taxii2_ui_session')
     return resp, 200
+
+
+@app.route('/ui/collections', methods=['GET'])
+def ui_collections():
+    """GET /ui/collections — the TAXII collection registry (dashboard)."""
+    if not _request_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    collections = [{'id': c.id, 'title': c.title} for c in TAXII_COLLECTIONS]
+    return jsonify({
+        'collections': collections,
+        'primary': TAXII_COLLECTION_ID,
+    }), 200
 
 
 @app.route('/community/pullers', methods=['GET'])
@@ -2208,12 +2802,28 @@ class SelfCheckPoller:
 _IPV4_RE = re.compile(r'^\d{1,3}(\.\d{1,3}){3}$')
 _HASH_RE = re.compile(r'^[0-9a-fA-F]+$', re.ASCII)
 _DOMAIN_RE = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?)+$')
+_URL_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.\-]*://\S+$')
+_EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+_MAC_RE = re.compile(r'^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$')
+_ASN_RE = re.compile(r'^AS\d+$', re.IGNORECASE)
 
 
 def _guess_object_type(value: str) -> Tuple[str, Optional[str]]:
-    """Guess (stix_type, hash_algorithm) for a raw SOL value."""
+    """Guess (stix_type, hash_algorithm) for a raw value."""
     if _IPV4_RE.match(value):
         return 'ipv4-addr', None
+    if ':' in value:
+        try:
+            if ipaddress.ip_address(value).version == 6:
+                return 'ipv6-addr', None
+        except ValueError:
+            pass
+    if _URL_RE.match(value):
+        return 'url', None
+    if _EMAIL_RE.match(value):
+        return 'email-addr', None
+    if _MAC_RE.match(value):
+        return 'mac-addr', None
     if _HASH_RE.match(value):
         algos = {32: 'md5', 40: 'sha1', 64: 'sha256'}
         algo = algos.get(len(value))
@@ -2221,6 +2831,8 @@ def _guess_object_type(value: str) -> Tuple[str, Optional[str]]:
             return 'file-hash', algo
     if _DOMAIN_RE.match(value):
         return 'domain-name', None
+    if _ASN_RE.match(value):
+        return 'autonomous-system', None
     return 'indicator', None
 
 
@@ -2270,27 +2882,61 @@ def _guess_hash_algo(value: str) -> str:
     return _HASH_LEN_ALGO.get(len(value), 'sha256')
 
 
-def parse_csv_intel(text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Parse CSV text into (stix_objects, skipped_rows).
+def _classify_value_cell(cell: str, role: str
+                         ) -> Optional[Tuple[str, str, Optional[str]]]:
+    """Classify one data cell into (value, stix_type, hash_algo), or None
+    when the cell is not a valid value for its column role.
 
-    Headers are fuzzy-mapped; values are validated (IPv4 octets, domain
-    shape, hash length) and re-classified when needed. Returns STIX
-    ingest payloads ready for ``ingest_objects(..., source='manual')``.
+    ``role`` comes from header fuzzy-mapping ('ip' / 'domain' / 'hash' /
+    'indicator'). Shape-validated; an 'indicator' column that actually
+    holds a URL / email / ipv6 / MAC / ASN is promoted to that STIX type.
     """
-    try:
-        reader = csv.DictReader(io.StringIO(text or ''))
-        rows = list(reader)
-    except Exception:
-        return [], [{'error': 'could not parse CSV'}]
+    if role == 'ip':
+        if _is_valid_ipv4(cell):
+            return cell, 'ipv4-addr', 'ipv4'
+        try:
+            if ipaddress.ip_address(cell).version == 6:
+                return cell, 'ipv6-addr', 'ipv6'
+        except ValueError:
+            pass
+        return None
+    if role == 'domain':
+        if _DOMAIN_RE.match(cell):
+            return cell, 'domain-name', 'domain'
+        return None
+    if role == 'hash':
+        if (re.fullmatch(r'[0-9a-fA-F]+', cell)
+                and len(cell) in _HASH_LEN_ALGO):
+            return cell.lower(), 'file-hash', _guess_hash_algo(cell)
+        return None
+    # role == 'indicator': free text; promote recognizable shapes to their
+    # STIX type (url / email-addr / ipv6-addr / mac-addr / autonomous-system).
+    guessed, algo = _guess_object_type(cell)
+    if guessed in ('url', 'email-addr', 'ipv6-addr', 'mac-addr',
+                   'autonomous-system'):
+        return cell, guessed, algo
+    return cell, 'indicator', 'indicator'
 
-    if not rows or not reader.fieldnames:
-        return [], [{'error': 'empty CSV (no header row found)'}]
+
+def _parse_tabular_rows(fieldnames: List[str], rows: List[Dict[str, Any]],
+                        start_row: int = 2
+                        ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """The shared CSV / XLSX row parser.
+
+    ``fieldnames`` are the header cells; ``rows`` are dict rows keyed by
+    header. Headers are fuzzy-mapped to column roles; values are validated
+    and typed by shape (see :func:`_classify_value_cell`). Returns STIX
+    ingest payloads ready for ``ingest_objects(..., source='manual')`` plus
+    the list of skipped rows.
+    """
+    if not rows or not fieldnames:
+        return [], [{'error': 'empty file (no header row found)'}]
 
     # Resolve column roles from the header row. A role may span several
     # columns (e.g. both "src_ip" and "dst_ip"); each recognized column is
     # remembered and the row loop takes the first valid value per role.
     roles: Dict[str, str] = {}
-    for h in reader.fieldnames:
+    for h in fieldnames:
         role = _csv_classify_header(h)
         if role != 'ignore':
             roles[h] = role
@@ -2300,7 +2946,7 @@ def parse_csv_intel(text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any
     # Emit one object per recognizable value column in a row (a row can carry
     # both an IP and a domain).
     value_roles = ('ip', 'domain', 'hash', 'indicator')
-    for idx, raw in enumerate(rows, start=2):  # row 1 = header
+    for idx, raw in enumerate(rows, start=start_row):  # row 1 = header
         labels: List[str] = []
         confidence = 50
         for h, role in roles.items():
@@ -2312,7 +2958,7 @@ def parse_csv_intel(text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any
             elif role == 'confidence':
                 try:
                     confidence = max(0, min(100, int(float(cell))))
-                except ValueError:
+                except (TypeError, ValueError):
                     pass
 
         emitted = False
@@ -2323,17 +2969,10 @@ def parse_csv_intel(text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any
                 cell = (raw.get(h) or '').strip()
                 if not cell:
                     continue
-                if vrole == 'ip' and _is_valid_ipv4(cell):
-                    value, otype, algo = cell, 'ipv4-addr', 'ipv4'
-                elif vrole == 'domain' and _DOMAIN_RE.match(cell):
-                    value, otype, algo = cell, 'domain-name', 'domain'
-                elif vrole == 'hash' and re.fullmatch(
-                        r'[0-9a-fA-F]+', cell) and len(cell) in _HASH_LEN_ALGO:
-                    value, otype, algo = cell.lower(), 'file-hash', _guess_hash_algo(cell)
-                elif vrole == 'indicator':
-                    value, otype, algo = cell, 'indicator', 'indicator'
-                else:
+                parsed = _classify_value_cell(cell, vrole)
+                if parsed is None:
                     continue
+                value, otype, algo = parsed
                 if otype == 'ipv4-addr':
                     obj_id = 'ipv4-addr--' + value.replace('.', '-')
                     obj = {'ipv4-addr': {'value': value}}
@@ -2343,8 +2982,22 @@ def parse_csv_intel(text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any
                 elif otype == 'file-hash':
                     obj_id = 'file-hash--' + value[:16]
                     obj = {'hash_value': {'algorithm': algo, 'value': value}}
+                elif otype in ('url', 'email-addr', 'ipv6-addr', 'mac-addr',
+                               'autonomous-system'):
+                    stable = uuid.uuid5(uuid.NAMESPACE_OID, value).hex[:16]
+                    obj_id = f'{otype}--{stable}'
+                    if otype == 'autonomous-system':
+                        # STIX wants the bare AS number, not the 'AS' prefix.
+                        obj = {'autonomous-system': {
+                            'number': int(re.sub(r'[^0-9]', '', value))}}
+                    else:
+                        obj = {otype: {'value': value}}
                 else:
-                    obj_id = 'indicator--' + value[:16]
+                    # Free-text indicator: slug the value so the STIX id
+                    # stays valid ([A-Za-z0-9-]+ per spec) — free text can
+                    # contain spaces/slashes that would fail id validation.
+                    slug = re.sub(r'[^A-Za-z0-9-]', '-', value)[:16]
+                    obj_id = 'indicator--' + slug
                     obj = {'indicator': {'value': value}}
                 row_labels = [algo] if otype == 'file-hash' else list(labels)
                 objects.append({
@@ -2362,39 +3015,123 @@ def parse_csv_intel(text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any
     return objects, skipped
 
 
+def parse_csv_intel(text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Parse CSV text into (stix_objects, skipped_rows).
+
+    Headers are fuzzy-mapped; values are validated (IPv4/IPv6 octets,
+    domain shape, hash length) and re-classified when needed. Returns STIX
+    ingest payloads ready for ``ingest_objects(..., source='manual')``.
+    """
+    try:
+        reader = csv.DictReader(io.StringIO(text or ''))
+        rows = list(reader)
+    except Exception:
+        return [], [{'error': 'could not parse CSV'}]
+
+    if not rows or not reader.fieldnames:
+        return [], [{'error': 'empty CSV (no header row found)'}]
+    return _parse_tabular_rows(reader.fieldnames, rows, start_row=2)
+
+
+def parse_xlsx_intel(data: bytes) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Parse an .xlsx workbook into (stix_objects, skipped_rows).
+
+    The first row is the header (fuzzy-mapped like CSV); values are typed
+    by shape. Requires ``openpyxl`` (an optional dependency — the server
+    boots without it; only this path needs it).
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        return [], [{'error': 'openpyxl is not installed (pip install openpyxl)'}]
+    try:
+        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        ws = wb.active
+        raw_rows = list(ws.iter_rows(values_only=True))
+        wb.close()
+    except Exception as exc:
+        return [], [{'error': f'could not parse workbook: {exc}'}]
+    if not raw_rows:
+        return [], [{'error': 'empty workbook (no header row found)'}]
+
+    headers: List[str] = []
+    seen = set()
+    for i, cell in enumerate(raw_rows[0]):
+        h = str(cell).strip() if cell is not None else ''
+        if not h:
+            h = f'col_{i + 1}'
+        while h in seen:  # dict keys must be unique
+            h += '_'
+        seen.add(h)
+        headers.append(h)
+
+    rows: List[Dict[str, Any]] = []
+    for raw in raw_rows[1:]:
+        rows.append({
+            h: (str(cell).strip() if cell is not None else '')
+            for h, cell in zip(headers, raw)
+        })
+    return _parse_tabular_rows(headers, rows, start_row=2)
+
+
 @app.route('/feed/import-csv', methods=['POST'])
 def import_csv_data():
-    """POST /feed/import-csv — GT-team CSV upload with fuzzy headers.
+    """POST /feed/import-csv — GT-team CSV / Excel (.xlsx) upload.
 
-    Form field ``file`` (multipart) or raw CSV body. Merges in as
-    ``source='manual'`` (append-only upsert — does NOT wipe existing rows),
-    so the web UI "replace" semantics are not disturbed.
+    Form field ``file`` (multipart; .csv or .xlsx) or raw CSV body.
+    Merges in as ``source='manual'`` (append-only upsert — does NOT wipe
+    existing rows), so the web UI "replace" semantics are not disturbed.
     """
     if not _request_allowed():
         return jsonify({'error': 'Unauthorized'}), 401
-    text = None
+    filename = ''
+    data_bytes: Optional[bytes] = None
     if 'file' in request.files:
         f = request.files['file']
         if not f or not f.filename:
             return jsonify({'error': 'no file provided'}), 400
-        text = f.read().decode('utf-8-sig', errors='replace')
+        filename = (f.filename or '').lower()
+        data_bytes = f.read()
     else:
-        text = request.get_data(as_text=True)
-    if not text or not text.strip():
-        return jsonify({'error': 'empty CSV'}), 400
-    try:
-        objects, skipped = parse_csv_intel(text)
-    except Exception as exc:
-        logger.error("CSV import error: %s", exc)
-        return jsonify({'error': str(exc)}), 500
+        data_bytes = request.get_data()
+    if not data_bytes or not data_bytes.strip():
+        return jsonify({'error': 'empty file'}), 400
+
+    if filename.endswith('.xlsx'):
+        try:
+            objects, skipped = parse_xlsx_intel(data_bytes)
+        except Exception as exc:
+            logger.error("XLSX import error: %s", exc)
+            return jsonify({'error': str(exc)}), 500
+        if skipped and any(
+                'openpyxl' in (s.get('error') or '') for s in skipped[:1]):
+            return jsonify({
+                'imported': 0,
+                'skipped': skipped[:1],
+                'error': 'openpyxl is not installed (pip install openpyxl)',
+            }), 500
+    else:
+        try:
+            objects, skipped = parse_csv_intel(
+                data_bytes.decode('utf-8-sig', errors='replace'))
+        except Exception as exc:
+            logger.error("CSV import error: %s", exc)
+            return jsonify({'error': str(exc)}), 500
     if not objects:
         return jsonify({
             'imported': 0,
             'skipped': skipped[:50],
             'error': 'no recognizable rows (check headers/values)',
         }), 400
+    # Import target collection: form/query field, default = primary.
+    cid, err = _collection_param(
+        request.form.get('collection') or request.args.get('collection'))
+    if err:
+        return jsonify({'error': err}), 400
+    cid = cid or TAXII_COLLECTION_ID
     try:
-        added = ingest_objects(objects, mode='merge', source='manual')
+        added = ingest_objects(objects, mode='merge', source='manual',
+                               collection=cid)
     except Exception as exc:
         logger.error("CSV ingest error: %s", exc)
         return jsonify({'error': str(exc)}), 500
@@ -2677,11 +3414,24 @@ class OtxPoller:
 # ---------------------------------------------------------------------------
 
 # STIX 2.1 object types we can map onto our store (type -> our object_type).
+# Covers the classic IOCs plus the extended SCOs, the UI-driven SDOs, and
+# relationships, so a third-party pull preserves the full feed (graph edges
+# included), not just flat indicators.
 _STIX_TO_OUR_TYPE = {
     'ipv4-addr': 'ipv4-addr',
     'domain-name': 'domain-name',
     'file': 'file-hash',
     'indicator': 'indicator',
+    'url': 'url',
+    'email-addr': 'email-addr',
+    'ipv6-addr': 'ipv6-addr',
+    'mac-addr': 'mac-addr',
+    'windows-registry-key': 'windows-registry-key',
+    'autonomous-system': 'autonomous-system',
+    'malware': 'malware',
+    'threat-actor': 'threat-actor',
+    'campaign': 'campaign',
+    'relationship': 'relationship',
 }
 _HASH_ALGO_BY_STIX_KEY = {
     'MD5': 'md5', 'SHA-1': 'sha1', 'SHA-256': 'sha256', 'SHA-512': 'sha512',
@@ -2689,13 +3439,19 @@ _HASH_ALGO_BY_STIX_KEY = {
 
 
 def _stix21_object_to_our(o: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Map a raw STIX 2.1 object (ipv4-addr / domain-name / file / indicator)
-    to an ingestable descriptor. Returns None for unsupported/invalid objects.
+    """Map a raw STIX 2.1 object to an ingestable descriptor.
+
+    Handles ipv4-addr / domain-name / file / indicator plus the extended
+    SCOs (url, email-addr, ipv6-addr, mac-addr, windows-registry-key,
+    autonomous-system), the SDOs (malware, threat-actor, campaign) and
+    relationships. Returns None for unsupported/invalid objects.
     """
     stype = o.get('type')
     if stype not in _STIX_TO_OUR_TYPE:
         return None
     our_type = _STIX_TO_OUR_TYPE[stype]
+    labels = list(o.get('labels') or [])
+    confidence = int(o.get('confidence', 0) or 0) or 50
 
     if our_type == 'ipv4-addr':
         value = o.get('value')
@@ -2703,7 +3459,6 @@ def _stix21_object_to_our(o: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return None
         payload = {'ipv4-addr': {'value': value}}
         stix_id = f"ipv4-addr--{str(value).replace('.', '-')}"
-        labels = list(o.get('labels') or [])
         name = None
     elif our_type == 'domain-name':
         value = o.get('value')
@@ -2711,7 +3466,6 @@ def _stix21_object_to_our(o: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return None
         payload = {'domain-name': {'value': value}}
         stix_id = f"domain-name--{str(value).replace('.', '-')}"
-        labels = list(o.get('labels') or [])
         name = None
     elif our_type == 'file-hash':
         hashes = o.get('hashes') or {}
@@ -2727,8 +3481,72 @@ def _stix21_object_to_our(o: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return None
         payload = {'hash_value': {'algorithm': algo, 'value': str(value)}}
         stix_id = f"file-hash--{str(value)[:16]}"
-        labels = [algo] + list(o.get('labels') or [])
+        labels = [algo] + labels
         name = None
+    elif our_type in ('url', 'email-addr', 'ipv6-addr', 'mac-addr'):
+        value = o.get('value')
+        if not value:
+            return None
+        if our_type == 'email-addr' and not _EMAIL_RE.match(str(value)):
+            return None
+        if our_type == 'ipv6-addr':
+            try:
+                if ipaddress.ip_address(str(value)).version != 6:
+                    return None
+            except ValueError:
+                return None
+        if our_type == 'mac-addr' and not _MAC_RE.match(str(value)):
+            return None
+        payload = {our_type: {'value': value}}
+        stix_id = str(o.get('id') or '') or (
+            f"{our_type}--{uuid.uuid5(uuid.NAMESPACE_OID, str(value)).hex}"
+        )
+        name = None
+    elif our_type == 'windows-registry-key':
+        value = o.get('key')
+        if not value:
+            return None
+        payload = {'windows-registry-key': {'key': value}}
+        stix_id = str(o.get('id') or '') or (
+            'windows-registry-key--' + uuid.uuid5(
+                uuid.NAMESPACE_OID, str(value)).hex
+        )
+        name = None
+    elif our_type == 'autonomous-system':
+        value = o.get('number')
+        if value is None:
+            return None
+        payload = {'autonomous-system': {'number': value}}
+        stix_id = str(o.get('id') or '') or (
+            'autonomous-system--' + uuid.uuid5(
+                uuid.NAMESPACE_OID, str(value)).hex
+        )
+        name = None
+    elif our_type == 'relationship':
+        source_ref = o.get('source_ref')
+        rel_type = o.get('relationship_type')
+        target_ref = o.get('target_ref')
+        if not source_ref or not rel_type or not target_ref:
+            return None
+        payload = {'relationship': {
+            'source_ref': source_ref,
+            'relationship_type': rel_type,
+            'target_ref': target_ref,
+        }}
+        stix_id = str(o.get('id') or '') or (
+            'relationship--' + uuid.uuid5(
+                uuid.NAMESPACE_OID, f'{source_ref}|{rel_type}|{target_ref}'
+            ).hex
+        )
+        name = None
+    elif our_type in ('malware', 'threat-actor', 'campaign'):
+        name = o.get('name')
+        if not name:
+            return None
+        payload = {our_type: {'name': name}}
+        stix_id = str(o.get('id') or '') or (
+            f"{our_type}--{uuid.uuid5(uuid.NAMESPACE_OID, str(name)).hex}"
+        )
     else:  # indicator
         value = None
         pattern = o.get('pattern') or ''
@@ -2753,7 +3571,6 @@ def _stix21_object_to_our(o: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             payload = {'domain-name': {'value': str(value)}}
         else:
             payload = {'indicator': {'value': str(value)}}
-        labels = list(o.get('labels') or [])
         name = o.get('name')
 
     return {
@@ -2761,7 +3578,7 @@ def _stix21_object_to_our(o: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         'type': our_type,
         'object': payload,
         'labels': labels or [],
-        'confidence': int(o.get('confidence', 0) or 0) or 50,
+        'confidence': confidence,
         'name': name,
     }
 
