@@ -1861,7 +1861,7 @@ def delete_objects_data():
     """POST /feed/delete — delete the given STIX ids from the feed (any source).
 
     Body: {"ids": ["ipv4-addr--...", ...]}. Used by the web UI's
-    "Purge unchecked" (drop the rows the user unchecked) — per-row and
+    "Purge selected" (drop the rows the user ticked) — per-row and
     full-feed removal are the × button and DELETE /feed/purge.
     """
     if not _request_allowed():

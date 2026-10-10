@@ -245,11 +245,12 @@ Use the top tabs to switch between **Feed**, **Community sources**, and
 3. **Save changes** — a true **save** (merge): keeps everything already in the
    feed and only **adds new rows + applies your edits** (value, type, labels,
    confidence). It never wipes, and checkboxes do **not** affect what is saved
-   (they only drive *Purge unchecked*). Empty/invalid rows are skipped with a
+   (they only drive *Purge selected*). Empty/invalid rows are skipped with a
    warning instead of being written or blocking the rest.
-4. **Purge unchecked** — deletes the entries that are **unchecked** (across
-   the whole feed, not just the visible page). Uncheck a few rows, click it,
-   and only those are dropped. The per-row **×** deletes a single entry.
+4. **Purge selected** — deletes the entries you **tick** (across the whole
+   feed, not just the visible page). Rows start unselected; select a few,
+   click it, and only those are dropped. The per-row **×** deletes a single
+   entry.
 5. **Purge all** — wipes the **entire** feed in one click (all sources, with
    a confirmation).
 6. **Withheld by filter** — a panel listing every community object the
@@ -429,7 +430,7 @@ write semantics:
 ### POST /feed/delete
 
 Deletes the given STIX ids from the feed (**any source**). This is what the
-web UI **Purge unchecked** button sends (the ids of the unchecked rows).
+web UI **Purge selected** button sends (the ids of the ticked rows).
 Per-row removal is the × button; the full-feed wipe is `DELETE /feed/purge`.
 
 **Request Body:**
@@ -652,7 +653,7 @@ own (see Step 3). They are optional helpers (all off by default):
 > *replace* (default — wipes and rebuilds the `source='manual'` feed) or
 > *merge* (upsert by STIX id, append-only). The web UI **Save changes**
 > button uses *merge*, so a save never wipes anything (manual **or**
-> community intel); dropping entries is an explicit action (*Purge unchecked*
+> community intel); dropping entries is an explicit action (*Purge selected*
 > / × / *Purge all*). The OTX and TAXII pullers also use *merge* mode. This
 > keeps hand-fed intel and pulled community intel independent of each other.
 

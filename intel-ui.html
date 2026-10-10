@@ -187,7 +187,7 @@
       <table id="table" style="display:none">
         <thead>
           <tr>
-            <th style="width:32px"><input type="checkbox" id="chkAll" title="Select all matching" checked></th>
+            <th style="width:32px"><input type="checkbox" id="chkAll" title="Select all matching"></th>
             <th>Type</th><th>Value</th><th>Labels</th><th>Confidence</th><th>Status</th><th>ID</th><th></th>
           </tr>
         </thead>
@@ -223,13 +223,13 @@
       <h2>Publish</h2>
       <div class="row">
         <button id="btnSave">Save changes</button>
-        <button id="btnPurgeUnchecked" class="ghost" title="Delete the rows that are unchecked (across the whole feed, not just this page/filter)">Purge unchecked</button>
+        <button id="btnPurgeSelected" class="ghost" title="Delete the rows that are selected (across the whole feed, not just this page/filter)">Purge selected</button>
         <button id="btnPurge" class="danger">Purge all</button>
       </div>
       <div class="hint">
         <b>Save changes</b> never wipes the feed — it keeps every entry and only
         <b>adds new rows + applies your edits</b> (value, type, labels, confidence).
-        To drop specific entries, uncheck them and hit <b>Purge unchecked</b> (per row) or
+        To drop specific entries, tick their checkboxes and hit <b>Purge selected</b>, or
         use the × on a row; <b>Purge all</b> wipes the entire feed in one click
         (community intel from pullers included).
       </div>
@@ -482,7 +482,7 @@ function rowElement(o) {
 
   const cChk = document.createElement("td");
   const chk = document.createElement("input");
-  chk.type = "checkbox"; chk.checked = o.checked !== false; chk.dataset.kind = o.kind || "new";
+  chk.type = "checkbox"; chk.checked = o.checked === true; chk.dataset.kind = o.kind || "new";
   cChk.appendChild(chk);
 
   const cType = document.createElement("td");
@@ -720,8 +720,6 @@ function updateChkAll() {
   $("chkAll").checked = matching.length > 0 && matching.every(o => o.checked);
   $("chkAll").indeterminate = matching.some(o => o.checked) && !matching.every(o => o.checked);
 }
-
-function refreshCount() { renderFeed(); }
 function setFeedPage(p) { feedPage = p; renderFeed(); }
 
 async function loadFeed() {
@@ -737,7 +735,7 @@ async function loadFeed() {
       ...o,
       value: (o.type === "file-hash" && !o.value) ? o.id : (o.value || ""), // fallback display
       kind: "existing",
-      checked: true,
+      checked: false,
     }));
     newRows = [];
     feedFilter = { q: "", type: "", status: "" };
@@ -750,7 +748,7 @@ async function loadFeed() {
     const wh = r.body.withheld_count || 0;
     showMsg(
       `Loaded ${r.body.count} object(s): ${r.body.served_count} served to Vision One, ` +
-      `${wh} withheld by the filter. Uncheck entries to drop them on save.`, true);
+      `${wh} withheld by the filter. Select entries (checkbox) to purge them.`, true);
   } catch (e) {
     showMsg("Load failed: " + e.message, false);
   }
@@ -787,7 +785,7 @@ function renderWithheld(objects) {
 let newSeq = 0;
 function addRow() {
   const k = "new-" + (++newSeq);
-  newRows.push({ _key: k, id: "ipv4-addr--", type: "ipv4-addr", value: "", labels: [], confidence: 0, checked: true, kind: "new" });
+  newRows.push({ _key: k, id: "ipv4-addr--", type: "ipv4-addr", value: "", labels: [], confidence: 0, checked: false, kind: "new" });
   // New rows are added after the loaded objects, so jump to the last page
   // (where the new row lives) — otherwise it would be off-screen on a big feed.
   feedPage = Math.ceil(filteredData().length / FEED_PAGE_SIZE);
@@ -799,7 +797,7 @@ function addRow() {
 async function save() {
   // SAVE = a real save: merge the WHOLE current model (every existing row +
   // every new row) into the feed. It never wipes anything. Checkboxes do NOT
-  // affect saving — they only drive "Purge unchecked". Invalid / empty rows
+  // affect saving — they only drive "Purge selected". Invalid / empty rows
   // are skipped (and reported) rather than written or blocking the rest, so a
   // half-typed scratch row can't stop a save or get written as garbage.
   const all = feedData.concat(newRows).map(o => ({
@@ -843,13 +841,13 @@ async function save() {
   }
 }
 
-async function purgeUnchecked() {
-  // Explicit removal: delete every row that is UNCHECKED (all pages/filters).
-  const unchecked = feedData.filter(o => !o.checked).map(o => o.id);
-  if (!unchecked.length) { showMsg("Nothing to purge — every row is checked.", false); return; }
-  if (!confirm(`Purge ${unchecked.length} unchecked entr${unchecked.length === 1 ? "y" : "ies"} from the feed (all pages)?`)) return;
+async function purgeSelected() {
+  // Explicit removal: delete every row that is SELECTED (all pages/filters).
+  const selected = feedData.filter(o => o.checked).map(o => o.id);
+  if (!selected.length) { showMsg("Nothing to purge — no rows are selected.", false); return; }
+  if (!confirm(`Purge ${selected.length} selected entr${selected.length === 1 ? "y" : "ies"} from the feed (all pages)?`)) return;
   try {
-    const r = await api("/feed/delete", { method: "POST", body: JSON.stringify({ ids: unchecked }) });
+    const r = await api("/feed/delete", { method: "POST", body: JSON.stringify({ ids: selected }) });
     if (r.status === 200) {
       showMsg(`Purged ${r.body.deleted} entr${r.body.deleted === 1 ? "y" : "ies"}.`, true);
       await loadFeed();
@@ -1070,7 +1068,7 @@ $("btnLogout").addEventListener("click", doLogout);
 $("btnLoad").addEventListener("click", loadFeed);
 $("btnAdd").addEventListener("click", addRow);
 $("btnSave").addEventListener("click", save);
-$("btnPurgeUnchecked").addEventListener("click", purgeUnchecked);
+$("btnPurgeSelected").addEventListener("click", purgeSelected);
 $("btnPurge").addEventListener("click", purge);
 
 // Dashboard page tabs (Feed / Community sources / Import CSV) + deep links.
