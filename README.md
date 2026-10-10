@@ -243,8 +243,12 @@ Use the top tabs to switch between **Feed**, **Community sources**, and
    *matching* row (all pages), not just the current one.
 2. **Add new entry** — pick a type (IPv4 / domain / file hash / indicator),
    type the value. IDs and hash algorithms (MD5/SHA-1/SHA-256) are
-   auto-derived, and values are validated. New rows are added on the last page
-   (and that page is shown) so they're never off-screen.
+   auto-derived, and values are validated. **Label** and **confidence
+   (1–100)** are required for every entry — a row missing either is skipped
+   (with a warning) rather than saved. New rows are added on the last page
+   (and that page is shown) so they're never off-screen. Committing one field
+   (blur) no longer rebuilds the table, so moving value → label → confidence
+   never loses what you've typed.
 3. **Save changes** — a true **save** (merge): keeps everything already in the
    feed and only **adds new rows + applies your edits** (value, type, labels,
    confidence). It never wipes, and checkboxes do **not** affect what is saved

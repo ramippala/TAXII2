@@ -552,13 +552,14 @@ function rowElement(o) {
 
   const cLbl = document.createElement("td");
   const lbl = document.createElement("input");
-  lbl.type = "text"; lbl.value = (o.labels || []).join(", "); lbl.placeholder = "comma,separated";
+  lbl.type = "text"; lbl.value = (o.labels || []).join(", ");
+  lbl.placeholder = o.kind === "new" ? "label,required" : "comma,separated";
   lbl.style.minWidth = "160px";
   cLbl.appendChild(lbl);
 
   const cConf = document.createElement("td");
   const conf = document.createElement("input");
-  conf.type = "number"; conf.min = 0; conf.max = 100; conf.value = o.confidence ?? 0;
+  conf.type = "number"; conf.min = 1; conf.max = 100; conf.value = o.confidence ?? 0;
   conf.style.width = "80px";
   cConf.appendChild(conf);
 
@@ -593,16 +594,19 @@ function rowElement(o) {
 
   tr.append(cChk, cType, cVal, cLbl, cConf, cStatus, cId, cDel);
   tr.dataset.key = o._key || o.id;
-  // Keep the model in sync as the user edits, then re-render (updates the
-  // count and applies the active filter/page). 'change' fires on blur/commit,
-  // so typing never loses focus.
-  const sync = () => { syncToModel(tr); renderFeed(); };
+  // Keep the model in sync as the user edits. 'change' fires on blur/commit.
+  // A commit must NOT rebuild the table: rebuilding on blur destroys the row
+  // the user is moving between (moving from value to labels re-rendered
+  // mid-click, so the label field was replaced before it could take focus
+  // and the typed labels were lost). Only the chrome (selection count /
+  // select-all) updates here — the row itself stays put.
+  const sync = () => { syncToModel(tr); updateFeedChrome(); };
   chk.addEventListener("change", sync);
   sel.addEventListener("change", () => {
     if (tr.dataset.newId) { tr.dataset.id = autoId(sel.value, inp.value.trim()); syncIdCell(tr); }
     sync();
   });
-  // New rows: keep the generated STIX id in sync with the typed value live
+  // Keep the generated STIX id in sync with the typed value live
   // (textContent-only, no re-render, so typing never loses focus).
   inp.addEventListener("input", () => { if (tr.dataset.newId) { tr.dataset.id = autoId(sel.value, inp.value.trim()); syncIdCell(tr); } });
   inp.addEventListener("change", sync);
@@ -650,7 +654,11 @@ async function toggleRevoke(tr, id, toRevoked, badge, btn) {
   }
 }
 
-function syncIdCell(tr) { tr.children[6].textContent = tr.dataset.id; }
+// The ID cell is the second-to-last <td> (the last is the × remove cell).
+function syncIdCell(tr) {
+  const cId = tr.children[tr.children.length - 2];
+  if (cId) cId.textContent = tr.dataset.id;
+}
 
 // Read a row's editable fields from its DOM into a plain object.
 function rowFromTr(tr) {
@@ -750,6 +758,18 @@ function updateChkAll() {
   const matching = feedMatched();
   $("chkAll").checked = matching.length > 0 && matching.every(o => o.checked);
   $("chkAll").indeterminate = matching.some(o => o.checked) && !matching.every(o => o.checked);
+}
+// Lighter than renderFeed(): refresh only the selection counter + the
+// select-all box from the current model — WITHOUT rebuilding <tbody>.
+// Used after a single-row edit commit so the row being edited is left intact.
+function updateFeedChrome() {
+  const matching = feedMatched();
+  const mChecked = matching.filter(o => o.checked).length;
+  const nChecked = newRows.filter(o => o.checked).length;
+  $("feedRange").textContent = matching.length
+    ? `matching ${matching.length} — ${mChecked} selected` + (newRows.length ? ` · +${nChecked} new` : "")
+    : "";
+  updateChkAll();
 }
 function setFeedPage(p) { feedPage = p; renderFeed(); }
 
@@ -868,6 +888,11 @@ async function save() {
     if (r.type !== "indicator") {
       const err = validateValue(r.type, r.value);
       if (err) { skipped.push(`${r.value} — ${err}`); continue; }
+    }
+    // Labels + confidence are mandatory for every entry.
+    if (!r.labels.length) { skipped.push(`${r.value} — label is required`); continue; }
+    if (!(r.confidence >= 1 && r.confidence <= 100)) {
+      skipped.push(`${r.value} — confidence (1-100) is required`); continue;
     }
     good.push(r);
   }
