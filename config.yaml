@@ -247,6 +247,11 @@ sso:
   # allowed_domains: ['contoso.com']   # only these UPN/email domains
   # allowed_upns: ['jdoe@contoso.com'] # or exact UPNs
   # allowed_groups: ['<entra-group-object-id>'] # must match a token 'groups' claim
+  # Role granted to an SSO user. SSO identities live in the IdP, not in the
+  # dashboard's `ui_users` table, so they need a role from here. Defaults to
+  # the weakest role: being authenticated by the tenant should not by itself
+  # confer write access to the feed. One of: viewer | editor | admin.
+  default_role: 'viewer'
 
 # ---------------------------------------------------------------------------
 # OPTIONAL background pollers — off by default. Neither is how Vision One
@@ -264,7 +269,7 @@ sso:
 # ---------------------------------------------------------------------------
 
 otx:
-  enabled: true               # set true to start pulling community intel from OTX
+  enabled: false               # set true to start pulling community intel from OTX
   base_url: 'https://otx.alienvault.com'   # OTX API base (no trailing slash)
   # Optional free OTX API key — put the real value in .env (OTX_API_KEY=...)
   # so it never lands in version control. Unset = anonymous read-only browsing

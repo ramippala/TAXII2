@@ -49,13 +49,14 @@ import server as _server
 
 
 def _reset_db():
-    """Purge all feed rows (all sources) and issued API keys between tests."""
+    """Purge feed rows, API keys and dashboard users between tests."""
     import server
     session = server.create_session()
     try:
         memory_store.clear()
         session.query(server.STIXObject).delete()
         session.query(server.ApiKey).delete()
+        session.query(server.UIUser).delete()
         session.commit()
     finally:
         session.close()
@@ -3449,6 +3450,190 @@ class TestClientIpTrust(unittest.TestCase):
                 self.assertEqual(_server._client_ip(), '127.0.0.1')
         finally:
             _server._TRUSTED_PROXY_NETS = saved
+
+
+class TestDashboardUsers(unittest.TestCase):
+    """Dashboard multi-user logins with roles (viewer / editor / admin).
+
+    Permissions are enforced server-side; the role is re-resolved from the
+    users table on every request, so changes apply without a re-login.
+    """
+
+    ADMIN = ('root', 'root-password-123')
+    PW = 'password-12345'
+
+    def setUp(self):
+        _reset_db()
+        self._saved = (_server._ui_username, _server._ui_password)
+        _server._ui_username, _server._ui_password = self.ADMIN
+        self.admin = app.test_client()
+        r = self.admin.post('/ui/login', json={
+            'username': self.ADMIN[0], 'password': self.ADMIN[1]})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+
+    def tearDown(self):
+        _server._ui_username, _server._ui_password = self._saved
+
+    def _mkuser(self, username, role):
+        r = self.admin.post('/ui/users', json={
+            'username': username, 'password': self.PW, 'role': role})
+        self.assertEqual(r.status_code, 201, r.get_data(as_text=True))
+        return r.get_json()
+
+    def _login(self, username, password=None):
+        client = app.test_client()
+        r = client.post('/ui/login', json={
+            'username': username, 'password': password or self.PW})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        return client
+
+    def _ingest(self, client):
+        return client.post('/feed/ingest',
+                           json={'stix_objects': [_manual_obj('7.7.7.7')]})
+
+    # --- provisioning -------------------------------------------------------
+
+    def test_admin_creates_user_who_can_log_in(self):
+        self._mkuser('alice', 'editor')
+        session = self._login('alice').get('/ui/session').get_json()
+        self.assertEqual(session['user'], 'alice')
+        self.assertEqual(session['role'], 'editor')
+        self.assertTrue(session['can_write'])
+        self.assertFalse(session['can_admin'])
+
+    def test_password_hash_is_never_returned(self):
+        body = self._mkuser('bob', 'viewer')
+        self.assertNotIn('password', body)
+        self.assertNotIn('password_hash', body)
+
+    def test_duplicate_username_rejected(self):
+        self._mkuser('dup', 'viewer')
+        self.assertEqual(self.admin.post('/ui/users', json={
+            'username': 'dup', 'password': self.PW, 'role': 'viewer'}).status_code,
+            409)
+
+    def test_role_and_password_are_validated(self):
+        self.assertEqual(self.admin.post('/ui/users', json={
+            'username': 'x', 'password': self.PW, 'role': 'superuser'}
+        ).status_code, 400)
+        self.assertEqual(self.admin.post('/ui/users', json={
+            'username': 'y', 'password': 'short', 'role': 'viewer'}
+        ).status_code, 400)
+
+    def test_static_credentials_remain_a_break_glass_admin(self):
+        session = self.admin.get('/ui/session').get_json()
+        self.assertEqual(session['role'], 'admin')
+        self.assertTrue(session['can_admin'])
+
+    # --- role enforcement ---------------------------------------------------
+
+    def test_viewer_can_read_but_not_write(self):
+        self._mkuser('vi', 'viewer')
+        viewer = self._login('vi')
+        self.assertEqual(viewer.get('/objects').status_code, 200)
+        self.assertEqual(self._ingest(viewer).status_code, 401)
+        self.assertEqual(viewer.post('/ui/keys', json={
+            'label': 'x', 'collections': ['gt_intel']}).status_code, 401)
+
+    def test_editor_can_write_but_not_manage_keys_or_users(self):
+        self._mkuser('ed', 'editor')
+        editor = self._login('ed')
+        self.assertEqual(self._ingest(editor).status_code, 200)
+        self.assertEqual(editor.post('/ui/keys', json={
+            'label': 'x', 'collections': ['gt_intel']}).status_code, 401)
+        self.assertEqual(editor.get('/ui/users').status_code, 401)
+
+    def test_admin_can_manage_keys_and_users(self):
+        self._mkuser('adm', 'admin')
+        admin = self._login('adm')
+        self.assertEqual(admin.get('/ui/users').status_code, 200)
+        self.assertEqual(admin.post('/ui/keys', json={
+            'label': 'k', 'collections': ['gt_intel']}).status_code, 201)
+
+    # --- changes apply without a re-login -----------------------------------
+
+    def test_disabling_a_user_ends_their_session_immediately(self):
+        user = self._mkuser('temp', 'editor')
+        temp = self._login('temp')
+        self.assertEqual(temp.get('/objects').status_code, 200)
+        self.assertEqual(self.admin.post(
+            f"/ui/users/{user['id']}", json={'enabled': False}).status_code, 200)
+        self.assertEqual(temp.get('/objects').status_code, 401)
+
+    def test_deleting_a_user_ends_their_session(self):
+        user = self._mkuser('gone', 'editor')
+        gone = self._login('gone')
+        self.assertEqual(self.admin.post(
+            f"/ui/users/{user['id']}/delete").status_code, 200)
+        self.assertEqual(gone.get('/objects').status_code, 401)
+
+    def test_role_change_takes_effect_without_relogin(self):
+        user = self._mkuser('promo', 'viewer')
+        promo = self._login('promo')
+        self.assertEqual(self._ingest(promo).status_code, 401)
+        self.admin.post(f"/ui/users/{user['id']}", json={'role': 'editor'})
+        self.assertEqual(self._ingest(promo).status_code, 200)
+
+    # --- lockout guard ------------------------------------------------------
+
+    def test_last_enabled_admin_cannot_be_removed(self):
+        user = self._mkuser('only-admin', 'admin')
+        self.assertEqual(self.admin.post(
+            f"/ui/users/{user['id']}", json={'role': 'viewer'}).status_code, 400)
+        self.assertEqual(self.admin.post(
+            f"/ui/users/{user['id']}", json={'enabled': False}).status_code, 400)
+        self.assertEqual(self.admin.post(
+            f"/ui/users/{user['id']}/delete").status_code, 400)
+
+    def test_a_second_admin_can_be_removed(self):
+        first = self._mkuser('admin-a', 'admin')
+        self._mkuser('admin-b', 'admin')
+        self.assertEqual(self.admin.post(
+            f"/ui/users/{first['id']}/delete").status_code, 200)
+
+    # --- audit --------------------------------------------------------------
+
+    def test_write_audit_line_names_the_actor(self):
+        self._mkuser('audited', 'editor')
+        editor = self._login('audited')
+        with self.assertLogs('TAXII', level='INFO') as logs:
+            self._ingest(editor)
+        joined = '\n'.join(logs.output)
+        self.assertIn('audited', joined)
+        self.assertIn('editor', joined)
+
+
+class TestUiPageWiring(unittest.TestCase):
+    """Static checks on intel-ui.html — the dashboard's page wiring.
+
+    A dashboard page is defined in THREE places: the tab button, the
+    ``<section>``, and the ``PAGE_NAMES`` allow-list. ``showPage()`` falls
+    back to Feed for a name missing from ``PAGE_NAMES``, so a half-added page
+    renders a visible tab that silently never opens. These assertions keep the
+    three in step; there is no browser in CI to catch it at runtime.
+    """
+
+    def setUp(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, 'intel-ui.html'), encoding='utf-8') as fh:
+            self.html = fh.read()
+
+    def test_tabs_sections_and_page_names_agree(self):
+        tabs = set(re.findall(
+            r'<button class="tab[^"]*" data-page="([^"]+)"', self.html))
+        sections = set(re.findall(r'<section data-page="([^"]+)"', self.html))
+        raw = re.search(r'const PAGE_NAMES = \[([^\]]*)\]', self.html).group(1)
+        names = {p.strip().strip('"\'') for p in raw.split(',') if p.strip()}
+
+        self.assertTrue(tabs, 'no dashboard tabs found — did the markup change?')
+        self.assertEqual(tabs, sections,
+                         'every tab needs exactly one matching <section>')
+        missing = tabs - names
+        self.assertFalse(
+            missing,
+            f'{sorted(missing)} have a tab and a section but are missing from '
+            f'PAGE_NAMES, so showPage() silently falls back to Feed')
+        self.assertEqual(names, tabs, 'PAGE_NAMES lists a page that has no tab')
 
 
 class _FakeJwkClient:

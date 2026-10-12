@@ -615,11 +615,15 @@ These drive the dashboard login. They are independent of `taxii.auth`.
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /ui/session` | Current session: `{"authenticated": bool, "user": str\|null}` |
+| `GET /ui/session` | Current session: `{"authenticated": bool, "user": str\|null, "role": str\|null, "can_write": bool, "can_admin": bool}` |
 | `GET /ui/collections` | Collection registry for the dashboard selector: `{"collections": [{id,title,members,aggregate}], "primary": id, "manual": id, "community": id}` — `manual`/`community` are where the dashboard routes a write, since an aggregate is read-only |
-| `GET /ui/keys` | Issued API keys (prefix, label, scope, expiry, last used, enabled) — never the secret. Requires a writer principal |
-| `POST /ui/keys` | Body `{"label", "collections": [id…], "expires_days"?, "rate_limit"?, "rate_window"?, "max_objects"?}`. Returns the plaintext key **once** (`201`). Requires a writer principal |
-| `POST /ui/keys/<id>/revoke` | Disable a key permanently |
+| `GET /ui/keys` | Issued API keys (prefix, label, scope, expiry, last used, enabled) — never the secret. Requires an **admin** principal |
+| `POST /ui/keys` | Body `{"label", "collections": [id…], "expires_days"?, "rate_limit"?, "rate_window"?, "max_objects"?}`. Returns the plaintext key **once** (`201`). Requires an **admin** principal |
+| `POST /ui/keys/<id>/revoke` | Disable a key permanently (admin) |
+| `GET /ui/users` | Dashboard users (username, role, enabled, created, last login) — never a password hash. Requires an **admin** principal |
+| `POST /ui/users` | Body `{"username", "password", "role"}` (role: `viewer`\|`editor`\|`admin`). `409` on a duplicate, `400` on a bad role or a password under 12 chars. Returns `201` (admin) |
+| `POST /ui/users/<id>` | Change a user's `role`, `enabled` or `password`. `400` if it would remove the last enabled admin (admin) |
+| `POST /ui/users/<id>/delete` | Delete a user; their session stops working immediately (admin) |
 | `GET /ui/stats` | Aggregates for the **Intel graph** tab. `?scope=community\|manual\|all` (default community) and `?collection=<id>`: totals, `categories`, `by_source`, `withheld_reasons`, `confidence` (histogram), `timeline`, `top_labels`. |
 | `POST /ui/login` | Body `{"username","password"}` checked against `ui.auth`. On success sets the http-only `taxii2_ui_session` cookie (signed with `security.secret_key`, lifetime `ui.session_ttl`); `401` on bad credentials. |
 | `POST /ui/logout` | Deletes the session cookie. |
@@ -955,6 +959,43 @@ can expire, and can carry its own rate limit.
 - **Revocation** is permanent: `POST /ui/keys/<id>/revoke` disables the key,
   and it starts failing authentication immediately.
 
+### Dashboard users (multi-user with roles)
+
+The dashboard is no longer a single shared login. The **Users** tab (admins
+only) creates logins, each with a role:
+
+| Role | Can do |
+|------|--------|
+| `viewer` | read everything in the dashboard (feed, graph, sources, stats) |
+| `editor` | viewer **+** data mutations: ingest, CSV/Excel import, delete, revoke, purge, community pulls |
+| `admin` | editor **+** API-key and user management |
+
+- **Enforced server-side, on every request.** The role is re-resolved from the
+  `ui_users` table per request rather than baked into the session cookie, so
+  disabling a user, changing their role, or deleting them takes effect on their
+  **next request** — no re-login, and no waiting for the cookie to expire. The
+  dashboard hides controls a role cannot use, but that is only cosmetic; the
+  server is the boundary.
+- **Passwords** are hashed with werkzeug (scrypt/pbkdf2). That runs once per
+  *login*, not per request, so an adaptive hash is correct here — unlike API
+  keys, which are verified on every poll and therefore use a fast SHA-256.
+- **`ui.auth` is kept as a break-glass admin.** The static pair is deliberately
+  *not* stored in `ui_users`, so it cannot be locked out by a bad role edit and
+  still works exactly as before. It is always an admin.
+- **SSO users** have no local row (their identity lives in the IdP), so they
+  take `sso.default_role` — `viewer` by default. Being authenticated by the
+  tenant should not by itself grant write access to the feed.
+- **You cannot lock yourself out.** The last enabled admin cannot be demoted,
+  disabled or deleted (`400`); create a second admin first.
+- **Audit lines name the actor.** Mutations log
+  `… by alice (editor via session) from 203.0.113.9`, so a shared login is no
+  longer indistinguishable — you can tell *who* purged the feed, not just from
+  which IP.
+
+> First run: log in with `ui.auth`, open **Users**, and create yourself a real
+> admin account before sharing the dashboard. Leave `ui.auth` set as the
+> break-glass credential.
+
 **Upgrading from the pre-segregation single collection.** The old rows lived
 under `collection_id='threat-intel'`, which no longer names anything. On the
 first boot with a `members:` aggregate configured, they are re-homed once —
@@ -1247,7 +1288,8 @@ group allow-lists, and session-cookie issuance on success).
 | Control | Behavior |
 |---------|----------|
 | Response headers | Every response carries `Content-Security-Policy` (inline script/style allowed, everything else `'self'`), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy`, `Strict-Transport-Security`. |
-| Session cookie | `taxii2_ui_session` is `HttpOnly`, `SameSite=Lax`, `Secure`, signed (itsdangerous) and time-bounded (`ui.session_ttl`). |
+| Session cookie | `taxii2_ui_session` is `HttpOnly`, `SameSite=Lax`, `Secure`, signed (itsdangerous) and time-bounded (`ui.session_ttl`). It carries the username *and* how the session was established, never the role: the role is re-resolved from `ui_users` on every request, so revoking access is immediate. |
+| Roles | Dashboard writes need `editor`; API-key and user management need `admin`. The last enabled admin cannot be removed. `ui.auth` and `taxii.admin_auth` are always admin (break-glass). |
 | Upload caps | `/feed/import-csv` bodies are capped at `security.max_upload_bytes` (25 MB → `413`) and parsed at most `security.max_import_rows` rows (50 000) before truncating with a note. A workbook that fails to parse returns a generic `400` (parser detail stays in the log), and `defusedxml` hardens openpyxl's XML parsing of untrusted `.xlsx`. |
 | Response caps | `/objects` accepts `?limit=` and never returns more than `security.max_objects_json` rows (50 000), reporting `"truncated": true` when it trims. TAXII Get Objects is capped at `taxii.max_objects` (10 000) per response **even when the client sends no `?limit=`**, so a single poll cannot materialise a whole collection; the client continues via `more`/`next`. Set `taxii.max_objects: 0` to disable. |
 | Auth throttling | After `security.auth_fail_limit` (10) failed credentials from one client IP within `security.auth_fail_window` (300 s), further attempts get `429` + `Retry-After` without the credential being evaluated. Only requests that *present* a credential are counted, and a success clears the counter. The failure table is bounded by evicting its oldest keys — never cleared wholesale, so a caller able to vary its throttle key cannot reset protection for everyone. |

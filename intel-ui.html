@@ -116,6 +116,12 @@
   .tab.active { background: var(--panel); color: var(--text); }
   section[data-page] { display: none; }
   section[data-page].active { display: block; }
+  /* Role-gated controls. The server enforces every permission; hiding these
+     only avoids inviting a viewer to press a button that would be rejected.
+     Body-class driven so it also covers controls rendered later (per-row
+     Revoke buttons) and survives re-renders. */
+  body.no-write .write-only { display: none !important; }
+  body.no-admin .admin-only { display: none !important; }
   .colsel { font-size: 12px; color: var(--muted); margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
   .colsel select { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 4px 8px; }
   /* api keys */
@@ -209,7 +215,8 @@
       <button class="tab" data-page="graph">Intel graph</button>
       <button class="tab" data-page="sources">Community sources</button>
       <button class="tab" data-page="import">Import CSV / Excel</button>
-      <button class="tab" data-page="keys">API keys</button>
+      <button class="tab admin-only" data-page="keys">API keys</button>
+      <button class="tab admin-only" data-page="users">Users</button>
     </div>
 
     <!-- ============ PAGE: FEED ============ -->
@@ -220,7 +227,7 @@
       <h2>Current feed</h2>
       <div class="row" style="margin-bottom:12px">
         <button id="btnLoad" class="ghost">Load current feed</button>
-        <button id="btnAdd" class="ghost">+ Add new entry</button>
+        <button id="btnAdd" class="write-only ghost">+ Add new entry</button>
         <label class="colsel" title="Which TAXII collection this dashboard shows and edits">
           Collection
           <select id="collectionSel"></select>
@@ -284,9 +291,9 @@
     <div class="panel">
       <h2>Publish</h2>
       <div class="row">
-        <button id="btnSave">Save changes</button>
-        <button id="btnPurgeSelected" class="ghost" title="Delete the rows that are selected (across the whole feed, not just this page/filter)">Purge selected</button>
-        <button id="btnPurge" class="danger">Purge all</button>
+        <button id="btnSave" class="write-only">Save changes</button>
+        <button id="btnPurgeSelected" class="write-only ghost" title="Delete the rows that are selected (across the whole feed, not just this page/filter)">Purge selected</button>
+        <button id="btnPurge" class="write-only danger">Purge all</button>
       </div>
       <div class="hint">
         <b>Save changes</b> never wipes the feed — it keeps every entry and only
@@ -353,7 +360,7 @@
       </div>
       <div class="row">
         <input type="file" id="csvFile" accept=".csv,text/csv,text/plain,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="max-width:380px">
-        <button id="btnCsvImport" class="ghost" disabled>Import CSV / Excel</button>
+        <button id="btnCsvImport" class="write-only ghost" disabled>Import CSV / Excel</button>
         <button id="btnCsvSample" class="ghost" title="Download a ready-to-edit template with all header styles">Download sample CSV</button>
       </div>
       <div id="csvMsg" class="msg" style="margin-top:10px"></div>
@@ -421,6 +428,62 @@
           </tr>
         </thead>
         <tbody id="keyBody"></tbody>
+      </table>
+    </div>
+
+    </section>
+
+    <!-- ============ PAGE: DASHBOARD USERS ============ -->
+    <section data-page="users">
+
+    <div class="panel">
+      <h2>Dashboard users</h2>
+      <div class="hint" style="margin:0 0 10px">
+        Logins for this dashboard, each with a role. Permissions are enforced
+        by the server on every request, and a role change takes effect
+        immediately — no re-login needed.
+        <br><b>viewer</b> can read everything.
+        <b>editor</b> can additionally ingest, import, delete, revoke, purge
+        and trigger community pulls.
+        <b>admin</b> can additionally manage API keys and users.
+      </div>
+      <div id="usersBootstrap" class="hint" style="display:none;margin:0 0 10px">
+        The static <span class="mono">ui.auth</span> credential is still active
+        as a break-glass admin and is not listed here.
+      </div>
+      <div class="row">
+        <label>Username
+          <input type="text" id="userName" maxlength="64" placeholder="alice" style="min-width:180px">
+        </label>
+        <label>Password
+          <input type="password" id="userPass" placeholder="at least 12 characters" style="min-width:200px">
+        </label>
+        <label>Role
+          <select id="userRole">
+            <option value="viewer">viewer</option>
+            <option value="editor">editor</option>
+            <option value="admin">admin</option>
+          </select>
+        </label>
+        <button id="btnUserCreate" class="ghost">Create user</button>
+      </div>
+      <div id="userMsg" class="msg" style="margin-top:10px"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Existing users</h2>
+      <div class="row" style="margin-bottom:12px">
+        <button id="btnUserReload" class="ghost">Reload</button>
+        <span class="currange mono" id="userCount"></span>
+      </div>
+      <table id="userTable" style="display:none">
+        <thead>
+          <tr>
+            <th>Username</th><th>Role</th><th>Status</th>
+            <th>Created</th><th>Last login</th><th>Password</th><th></th>
+          </tr>
+        </thead>
+        <tbody id="userBody"></tbody>
       </table>
     </div>
 
@@ -662,15 +725,39 @@ function showLogin(ssoEnabled) {
   $("ssoWrap").style.display = (ssoEnabled ?? SSO_ENABLED) ? "block" : "none";
 }
 
+// The signed-in principal. The server enforces every permission; these flags
+// only decide which controls are worth showing, so a viewer is not invited to
+// press buttons that will be rejected.
+let CURRENT_ROLE = null;
+let CAN_WRITE = false;
+let CAN_ADMIN = false;
+
 function showDashboard(user) {
   $("loginPanel").style.display = "none";
   $("dashboard").style.display = "block";
-  if (user) $("whoami").textContent = "Signed in as " + user;
+  if (user) {
+    $("whoami").textContent =
+      "Signed in as " + user + (CURRENT_ROLE ? ` (${CURRENT_ROLE})` : "");
+  }
+  applyRole();
   showPage(currentPageFromHash());
 }
 
+// Hide what this role cannot use. Driven by body classes + CSS rather than a
+// list of element ids, so it also covers controls rendered later (per-row
+// Revoke buttons) and survives re-renders. Purely cosmetic: every permission
+// is enforced server-side, so a control that slips through still gets a 401.
+function applyRole() {
+  document.body.classList.toggle("no-write", !CAN_WRITE);
+  document.body.classList.toggle("no-admin", !CAN_ADMIN);
+  if (!CAN_ADMIN && ["keys", "users"].includes(currentPageFromHash())) {
+    showPage("feed");
+    location.hash = "#feed";
+  }
+}
+
 // --- Dashboard page tabs (Feed / Intel graph / Community sources / Import) ---
-const PAGE_NAMES = ["feed", "graph", "sources", "import", "keys"];
+const PAGE_NAMES = ["feed", "graph", "sources", "import", "keys", "users"];
 function currentPageFromHash() {
   const h = (location.hash || "").replace(/^#/, "");
   return PAGE_NAMES.includes(h) ? h : "feed";
@@ -688,10 +775,17 @@ function showPage(name) {
   }
   if (name === "graph") loadStats();  // aggregated view: fetch on entry
   if (name === "keys") loadKeys();    // keys: fetch on entry
+  if (name === "users") loadUsers();  // users: fetch on entry
 }
 function onTabClick(e) {
   const name = e.currentTarget.dataset.page;
   showPage(name);
+}
+
+function setRole(body) {
+  CURRENT_ROLE = (body && body.role) || null;
+  CAN_WRITE = !!(body && body.can_write);
+  CAN_ADMIN = !!(body && body.can_admin);
 }
 
 async function init() {
@@ -699,6 +793,7 @@ async function init() {
     const r = await api("/ui/session");
     SSO_ENABLED = !!(r.body && r.body.sso && r.body.sso.enabled);
     if (r.status === 200 && r.body && r.body.authenticated) {
+      setRole(r.body);
       showDashboard(r.body.user);
       await loadCollections();
       loadFeed();
@@ -720,6 +815,10 @@ async function doLogin() {
       body: JSON.stringify({ username: $("loginUser").value.trim(), password: $("loginPass").value }),
     });
     if (r.status === 200) {
+      // Re-read the session so the role flags are set before the dashboard
+      // decides which controls to show.
+      const s = await api("/ui/session");
+      setRole(s.body);
       showDashboard(r.body && r.body.user);
       $("loginPass").value = "";
       await loadCollections();
@@ -753,6 +852,11 @@ async function doLogout() {
   $("keyMsg").className = "msg";
   $("keyScope").innerHTML = "";
   delete $("keyScope").dataset.ids;
+  $("userBody").innerHTML = "";
+  $("userTable").style.display = "none";
+  $("userMsg").className = "msg";
+  // Drop the cached role so a later login re-reads it from the server.
+  CURRENT_ROLE = null; CAN_WRITE = false; CAN_ADMIN = false;
   renderFeed();
   showLogin();
 }
@@ -837,7 +941,7 @@ function rowElement(o) {
     if (o.revoked_at) st.title = "Revoked: " + o.revoked_at;
     else if (o.last_seen) st.title = "Last seen: " + o.last_seen;
     const btn = document.createElement("button");
-    btn.className = "revbtn";
+    btn.className = "revbtn write-only";
     btn.textContent = o.revoked ? "Unrevoke" : "Revoke";
     btn.title = o.revoked
       ? "Reinstate (mark active again)"
@@ -1454,6 +1558,157 @@ async function copyKey() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Dashboard users (admin only)
+// ---------------------------------------------------------------------------
+function userMsg(text, ok) {
+  const el = $("userMsg");
+  el.textContent = text || "";
+  el.className = "msg " + (ok ? "ok" : "bad");
+  if (!text) el.className = "msg";
+}
+
+async function loadUsers() {
+  try {
+    const r = await api("/ui/users");
+    if (r.status !== 200) {
+      userMsg(`Could not load users (HTTP ${r.status}).`, false);
+      return;
+    }
+    const b = r.body || {};
+    $("usersBootstrap").style.display = b.bootstrap_configured ? "block" : "none";
+    renderUserTable(b.users || []);
+  } catch (e) {
+    userMsg("Could not load users: " + e.message, false);
+  }
+}
+
+function renderUserTable(users) {
+  const body = $("userBody");
+  const table = $("userTable");
+  body.innerHTML = "";
+  $("userCount").textContent = users.length ? `${users.length} user(s)` : "";
+  table.style.display = users.length ? "table" : "none";
+  users.forEach(u => {
+    const tr = document.createElement("tr");
+    [u.username, u.role, u.enabled ? "active" : "disabled",
+     fmtKeyTs(u.created), fmtKeyTs(u.last_login_at)].forEach(v => {
+      const td = document.createElement("td");
+      td.textContent = v;
+      tr.appendChild(td);
+    });
+
+    // Password reset
+    const cPass = document.createElement("td");
+    const btnPass = document.createElement("button");
+    btnPass.className = "ghost";
+    btnPass.textContent = "Set password";
+    btnPass.addEventListener("click", () => resetUserPassword(u));
+    cPass.appendChild(btnPass);
+    tr.appendChild(cPass);
+
+    // Role + enable/disable + delete
+    const cAct = document.createElement("td");
+    const sel = document.createElement("select");
+    ["viewer", "editor", "admin"].forEach(role => {
+      const o = document.createElement("option");
+      o.value = role; o.textContent = role;
+      if (role === u.role) o.selected = true;
+      sel.appendChild(o);
+    });
+    sel.addEventListener("change", () => updateUser(u, { role: sel.value }));
+    cAct.appendChild(sel);
+    const btnToggle = document.createElement("button");
+    btnToggle.className = "ghost";
+    btnToggle.textContent = u.enabled ? "Disable" : "Enable";
+    btnToggle.addEventListener("click", () => updateUser(u, { enabled: !u.enabled }));
+    cAct.appendChild(btnToggle);
+    const btnDel = document.createElement("button");
+    btnDel.className = "ghost";
+    btnDel.textContent = "Delete";
+    btnDel.addEventListener("click", () => deleteUser(u));
+    cAct.appendChild(btnDel);
+    tr.appendChild(cAct);
+
+    body.appendChild(tr);
+  });
+}
+
+async function createUser() {
+  const username = $("userName").value.trim();
+  const password = $("userPass").value;
+  if (!username) { userMsg("A username is required.", false); return; }
+  if (!password) { userMsg("A password is required.", false); return; }
+  const btn = $("btnUserCreate");
+  btn.disabled = true;
+  try {
+    const r = await api("/ui/users", {
+      method: "POST",
+      body: JSON.stringify({ username, password, role: $("userRole").value }),
+    });
+    if (r.status === 201) {
+      userMsg(`User "${username}" created as ${r.body.role}.`, true);
+      $("userName").value = ""; $("userPass").value = "";
+      await loadUsers();
+    } else {
+      userMsg(`Could not create the user (HTTP ${r.status}): `
+             + ((r.body && r.body.error) || "unknown error"), false);
+    }
+  } catch (e) {
+    userMsg("Could not create the user: " + e.message, false);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function updateUser(u, patch) {
+  try {
+    const r = await api(`/ui/users/${encodeURIComponent(u.id)}`, {
+      method: "POST", body: JSON.stringify(patch),
+    });
+    if (r.status === 200) {
+      userMsg(`"${u.username}" updated.`, true);
+      await loadUsers();
+    } else {
+      userMsg(`Update failed (HTTP ${r.status}): `
+             + ((r.body && r.body.error) || "unknown error"), false);
+      await loadUsers();      // re-sync the row we just changed optimistically
+    }
+  } catch (e) {
+    userMsg("Update failed: " + e.message, false);
+    await loadUsers();
+  }
+}
+
+async function resetUserPassword(u) {
+  const password = prompt(`New password for "${u.username}" (at least 12 characters):`);
+  if (password === null) return;
+  if (!password) { userMsg("No password entered.", false); return; }
+  await updateUser(u, { password });
+}
+
+async function deleteUser(u) {
+  if (!await showConfirm(
+      "Delete user",
+      `Delete "${u.username}"? They will be signed out and unable to log in `
+      + `again. This cannot be undone.`,
+      { danger: true, okLabel: "Delete" }
+  )) return;
+  try {
+    const r = await api(`/ui/users/${encodeURIComponent(u.id)}/delete`,
+                        { method: "POST" });
+    if (r.status === 200) {
+      userMsg(`User "${u.username}" deleted.`, true);
+      await loadUsers();
+    } else {
+      userMsg(`Delete failed (HTTP ${r.status}): `
+             + ((r.body && r.body.error) || "unknown error"), false);
+    }
+  } catch (e) {
+    userMsg("Delete failed: " + e.message, false);
+  }
+}
+
 // Generates a ready-to-edit template covering every supported header style.
 // Pure client-side (Blob) — works offline, no server asset.
 function downloadCsvSample() {
@@ -1799,6 +2054,10 @@ $("collectionSel").addEventListener("change", () => {
 $("btnKeyCreate").addEventListener("click", createKey);
 $("btnKeyCopy").addEventListener("click", copyKey);
 $("btnKeyReload").addEventListener("click", loadKeys);
+
+// Dashboard users page: create / reload (per-row actions are wired on render).
+$("btnUserCreate").addEventListener("click", createUser);
+$("btnUserReload").addEventListener("click", loadUsers);
 
 // Intel graph: scope switch + manual refresh.
 $("graphScope").addEventListener("change", () => {

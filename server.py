@@ -276,6 +276,31 @@ class ApiKey(Base):
     max_objects = Column(Integer, nullable=True)
 
 
+class UIUser(Base):
+    """A dashboard login with a role.
+
+    Replaces the single shared ``ui.auth`` pair for everyday use. Passwords
+    are hashed with werkzeug (scrypt/pbkdf2) — unlike API keys this runs once
+    per *login*, not per poll, so an adaptive hash is the right choice.
+
+    ``role`` is one of :data:`ROLE_LEVELS` and is resolved from this row on
+    every request rather than baked into the session cookie, so disabling a
+    user or changing their role takes effect immediately instead of at their
+    next login. The static ``ui.auth`` credential is kept as a virtual
+    break-glass admin and is deliberately NOT stored here.
+    """
+
+    __tablename__ = "ui_users"
+
+    id = Column(String, primary_key=True)
+    username = Column(String, unique=True, nullable=False, index=True)
+    password_hash = Column(String, nullable=False)
+    role = Column(String, nullable=False, default='viewer')
+    enabled = Column(Boolean, default=True)
+    created = Column(DateTime, default=datetime.utcnow)
+    last_login_at = Column(DateTime, nullable=True)
+
+
 class PullerState(Base):
     """Per-community-puller state: last sync timestamp + status.
 
@@ -1301,25 +1326,165 @@ from itsdangerous import BadSignature, URLSafeTimedSerializer
 _session_serializer = URLSafeTimedSerializer(_ui_secret, salt='taxii2-ui-session')
 
 
-def _session_cookie(username: str) -> str:
-    """Create a signed, time-bounded session cookie for the web UI."""
-    return _session_serializer.dumps({'user': username})
+# Dashboard roles, weakest to strongest. A principal may do anything at its
+# own level or below:
+#   viewer — read the dashboard (feed, graph, sources, stats)
+#   editor — viewer + data mutations (ingest, import, delete, revoke, purge,
+#            community pulls)
+#   admin  — editor + API-key and user management
+ROLE_LEVELS = {'viewer': 1, 'editor': 2, 'admin': 3}
+DEFAULT_ROLE = 'viewer'
+_PRINCIPAL_UNSET = object()
 
 
-def _session_user() -> Optional[str]:
-    """Decode the session cookie; returns the username or None."""
+def _role_at_least(role: Any, minimum: str) -> bool:
+    """True when ``role`` ranks at or above ``minimum``."""
+    return ROLE_LEVELS.get(str(role or ''), 0) >= ROLE_LEVELS.get(minimum, 99)
+
+
+def _session_cookie(username: str, source: str = 'user') -> str:
+    """Create a signed, time-bounded session cookie for the web UI.
+
+    ``source`` records HOW the session was established, because that decides
+    how the principal is re-resolved on later requests:
+      * ``user``   — a ``ui_users`` row, re-checked every request, so
+                     disabling the account or changing its role applies at once
+      * ``static`` — the break-glass ``ui.auth`` pair (always admin)
+      * ``sso``    — an SSO identity with no local row (role from config)
+    """
+    return _session_serializer.dumps({'user': username, 'src': source})
+
+
+def _session_payload() -> Optional[Dict[str, str]]:
+    """Decode the session cookie to ``{'user', 'src'}``, or None."""
     token = request.cookies.get('taxii2_ui_session')
     if not token:
         return None
     try:
         payload = _session_serializer.loads(token, max_age=_ui_session_ttl)
-        return payload.get('user')
     except BadSignature:
         return None
+    if not isinstance(payload, dict) or not payload.get('user'):
+        return None
+    return {'user': str(payload['user']),
+            'src': str(payload.get('src') or 'user')}
+
+
+def _session_user() -> Optional[str]:
+    """Decode the session cookie; returns the username or None."""
+    payload = _session_payload()
+    return payload['user'] if payload else None
+
+
+def _lookup_ui_user(username: str) -> Optional[Dict[str, Any]]:
+    """The ENABLED dashboard user named ``username``, or None."""
+    session = create_session()
+    try:
+        row = session.query(UIUser).filter_by(username=str(username or '')).first()
+        if row is None or not row.enabled:
+            return None
+        return {'id': row.id, 'user': row.username,
+                'role': str(row.role or DEFAULT_ROLE)}
+    finally:
+        session.close()
+
+
+def _any_ui_users() -> bool:
+    """True when at least one dashboard user exists in ``ui_users``."""
+    session = create_session()
+    try:
+        return session.query(UIUser).first() is not None
+    finally:
+        session.close()
+
+
+def _resolve_principal() -> Optional[Dict[str, Any]]:
+    """Resolve the dashboard principal for this request, or None."""
+    payload = _session_payload()
+    if payload:
+        src = payload['src']
+        if src == 'static':
+            return {'user': payload['user'], 'role': 'admin', 'via': 'ui_auth'}
+        if src == 'sso':
+            return {'user': payload['user'],
+                    'role': SSO_DEFAULT_ROLE, 'via': 'sso'}
+        row = _lookup_ui_user(payload['user'])
+        # A local session whose user was deleted or disabled stops working at
+        # once, without waiting for the cookie to expire.
+        if row is None:
+            return None
+        return {'user': row['user'], 'role': row['role'], 'via': 'session'}
+    user, pw = _request_taxii_credentials()
+    if _validate_ui_credentials(user, pw):
+        # Break-glass: the static pair is never stored in ui_users, so a bad
+        # role edit can't lock the operator out.
+        return {'user': user, 'role': 'admin', 'via': 'ui_auth'}
+    admin = _get_admin_auth_config()
+    if admin.get('username') and _credentials_match(user, pw, admin):
+        return {'user': user, 'role': 'admin', 'via': 'admin_auth'}
+    return None
+
+
+def _principal() -> Optional[Dict[str, Any]]:
+    """The dashboard principal for this request, or None (memoised per request).
+
+    Memoised on ``g``: several endpoints consult it more than once, and a
+    ``ui_users`` lookup per call would be wasteful.
+    """
+    try:
+        cached = getattr(g, '_ui_principal', _PRINCIPAL_UNSET)
+    except RuntimeError:            # no request context (tests, scripts)
+        cached = _PRINCIPAL_UNSET
+    if cached is not _PRINCIPAL_UNSET:
+        return cached
+    principal = _resolve_principal()
+    try:
+        g._ui_principal = principal
+    except RuntimeError:
+        pass
+    return principal
+
+
+def _require_role(minimum: str) -> bool:
+    """True when the request carries a dashboard principal of ``minimum`` role."""
+    principal = _principal()
+    return bool(principal) and _role_at_least(principal['role'], minimum)
+
+
+def _actor() -> str:
+    """Who is acting, for audit lines: ``user (role via source) from ip``."""
+    principal = _principal()
+    if not principal:
+        return f'anonymous from {_client_ip()}'
+    return (f"{principal['user']} ({principal['role']} via {principal['via']}) "
+            f"from {_client_ip()}")
 
 
 def _ui_session_valid() -> bool:
-    return _session_user() is not None
+    return _principal() is not None
+
+
+def _check_ui_login(username: str, password: str) -> Optional[Dict[str, str]]:
+    """Verify a dashboard login against ``ui_users``, then the static pair.
+
+    Returns ``{'user', 'role', 'src'}`` or None. A matching row wins; the
+    static ``ui.auth`` credential is accepted as a break-glass admin so an
+    existing deployment can always get in.
+    """
+    session = create_session()
+    try:
+        row = session.query(UIUser).filter_by(username=str(username or '')).first()
+        if (row is not None and row.enabled and row.password_hash
+                and check_password_hash(row.password_hash, str(password or ''))):
+            row.last_login_at = datetime.utcnow()
+            session.commit()
+            return {'user': row.username,
+                    'role': str(row.role or DEFAULT_ROLE), 'src': 'user'}
+    finally:
+        session.close()
+    if _validate_ui_credentials(username, password):
+        return {'user': username, 'role': 'admin', 'src': 'static'}
+    return None
 
 
 def _request_allowed() -> bool:
@@ -1332,7 +1497,7 @@ def _request_allowed() -> bool:
 
 
 def _validate_ui_credentials(user: str, password: str) -> bool:
-    """Constant-time check of the dashboard credentials (ui.auth)."""
+    """Constant-time check of the static dashboard credentials (ui.auth)."""
     return _credentials_match(user, password,
                               {'username': _ui_username,
                                'password': _ui_password})
@@ -1354,23 +1519,23 @@ def _get_admin_auth_config() -> Dict[str, str]:
 
 
 def _write_allowed() -> bool:
-    """Authorization for data-mutating endpoints.
+    """Authorization for data-mutating endpoints (``editor`` or above).
 
-    Only the dashboard session, the UI credentials or an optional
-    ``taxii.admin_auth`` principal may write. TAXII credentials — including
-    the read credential handed to a consumer such as Vision One — are
-    read-only, so a leaked consumer credential cannot ingest, revoke, delete
-    or purge anything.
+    Only a dashboard principal of at least ``editor`` rank may write. TAXII
+    credentials — including the read credential handed to a consumer such as
+    Vision One — are read-only, so a leaked consumer credential cannot ingest,
+    revoke, delete or purge anything.
     """
-    if _ui_session_valid():
-        return True
-    user, pw = _request_taxii_credentials()
-    if _validate_ui_credentials(user, pw):
-        return True
-    admin = _get_admin_auth_config()
-    if admin.get('username') and _credentials_match(user, pw, admin):
-        return True
-    return False
+    return _require_role('editor')
+
+
+def _admin_allowed() -> bool:
+    """Authorization for credential/user management (``admin`` only).
+
+    Minting an API key or creating a user *grants* access, so it sits a level
+    above the data mutations ``_write_allowed`` guards.
+    """
+    return _require_role('admin')
 
 
 # ---------------------------------------------------------------------------
@@ -1401,6 +1566,15 @@ except ImportError:  # pragma: no cover - depends on optional install
 
 SSO_CFG = CONFIG.get('sso', {}) or {}
 SSO_ENABLED = bool(SSO_CFG.get('enabled', False))
+# SSO identities have no row in `ui_users` (they are managed by the IdP), so
+# they need a role from config. Defaults to the weakest role: an SSO user is
+# *authenticated* by the tenant, but that alone should not confer write access
+# to the feed.
+SSO_DEFAULT_ROLE = str(SSO_CFG.get('default_role') or DEFAULT_ROLE)
+if SSO_DEFAULT_ROLE not in ROLE_LEVELS:
+    logger.warning("sso.default_role %r is not one of %s; using %r",
+                   SSO_DEFAULT_ROLE, sorted(ROLE_LEVELS), DEFAULT_ROLE)
+    SSO_DEFAULT_ROLE = DEFAULT_ROLE
 SSO_TENANT = str(SSO_CFG.get('tenant', 'common') or 'common')
 SSO_CLIENT_ID = str(SSO_CFG.get('client_id', '') or '')
 SSO_CLIENT_SECRET = str(SSO_CFG.get('client_secret', '') or '')
@@ -1620,12 +1794,13 @@ def ui_sso_callback():
     )
     resp = redirect('/')
     resp.set_cookie(
-        'taxii2_ui_session', _session_cookie(username),
+        'taxii2_ui_session', _session_cookie(username, 'sso'),
         max_age=_ui_session_ttl, httponly=True, samesite='Lax', secure=True,
     )
     resp.delete_cookie(_oauth_state_cookie, httponly=True, samesite='Lax',
                        secure=True)
-    logger.info("SSO login successful for %s", username)
+    logger.info("SSO login successful for %s (role=%s)", username,
+                SSO_DEFAULT_ROLE)
     return resp
 
 
@@ -3527,8 +3702,8 @@ def revoke_object(stix_id: str):
             if obj is not None:
                 obj.revoked = bool(row.revoked)
         logger.info(
-            "Object %s %s via %s (source=%s)",
-            stix_id, action, request.remote_addr, row.source,
+            "Object %s %s (source=%s) by %s",
+            stix_id, action, row.source, _actor(),
         )
         return jsonify({'id': stix_id, 'revoked': bool(row.revoked), 'changed': True})
     except Exception as exc:
@@ -3587,6 +3762,8 @@ def ingest_data():
         logger.error("Ingest error: %s", exc)
         return jsonify({'error': 'could not ingest the supplied objects'}), 500
 
+    logger.info("Ingest via /feed/ingest: %d object(s) into '%s' (mode=%s) by %s",
+                count, cid, mode, _actor())
     return jsonify({
         'message': 'Data ingested successfully',
         'mode': mode,
@@ -3627,7 +3804,8 @@ def delete_objects_data():
         return jsonify({'error': 'could not delete the requested objects'}), 500
     finally:
         session.close()
-    logger.info("Deleted %d object(s) via /feed/delete", len(deleted))
+    logger.info("Deleted %d object(s) via /feed/delete by %s",
+                len(deleted), _actor())
     return jsonify({'deleted': len(deleted), 'ids': deleted}), 200
 
 
@@ -3654,6 +3832,8 @@ def purge_data():
     except Exception as exc:
         logger.error("Purge error: %s", exc)
         return jsonify({'error': 'could not purge the feed'}), 500
+    logger.info("Purge via /feed/purge: %d object(s) from %s by %s",
+                purged, f"'{cid}'" if cid else 'ALL collections', _actor())
     if cid:
         return jsonify({
             'message': f"Collection '{cid}' purged successfully",
@@ -3766,10 +3946,15 @@ def add_subscription(client_id: str):
 @app.route('/ui/session', methods=['GET'])
 def ui_session():
     """GET /ui/session — report whether the current cookie is a valid login."""
-    user = _session_user()
+    principal = _principal()
     return jsonify({
-        'authenticated': user is not None,
-        'user': user or None,
+        'authenticated': principal is not None,
+        'user': (principal or {}).get('user'),
+        # The role drives which controls the dashboard shows. It is only a
+        # convenience: every permission is enforced server-side.
+        'role': (principal or {}).get('role'),
+        'can_write': _require_role('editor'),
+        'can_admin': _require_role('admin'),
         'sso': sso_public_info(),
     }), 200
 
@@ -3780,16 +3965,19 @@ def ui_login():
     data = request.get_json(silent=True) or {}
     username = str(data.get('username') or '')
     password = str(data.get('password') or '')
-    # Fail closed if creds are unconfigured — otherwise empty==empty would
-    # let anyone in with a blank login.
-    if not _ui_username or not _ui_password:
+    # Fail closed if nothing can authenticate anyone — otherwise a blank login
+    # could match a blank credential.
+    if not _ui_username and not _ui_password and not _any_ui_users():
         return jsonify({'error': 'Login not configured (UI_AUTH_USER/UI_AUTH_PASSWORD unset)'}), 503
-    if not _validate_ui_credentials(username, password):
+    who = _check_ui_login(username, password)
+    if who is None:
         return jsonify({'error': 'Invalid credentials'}), 401
-    resp = jsonify({'message': 'Logged in', 'user': username})
+    logger.info("Dashboard login: %s (role=%s)", who['user'], who['role'])
+    resp = jsonify({'message': 'Logged in', 'user': who['user'],
+                    'role': who['role']})
     resp.set_cookie(
         'taxii2_ui_session',
-        _session_cookie(username),
+        _session_cookie(who['user'], who['src']),
         max_age=_ui_session_ttl,
         httponly=True,
         samesite='Lax',
@@ -3936,10 +4124,198 @@ def _parse_key_max_objects(value: Any) -> Tuple[Optional[int], Optional[str]]:
     return (cap or None), None
 
 
+# ---------------------------------------------------------------------------
+# Dashboard users (admin only)
+# ---------------------------------------------------------------------------
+# Multi-user dashboard logins with roles, replacing the single shared
+# ui.auth pair for everyday use. The static pair is deliberately NOT stored
+# here: it stays a break-glass admin, so a mistake in this table can never
+# lock the operator out of their own server.
+
+_MAX_USERNAME = 64
+_MIN_PASSWORD_LEN = 12
+
+
+def _parse_new_username(value: Any) -> Tuple[Optional[str], Optional[str]]:
+    name = str(value or '').strip()
+    if not name:
+        return None, 'username is required'
+    if len(name) > _MAX_USERNAME:
+        return None, f'username must be at most {_MAX_USERNAME} characters'
+    if not re.fullmatch(r'[A-Za-z0-9._@-]+', name):
+        return None, 'username may contain only letters, digits and . _ @ -'
+    return name, None
+
+
+def _parse_new_password(value: Any) -> Tuple[Optional[str], Optional[str]]:
+    password = str(value or '')
+    if len(password) < _MIN_PASSWORD_LEN:
+        return None, f'password must be at least {_MIN_PASSWORD_LEN} characters'
+    return password, None
+
+
+def _parse_role(value: Any) -> Tuple[Optional[str], Optional[str]]:
+    role = str(value or '').strip().lower()
+    if role not in ROLE_LEVELS:
+        return None, f'role must be one of {", ".join(sorted(ROLE_LEVELS))}'
+    return role, None
+
+
+def _user_public(row: 'UIUser') -> Dict[str, Any]:
+    """Dashboard view of a user. Never includes the password hash."""
+    return {
+        'id': row.id,
+        'username': row.username,
+        'role': str(row.role or DEFAULT_ROLE),
+        'enabled': bool(row.enabled),
+        'created': _stix_ts(row.created),
+        'last_login_at': _stix_ts(row.last_login_at),
+    }
+
+
+def _enabled_admin_count(session, exclude_id: Optional[str] = None) -> int:
+    """Enabled admins, optionally ignoring one row.
+
+    Guards the one unrecoverable mistake an admin can make here: removing the
+    last way in. (The break-glass ui.auth pair would still work, but relying
+    on that is not a plan.)
+    """
+    q = session.query(UIUser).filter(UIUser.enabled.is_(True),
+                                     UIUser.role == 'admin')
+    if exclude_id:
+        q = q.filter(UIUser.id != exclude_id)
+    return q.count()
+
+
+@app.route('/ui/users', methods=['GET'])
+def ui_users():
+    """GET /ui/users — list dashboard users (admin only)."""
+    if not _admin_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    session = create_session()
+    try:
+        rows = session.query(UIUser).order_by(UIUser.username.asc()).all()
+        users = [_user_public(r) for r in rows]
+    finally:
+        session.close()
+    return jsonify({
+        'users': users,
+        'roles': sorted(ROLE_LEVELS, key=lambda r: ROLE_LEVELS[r]),
+        # Surfaced so the UI can explain why the static login still works.
+        'bootstrap_configured': bool(_ui_username and _ui_password),
+    }), 200
+
+
+@app.route('/ui/users', methods=['POST'])
+def ui_users_create():
+    """POST /ui/users — create a dashboard user (admin only)."""
+    if not _admin_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+    username, err = _parse_new_username(data.get('username'))
+    if err:
+        return jsonify({'error': err}), 400
+    password, err = _parse_new_password(data.get('password'))
+    if err:
+        return jsonify({'error': err}), 400
+    role, err = _parse_role(data.get('role') or DEFAULT_ROLE)
+    if err:
+        return jsonify({'error': err}), 400
+    session = create_session()
+    try:
+        if session.query(UIUser).filter_by(username=username).first():
+            return jsonify({'error': f'user {username!r} already exists'}), 409
+        row = UIUser(id=uuid.uuid4().hex, username=username,
+                     password_hash=generate_password_hash(password),
+                     role=role, enabled=True)
+        session.add(row)
+        session.commit()
+        payload = _user_public(row)
+    except Exception as exc:
+        session.rollback()
+        logger.error("Could not create dashboard user: %s", exc)
+        return jsonify({'error': 'could not create the user'}), 500
+    finally:
+        session.close()
+    logger.info("Dashboard user %r created (role=%s) by %s",
+                username, role, _actor())
+    return jsonify(payload), 201
+
+
+@app.route('/ui/users/<user_id>', methods=['POST'])
+def ui_users_update(user_id: str):
+    """POST /ui/users/<id> — change a user's role, password or enabled flag."""
+    if not _admin_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+    session = create_session()
+    try:
+        row = session.query(UIUser).filter_by(id=user_id).first()
+        if row is None:
+            return jsonify({'error': 'user not found'}), 404
+        if data.get('role') not in (None, ''):
+            role, err = _parse_role(data.get('role'))
+            if err:
+                return jsonify({'error': err}), 400
+            if (role != 'admin' and row.role == 'admin' and row.enabled
+                    and _enabled_admin_count(session, exclude_id=row.id) == 0):
+                return jsonify({'error': 'cannot demote the last enabled admin'}), 400
+            row.role = role
+        if 'enabled' in data and data.get('enabled') is not None:
+            enabled = bool(data.get('enabled'))
+            if (not enabled and row.role == 'admin' and row.enabled
+                    and _enabled_admin_count(session, exclude_id=row.id) == 0):
+                return jsonify({'error': 'cannot disable the last enabled admin'}), 400
+            row.enabled = enabled
+        if data.get('password'):
+            password, err = _parse_new_password(data.get('password'))
+            if err:
+                return jsonify({'error': err}), 400
+            row.password_hash = generate_password_hash(password)
+        session.commit()
+        payload = _user_public(row)
+    except Exception as exc:
+        session.rollback()
+        logger.error("Could not update dashboard user: %s", exc)
+        return jsonify({'error': 'could not update the user'}), 500
+    finally:
+        session.close()
+    logger.info("Dashboard user %r updated (role=%s, enabled=%s) by %s",
+                payload['username'], payload['role'], payload['enabled'],
+                _actor())
+    return jsonify(payload), 200
+
+
+@app.route('/ui/users/<user_id>/delete', methods=['POST'])
+def ui_users_delete(user_id: str):
+    """POST /ui/users/<id>/delete — remove a dashboard user (admin only)."""
+    if not _admin_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    session = create_session()
+    try:
+        row = session.query(UIUser).filter_by(id=user_id).first()
+        if row is None:
+            return jsonify({'error': 'user not found'}), 404
+        if (row.role == 'admin' and row.enabled
+                and _enabled_admin_count(session, exclude_id=row.id) == 0):
+            return jsonify({'error': 'cannot delete the last enabled admin'}), 400
+        username = row.username
+        session.delete(row)
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        logger.error("Could not delete dashboard user: %s", exc)
+        return jsonify({'error': 'could not delete the user'}), 500
+    finally:
+        session.close()
+    logger.info("Dashboard user %r deleted by %s", username, _actor())
+    return jsonify({'message': f'user {username!r} deleted'}), 200
+
+
 @app.route('/ui/keys', methods=['GET'])
 def ui_keys():
     """GET /ui/keys — list API keys (prefixes only, never the secret)."""
-    if not _write_allowed():
+    if not _admin_allowed():
         return jsonify({'error': 'Unauthorized'}), 401
     session = create_session()
     try:
@@ -3961,7 +4337,7 @@ def ui_keys():
 @app.route('/ui/keys', methods=['POST'])
 def ui_keys_create():
     """POST /ui/keys — mint a key. The plaintext is returned exactly once."""
-    if not _write_allowed():
+    if not _admin_allowed():
         return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json(silent=True) or {}
     label = str(data.get('label') or '').strip()
@@ -4008,8 +4384,8 @@ def ui_keys_create():
     finally:
         session.close()
     # Log the prefix only — the secret must never reach the log.
-    logger.info("API key %s created (label=%r, collections=%s)",
-                prefix, label, ','.join(scope))
+    logger.info("API key %s created (label=%r, collections=%s) by %s",
+                prefix, label, ','.join(scope), _actor())
     payload['key'] = plaintext
     payload['message'] = ('Copy this key now — it is shown once and cannot be '
                           'retrieved again.')
@@ -4019,7 +4395,7 @@ def ui_keys_create():
 @app.route('/ui/keys/<key_id>/revoke', methods=['POST'])
 def ui_key_revoke(key_id: str):
     """POST /ui/keys/<id>/revoke — disable a key (revocation is permanent)."""
-    if not _write_allowed():
+    if not _admin_allowed():
         return jsonify({'error': 'Unauthorized'}), 401
     session = create_session()
     try:
@@ -4037,7 +4413,7 @@ def ui_key_revoke(key_id: str):
         return jsonify({'error': 'could not revoke the API key'}), 500
     finally:
         session.close()
-    logger.info("API key %s revoked via %s", payload['prefix'], _client_ip())
+    logger.info("API key %s revoked by %s", payload['prefix'], _actor())
     return jsonify({**payload, 'changed': True}), 200
 
 
@@ -4084,6 +4460,8 @@ def community_pull(name: str):
         result['limit'] = limit
     if result.get('error') and 'misconfigured' in result['error']:
         return jsonify(result), 400
+    logger.info("Community pull '%s' by %s: %s", name, _actor(),
+                result.get('added', result.get('error', 'ok')))
     return jsonify(result), 200
 
 
@@ -4571,9 +4949,9 @@ def import_csv_data():
     except Exception as exc:
         logger.error("CSV ingest error: %s", exc)
         return jsonify({'error': 'could not import the uploaded file'}), 500
-    logger.info("Import via /feed/import-csv from %s: +%d object(s) into '%s' "
-                "(source=manual, skipped %d)",
-                _client_ip(), added, cid, len(skipped))
+    logger.info("Import via /feed/import-csv: +%d object(s) into '%s' "
+                "(source=manual, skipped %d) by %s",
+                added, cid, len(skipped), _actor())
     return jsonify({
         'imported': added,
         'skipped': skipped[:50],
