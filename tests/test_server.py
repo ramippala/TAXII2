@@ -2988,6 +2988,74 @@ class TestApiKeys(_CollectionRegistryTestCase):
             {served_value(o) for o in r.get_json()['content']['content']['objects']},
             {'1.1.1.1', '8.8.8.8'})
 
+    # --- per-response IOC ceiling (max_objects) ----------------------------
+
+    def _seed(self, n, collection='alpha'):
+        objs = [_manual_obj(f'10.0.0.{i}') for i in range(1, n + 1)]
+        _server.ingest_objects(objs, mode='merge', source='manual',
+                               collection=collection)
+        return objs
+
+    def _objects(self, key, path='/taxii2/collections/alpha/objects/'):
+        r = self._use(key, path)
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        return body['content']['content']['objects'], body
+
+    def test_key_max_objects_caps_each_response(self):
+        """A key with a per-poll ceiling is never handed the whole feed."""
+        self._seed(5)
+        key = self._create(max_objects=2).get_json()['key']
+        objs, body = self._objects(key)
+        self.assertEqual(len(objs), 2)
+        self.assertTrue(body['more'])
+        self.assertIn('next', body)
+
+    def test_key_max_objects_overrides_a_larger_client_limit(self):
+        """A client asking for more than its key allows still gets the cap."""
+        self._seed(5)
+        key = self._create(max_objects=2).get_json()['key']
+        objs, body = self._objects(
+            key, '/taxii2/collections/alpha/objects/?limit=100')
+        self.assertEqual(len(objs), 2)
+        self.assertTrue(body['more'])
+
+    def test_key_max_objects_pages_to_completion(self):
+        """Following the cursor with a capped key loses nothing and repeats
+        nothing — the property that makes the cap safe to rely on."""
+        self._seed(5)
+        key = self._create(max_objects=2).get_json()['key']
+        seen, nxt, guard = [], None, 0
+        while guard < 10:
+            path = '/taxii2/collections/alpha/objects/'
+            if nxt:
+                path += '?next=' + urllib.parse.quote(nxt)
+            objs, body = self._objects(key, path)
+            seen.extend(served_value(o) for o in objs)
+            if not body['more']:
+                break
+            nxt = body.get('next')
+            guard += 1
+        self.assertEqual(len(seen), 5)
+        self.assertEqual(len(set(seen)), 5)
+
+    def test_key_without_a_cap_is_not_limited(self):
+        self._seed(5)
+        key = self._create().get_json()['key']
+        objs, body = self._objects(key)
+        self.assertEqual(len(objs), 5)
+        self.assertFalse(body['more'])
+
+    def test_key_max_objects_is_validated_and_reported(self):
+        self.assertEqual(self._create(label='neg', max_objects=-1).status_code, 400)
+        self.assertEqual(
+            self._create(label='junk', max_objects='lots').status_code, 400)
+        self._create(label='capped', max_objects=7)
+        keys = self.client.get('/ui/keys',
+                               headers=self.admin_auth).get_json()['keys']
+        capped = next(k for k in keys if k['label'] == 'capped')
+        self.assertEqual(capped['max_objects'], 7)
+
 
 class TestSecurityHardening(unittest.TestCase):
     """Response headers, cookie flags, upload guards and auth throttling."""

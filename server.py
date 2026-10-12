@@ -248,9 +248,10 @@ class ApiKey(Base):
 
     ``collections`` is a JSON list of collection ids the key may read;
     ``rate_limit`` / ``rate_window`` are an optional per-key sliding window
-    (requests per window seconds). Unlike :class:`Subscription` — a
-    hashed-credential store the TAXII feed never consults — this table IS the
-    credential the feed honours.
+    (requests per window seconds); ``max_objects`` is an optional ceiling on
+    how many objects one response may carry for this key. Unlike
+    :class:`Subscription` — a hashed-credential store the TAXII feed never
+    consults — this table IS the credential the feed honours.
     """
 
     __tablename__ = "api_keys"
@@ -266,6 +267,13 @@ class ApiKey(Base):
     collections = Column(Text, nullable=True)   # JSON list of collection ids
     rate_limit = Column(Integer, nullable=True)    # requests per window (0/null = off)
     rate_window = Column(Integer, nullable=True)   # window length, seconds
+    # Per-response IOC ceiling for this key. Bounds how many objects one Get
+    # Objects response may carry, so a consumer with a per-poll ingest limit
+    # cannot be handed the whole feed at once. 0/null inherits
+    # taxii.max_objects. NOTE: this only throttles *delivery* — the client must
+    # follow `more`/`next` (or poll with added_after) to make progress, or it
+    # will keep receiving the same first page.
+    max_objects = Column(Integer, nullable=True)
 
 
 class PullerState(Base):
@@ -443,6 +451,17 @@ def init_db() -> None:
                 ),
                 {'legacy': DEFAULT_COLLECTION_ID},
             )
+    # `api_keys` gained `max_objects` (the per-key response ceiling) after the
+    # table first shipped; add it for a database created by an older build.
+    # `create_all` above already includes it on a fresh database.
+    if 'api_keys' in insp.get_table_names():
+        key_cols = {c['name'] for c in insp.get_columns('api_keys')}
+        if 'max_objects' not in key_cols:
+            with engine.begin() as conn:
+                conn.execute(
+                    text('ALTER TABLE api_keys ADD COLUMN max_objects INTEGER')
+                )
+            logger.info("Migrated api_keys: added 'max_objects' column")
     # `create_all` only creates indexes for tables it creates, so a database
     # that predates the poll-path indexes above never gets them. Create any
     # missing ones explicitly — checkfirst makes this idempotent and portable
@@ -1113,6 +1132,7 @@ def _api_key_row(password: str) -> Optional[Dict[str, Any]]:
             'collections': _parse_key_collections(row.collections),
             'rate_limit': int(row.rate_limit or 0),
             'rate_window': int(row.rate_window or 0),
+            'max_objects': int(row.max_objects or 0),
         }
         # Touch last_used_at at most once a minute: it is dashboard
         # information, not an audit trail, and a write per poll is waste.
@@ -3064,22 +3084,49 @@ def taxii_objects(collection_id: str):
             limit = int(raw_limit)
             if limit <= 0:
                 raise ValueError
-            max_objects = int((TAXII_CFG.get('max_objects') or 10000))
-            if max_objects > 0:
-                limit = min(limit, max_objects)
         except (TypeError, ValueError):
             return _taxii_error(400, 'Bad Request',
                                 f'limit must be a positive integer, got {raw_limit!r}',
                                 'malformed')
     next_cursor = request.args.get('next')
 
+    # Page ceiling: the smallest of what the client asked for, what THIS API key
+    # is allowed, and the server-wide taxii.max_objects. The per-key ceiling
+    # lets a consumer with a per-poll ingest limit be fed incrementally instead
+    # of being handed the whole collection at once. Returning fewer objects than
+    # a client asked for is spec-legal (`limit` is a maximum; `more` signals it).
+    key = _api_key_for(_request_taxii_credentials()[1])
+    key_cap = int((key or {}).get('max_objects') or 0)
+    global_cap = int(TAXII_CFG.get('max_objects') or 0)
+    caps = [c for c in (limit, key_cap, global_cap) if c and c > 0]
+    effective_limit = min(caps) if caps else None
+    # True when the key's own ceiling is what bounds this page — the case a
+    # client with a per-poll limit cares about, and the case worth logging.
+    key_bound = bool(key_cap and effective_limit == key_cap
+                     and (not limit or limit > key_cap))
+
     try:
         bundle, more, nxt = build_stix_bundle(
             since=since, match_types=match_types, match_ids=match_ids,
-            collection=collection_id, limit=limit, next_cursor=next_cursor,
+            collection=collection_id, limit=effective_limit,
+            next_cursor=next_cursor,
         )
     except ValueError as exc:
         return _taxii_error(400, 'Bad Request', str(exc), 'malformed')
+
+    if key_bound and more:
+        # This is the log line that answers "does my consumer paginate?".
+        # A client that follows the cursor shows up as `next cursor`; one that
+        # ignores it (and polls without added_after) would sit on the same
+        # first page forever, and shows up as `no cursor, no added_after`.
+        logger.info(
+            "API key %s served a capped page (max_objects=%d, %d object(s), "
+            "more remain); request used %s",
+            (key or {}).get('prefix') or '?', key_cap,
+            len(bundle.get('objects') or []),
+            'the next cursor' if next_cursor else
+            ('added_after' if since else 'no cursor and no added_after'),
+        )
 
     if TAXII_OBJECTS_SHAPE == 'bundle':
         # OTX-compatible shape: the STIX bundle at the top level with
@@ -3807,6 +3854,7 @@ def _api_key_public(row: 'ApiKey') -> Dict[str, Any]:
         'last_used_at': _stix_ts(row.last_used_at),
         'rate_limit': int(row.rate_limit or 0),
         'rate_window': int(row.rate_window or 0),
+        'max_objects': int(row.max_objects or 0),
         'expired': bool(row.expires_at and row.expires_at <= datetime.utcnow()),
     }
 
@@ -3865,6 +3913,29 @@ def _parse_key_rate(data: Dict[str, Any]) -> Tuple[int, int, Optional[str]]:
     return limit, window, None
 
 
+def _parse_key_max_objects(value: Any) -> Tuple[Optional[int], Optional[str]]:
+    """``(max_objects, error)`` for a key's per-response ceiling.
+
+    ``None``/empty/0 means "inherit ``taxii.max_objects``". A positive value
+    caps how many objects this key is ever handed in one response.
+
+    This is a *delivery* ceiling, not a filter: it does not change which
+    objects the key is entitled to see, only how many arrive per page. The
+    client must follow ``more``/``next`` (or poll with ``added_after``) to
+    advance — a client that ignores both would keep receiving the same first
+    page of the (modified, stix_id) ordering.
+    """
+    if value in (None, ''):
+        return None, None
+    try:
+        cap = int(value)
+    except (TypeError, ValueError):
+        return None, f'max_objects must be a non-negative integer, got {value!r}'
+    if cap < 0:
+        return None, 'max_objects must be a non-negative integer'
+    return (cap or None), None
+
+
 @app.route('/ui/keys', methods=['GET'])
 def ui_keys():
     """GET /ui/keys — list API keys (prefixes only, never the secret)."""
@@ -3908,6 +3979,9 @@ def ui_keys_create():
     rate_limit, rate_window, err = _parse_key_rate(data)
     if err:
         return jsonify({'error': err}), 400
+    key_max_objects, err = _parse_key_max_objects(data.get('max_objects'))
+    if err:
+        return jsonify({'error': err}), 400
 
     plaintext, prefix, secret_hash = _generate_api_key()
     session = create_session()
@@ -3922,6 +3996,7 @@ def ui_keys_create():
             collections=json.dumps(scope),
             rate_limit=rate_limit or None,
             rate_window=rate_window if rate_limit else None,
+            max_objects=key_max_objects,
         )
         session.add(row)
         session.commit()

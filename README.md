@@ -618,7 +618,7 @@ These drive the dashboard login. They are independent of `taxii.auth`.
 | `GET /ui/session` | Current session: `{"authenticated": bool, "user": str\|null}` |
 | `GET /ui/collections` | Collection registry for the dashboard selector: `{"collections": [{id,title,members,aggregate}], "primary": id, "manual": id, "community": id}` — `manual`/`community` are where the dashboard routes a write, since an aggregate is read-only |
 | `GET /ui/keys` | Issued API keys (prefix, label, scope, expiry, last used, enabled) — never the secret. Requires a writer principal |
-| `POST /ui/keys` | Body `{"label", "collections": [id…], "expires_days"?, "rate_limit"?, "rate_window"?}`. Returns the plaintext key **once** (`201`). Requires a writer principal |
+| `POST /ui/keys` | Body `{"label", "collections": [id…], "expires_days"?, "rate_limit"?, "rate_window"?, "max_objects"?}`. Returns the plaintext key **once** (`201`). Requires a writer principal |
 | `POST /ui/keys/<id>/revoke` | Disable a key permanently |
 | `GET /ui/stats` | Aggregates for the **Intel graph** tab. `?scope=community\|manual\|all` (default community) and `?collection=<id>`: totals, `categories`, `by_source`, `withheld_reasons`, `confidence` (histogram), `timeline`, `top_labels`. |
 | `POST /ui/login` | Body `{"username","password"}` checked against `ui.auth`. On success sets the http-only `taxii2_ui_session` cookie (signed with `security.secret_key`, lifetime `ui.session_ttl`); `401` on bad credentials. |
@@ -928,6 +928,30 @@ can expire, and can carry its own rate limit.
   caveat as the auth-failure throttle: it resets on restart, and scaling to
   multiple workers would need a shared store (Redis). The server is
   deliberately single-process (waitress), so one table is the whole picture.
+- **Per-response IOC ceiling (`max_objects`).** For consumers with a
+  *per-poll ingest limit* (an XDR that chokes if handed 15 000 objects at
+  once), a key can cap how many objects one response carries. The effective
+  page is `min(client limit, key max_objects, taxii.max_objects)`, so a
+  client asking for more than its key allows still gets the cap, with
+  `more: true`. Blank/`0` inherits the server-wide cap.
+
+  > **This throttles delivery, not entitlement — and it needs the client's
+  > cooperation.** It does not change *which* objects the key may see, only
+  > how many arrive per page. Because pages are ordered oldest-first
+  > (`modified, stix_id`), a client that ignores `more`/`next` **and** polls
+  > without `added_after` will receive the same first page forever and never
+  > reach the rest of the feed. A capped page is therefore logged:
+  >
+  > ```
+  > API key <prefix> served a capped page (max_objects=500, 500 object(s),
+  > more remain); request used the next cursor
+  > ```
+  >
+  > `used the next cursor` (or `added_after`) means the client is paginating
+  > correctly. `no cursor and no added_after` repeated across polls means it
+  > is not, and the cap is starving it — raise the cap, or fix the client's
+  > polling. The correct client pattern is
+  > `?limit=500&added_after=<modified of the newest object received>`.
 - **Revocation** is permanent: `POST /ui/keys/<id>/revoke` disables the key,
   and it starts failing authentication immediately.
 

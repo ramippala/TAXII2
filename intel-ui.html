@@ -388,6 +388,9 @@
         <label>per seconds
           <input type="number" id="keyRateWindow" min="1" placeholder="60" style="width:100px">
         </label>
+        <label>Max IOCs / response
+          <input type="number" id="keyMaxObjects" min="0" placeholder="server default" style="width:150px" title="Ceiling on how many objects this key receives in one response, for consumers with a per-poll ingest limit. Blank or 0 inherits the server-wide cap. The client must follow more/next to see the rest.">
+        </label>
       </div>
       <div class="row" style="margin-top:10px">
         <span class="muted">Collections (at least one):</span>
@@ -413,6 +416,7 @@
         <thead>
           <tr>
             <th>Label</th><th>Prefix</th><th>Collections</th><th>Rate limit</th>
+            <th>Max IOCs</th>
             <th>Expires</th><th>Last used</th><th>Status</th><th></th>
           </tr>
         </thead>
@@ -1344,6 +1348,7 @@ function renderKeyTable(keys) {
       k.prefix,
       k.collections.join(", "),
       k.rate_limit ? `${k.rate_limit} / ${k.rate_window || 60}s` : "unlimited",
+      k.max_objects ? `${k.max_objects} / response` : "server default",
       fmtKeyTs(k.expires_at),
       fmtKeyTs(k.last_used_at),
       status,
@@ -1394,6 +1399,8 @@ async function createKey() {
     body.rate_limit = Number(limit);
     body.rate_window = Number($("keyRateWindow").value.trim() || 60);
   }
+  const maxObj = $("keyMaxObjects").value.trim();
+  if (maxObj) body.max_objects = Number(maxObj);
   const btn = $("btnKeyCreate");
   btn.disabled = true;
   try {
