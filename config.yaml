@@ -118,10 +118,10 @@ taxii:
         username: '${TAXII_AUTH_USER}'
         password: '${TAXII_AUTH_PASSWORD}'
     - id: gt_intel
-      title: 'GovTech intel (manual)'
+      title: 'GovTech intel'
       description: 'GovTech intel: dashboard entry and CSV/Excel imports.'
     - id: comm_intel
-      title: 'Community intel (pulled)'
+      title: 'Community intel'
       description: 'Community intel pulled from OTX and third-party TAXII servers.'
 
   # Optional third principal: a script/automation credential allowed to do
