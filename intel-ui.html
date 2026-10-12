@@ -118,6 +118,12 @@
   section[data-page].active { display: block; }
   .colsel { font-size: 12px; color: var(--muted); margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
   .colsel select { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 4px 8px; }
+  /* api keys */
+  .keyScope { display: inline-flex; gap: 10px; flex-wrap: wrap; font-size: 13px; }
+  .keyScope label { display: inline-flex; align-items: center; gap: 5px; color: var(--text); }
+  .keyReveal { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin-top: 10px; }
+  .keyReveal .keyValue { display: flex; align-items: center; gap: 10px; margin-top: 6px; word-break: break-all; }
+  .keyReveal .keyValue span { flex: 1 1 auto; }
   /* intel graph (dashboard) */
   .kpis { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
   .kpi { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; min-width: 96px; }
@@ -203,6 +209,7 @@
       <button class="tab" data-page="graph">Intel graph</button>
       <button class="tab" data-page="sources">Community sources</button>
       <button class="tab" data-page="import">Import CSV / Excel</button>
+      <button class="tab" data-page="keys">API keys</button>
     </div>
 
     <!-- ============ PAGE: FEED ============ -->
@@ -219,6 +226,7 @@
           <select id="collectionSel"></select>
         </label>
       </div>
+      <div id="unionNote" class="hint" style="display:none;margin:0 0 10px"></div>
       <div class="feedtools">
         <input type="search" id="feedSearch" placeholder="Search value, label, type, source or ID…" autocomplete="off">
         <select id="feedType" title="Filter by type">
@@ -353,6 +361,67 @@
 
     </section>
 
+    <!-- ============ PAGE: API KEYS ============ -->
+    <section data-page="keys">
+
+    <div class="panel">
+      <h2>API keys</h2>
+      <div class="hint" style="margin:0 0 10px">
+        Scoped credentials for TAXII consumers. Use the <b>prefix</b> as the
+        username and the <b>key</b> as the password
+        (<span class="mono">curl -u &lt;prefix&gt;:&lt;key&gt;</span>), or paste
+        them into the client's HTTP Basic fields — a key scoped to
+        <span class="mono">gt_intel</span> can list and read only that
+        collection. The secret is shown <b>once</b>, at creation: it is stored
+        only as a hash and cannot be retrieved later. Revoking is permanent.
+      </div>
+      <div class="row">
+        <label>Label
+          <input type="text" id="keyLabel" maxlength="128" placeholder="Vision One (prod)" style="min-width:220px">
+        </label>
+        <label>Expires in days
+          <input type="number" id="keyExpiry" min="1" max="3650" placeholder="never" style="width:110px">
+        </label>
+        <label>Rate limit
+          <input type="number" id="keyRateLimit" min="0" placeholder="unlimited" style="width:120px" title="Requests allowed per window (0 or blank = unlimited)">
+        </label>
+        <label>per seconds
+          <input type="number" id="keyRateWindow" min="1" placeholder="60" style="width:100px">
+        </label>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <span class="muted">Collections (at least one):</span>
+        <span id="keyScope" class="keyScope"></span>
+        <button id="btnKeyCreate" class="ghost">Generate key</button>
+      </div>
+      <div id="keyMsg" class="msg" style="margin-top:10px"></div>
+      <div id="keyReveal" class="keyReveal" style="display:none">
+        <div class="reason">Copy this key now — it is shown once and cannot be retrieved again.</div>
+        <div class="mono keyValue"><span id="keyValue"></span>
+          <button id="btnKeyCopy" class="ghost">Copy</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Issued keys</h2>
+      <div class="row" style="margin-bottom:12px">
+        <button id="btnKeyReload" class="ghost">Reload</button>
+        <span class="currange mono" id="keyCount"></span>
+      </div>
+      <table id="keyTable" style="display:none">
+        <thead>
+          <tr>
+            <th>Label</th><th>Prefix</th><th>Collections</th><th>Rate limit</th>
+            <th>Expires</th><th>Last used</th><th>Status</th><th></th>
+          </tr>
+        </thead>
+        <tbody id="keyBody"></tbody>
+      </table>
+    </div>
+
+    </section>
+
     <!-- ============ PAGE: INTEL GRAPH ============ -->
     <section data-page="graph">
 
@@ -436,6 +505,12 @@ let feedPage = 1;
 const FEED_PAGE_SIZE = 15;
 let feedFilter = { q: "", type: "", status: "" };
 let currentCollection = ""; // "" = primary collection (server default)
+// Collection registry from /ui/collections: id -> {id,title,members,aggregate},
+// plus the server-declared write targets. An aggregate (union) view is
+// read-only, so a write made while it is selected is routed to `manual`.
+let collectionsInfo = {};
+let manualCollection = "";
+let communityCollection = "";
 
 // Types the "+ Add new entry" flow can create (editable row type dropdown).
 const EDITABLE_TYPES = ["ipv4-addr", "domain-name", "file-hash", "url", "email-addr", "ipv6-addr", "indicator"];
@@ -527,11 +602,17 @@ async function loadCollections() {
     if (r.status !== 200 || !r.body || !r.body.collections) return;
     const sel = $("collectionSel");
     const prev = currentCollection;
+    collectionsInfo = {};
+    manualCollection = r.body.manual || "";
+    communityCollection = r.body.community || "";
     sel.innerHTML = "";
     r.body.collections.forEach(c => {
+      collectionsInfo[c.id] = c;
       const op = document.createElement("option");
       op.value = c.id;
-      op.textContent = c.id + (c.id === r.body.primary ? " (primary)" : "");
+      op.textContent = c.id
+        + (c.aggregate ? " (union)"
+                       : (c.id === r.body.primary ? " (primary)" : ""));
       if (c.id === prev) op.selected = true;
       sel.appendChild(op);
     });
@@ -542,7 +623,32 @@ async function loadCollections() {
       ? sel.options[sel.selectedIndex].value : "";
     if (r.body.collections.length > 1) sel.closest(".colsel").style.display = "inline-flex";
     else sel.closest(".colsel").style.display = "none";
+    updateUnionNote();
   } catch (e) { /* registry unavailable — stay on the primary collection */ }
+}
+
+// An aggregate serves the union of its members and owns no rows, so it can't
+// be written to: new entries go to the manual collection instead.
+function currentIsAggregate() {
+  const info = collectionsInfo[currentCollection];
+  return !!(info && info.aggregate);
+}
+
+function writeCollection() {
+  return currentIsAggregate() ? (manualCollection || currentCollection)
+                              : currentCollection;
+}
+
+function updateUnionNote() {
+  const note = $("unionNote");
+  const info = collectionsInfo[currentCollection];
+  if (info && info.aggregate) {
+    note.textContent = `Viewing the union feed (${info.members.join(" + ")}) — `
+      + `new entries and imports are saved to ${writeCollection()}.`;
+    note.style.display = "block";
+  } else {
+    note.style.display = "none";
+  }
 }
 
 function showLogin(ssoEnabled) {
@@ -560,7 +666,7 @@ function showDashboard(user) {
 }
 
 // --- Dashboard page tabs (Feed / Intel graph / Community sources / Import) ---
-const PAGE_NAMES = ["feed", "graph", "sources", "import"];
+const PAGE_NAMES = ["feed", "graph", "sources", "import", "keys"];
 function currentPageFromHash() {
   const h = (location.hash || "").replace(/^#/, "");
   return PAGE_NAMES.includes(h) ? h : "feed";
@@ -577,6 +683,7 @@ function showPage(name) {
     history.replaceState(null, "", "#" + name);
   }
   if (name === "graph") loadStats();  // aggregated view: fetch on entry
+  if (name === "keys") loadKeys();    // keys: fetch on entry
 }
 function onTabClick(e) {
   const name = e.currentTarget.dataset.page;
@@ -635,6 +742,13 @@ async function doLogout() {
   $("tbody").innerHTML = "";
   $("withheldBody").innerHTML = "";
   $("pullerBody").innerHTML = "";
+  $("keyBody").innerHTML = "";
+  $("keyTable").style.display = "none";
+  $("keyReveal").style.display = "none";
+  $("keyValue").textContent = "";
+  $("keyMsg").className = "msg";
+  $("keyScope").innerHTML = "";
+  delete $("keyScope").dataset.ids;
   renderFeed();
   showLogin();
 }
@@ -1058,10 +1172,14 @@ async function save() {
   });
   try {
     const body = { stix_objects, mode: "merge" };
-    if (currentCollection) body.collection = currentCollection;
+    const target = writeCollection();
+    if (target) body.collection = target;
     const r = await api("/feed/ingest", { method: "POST", body: JSON.stringify(body) });
     if (r.status === 200) {
       let text = `Saved ${good.length} object(s) (merge — nothing wiped)`;
+      if (currentIsAggregate()) {
+        text += ` into the ${target} collection (the union view is read-only)`;
+      }
       const newIds = good.filter(r => r.isNew).map(r => r.id);
       if (newIds.length) text += `, including ${newIds.length} new`;
       if (skipped.length) text += `. Skipped ${skipped.length}: ${skipped.join("; ")}`;
@@ -1105,8 +1223,14 @@ async function purgeSelected() {
 }
 
 async function purge() {
-  const target = currentCollection
-    ? ` the "${currentCollection}" collection` : " the entire feed (all collections)";
+  const info = collectionsInfo[currentCollection];
+  // An aggregate purge clears the union of its members — name them, so the
+  // operator can see exactly how wide the confirmation is.
+  const target = !currentCollection
+    ? " the entire feed (all collections)"
+    : (info && info.aggregate
+        ? ` the "${currentCollection}" union (${info.members.join(" + ")})`
+        : ` the "${currentCollection}" collection`);
   if (!await showConfirm(
       "Purge all",
       `Purge ALL intel from${target} (memory + database), including community entries from pullers? This cannot be undone.`,
@@ -1138,7 +1262,10 @@ async function importCsv() {
   btn.disabled = true;
   const fd = new FormData();
   fd.append("file", file);
-  if (currentCollection) fd.append("collection", currentCollection);
+  // Never the aggregate: imports are manual intel, so they land in `manual`
+  // even while the union feed is the selected view.
+  const target = writeCollection();
+  if (target) fd.append("collection", target);
   try {
     const r = await apiRaw("/feed/import-csv", { method: "POST", body: fd });
     if (r.status === 200) {
@@ -1159,6 +1286,164 @@ async function importCsv() {
     msgEl.className = "msg err";
   } finally {
     btn.disabled = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// API keys (scoped consumer credentials)
+// ---------------------------------------------------------------------------
+
+function keyMsg(text, ok) {
+  const m = $("keyMsg");
+  m.className = "msg " + (ok ? "ok" : "err");
+  m.textContent = text;
+}
+
+function fmtKeyTs(ts) {
+  return ts ? ts.replace("T", " ").replace("Z", "") : "never";
+}
+
+// Scope checkboxes are rebuilt only when the registry itself changes, so the
+// operator's ticks survive a reload after creating or revoking a key.
+function renderKeyScope(collections) {
+  const box = $("keyScope");
+  const wanted = collections.map(c => c.id).join(",");
+  if (box.dataset.ids === wanted) return;
+  const ticked = new Set([...box.querySelectorAll("input:checked")].map(i => i.value));
+  const first = !box.dataset.ids;
+  box.dataset.ids = wanted;
+  box.innerHTML = "";
+  collections.forEach((c, i) => {
+    const label = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.value = c.id;
+    // First build: pre-tick the primary (the union) — the common ask.
+    if (first ? i === 0 : ticked.has(c.id)) cb.checked = true;
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(
+      c.id + (c.aggregate ? " (union)" : "")));
+    box.appendChild(label);
+  });
+}
+
+function selectedKeyScope() {
+  return [...$("keyScope").querySelectorAll("input:checked")].map(i => i.value);
+}
+
+function renderKeyTable(keys) {
+  const body = $("keyBody");
+  const table = $("keyTable");
+  body.innerHTML = "";
+  $("keyCount").textContent = keys.length ? `${keys.length} key(s)` : "";
+  table.style.display = keys.length ? "table" : "none";
+  keys.forEach(k => {
+    const tr = document.createElement("tr");
+    const status = !k.enabled ? "revoked" : (k.expired ? "expired" : "active");
+    const cells = [
+      k.label,
+      k.prefix,
+      k.collections.join(", "),
+      k.rate_limit ? `${k.rate_limit} / ${k.rate_window || 60}s` : "unlimited",
+      fmtKeyTs(k.expires_at),
+      fmtKeyTs(k.last_used_at),
+      status,
+    ];
+    cells.forEach(v => {
+      const td = document.createElement("td");
+      td.textContent = v;
+      tr.appendChild(td);
+    });
+    const cAct = document.createElement("td");
+    if (k.enabled) {
+      const btn = document.createElement("button");
+      btn.className = "ghost";
+      btn.textContent = "Revoke";
+      btn.addEventListener("click", () => revokeKey(k));
+      cAct.appendChild(btn);
+    }
+    tr.appendChild(cAct);
+    body.appendChild(tr);
+  });
+}
+
+async function loadKeys() {
+  try {
+    const r = await api("/ui/keys");
+    if (r.status !== 200) {
+      keyMsg(`Could not load keys (HTTP ${r.status}).`, false);
+      return;
+    }
+    const b = r.body || {};
+    renderKeyScope(b.collections || []);
+    renderKeyTable(b.keys || []);
+  } catch (e) {
+    keyMsg("Could not load keys: " + e.message, false);
+  }
+}
+
+async function createKey() {
+  const label = $("keyLabel").value.trim();
+  if (!label) { keyMsg("A label is required.", false); return; }
+  const scope = selectedKeyScope();
+  if (!scope.length) { keyMsg("Select at least one collection.", false); return; }
+  const body = { label, collections: scope };
+  const days = $("keyExpiry").value.trim();
+  if (days) body.expires_days = Number(days);
+  const limit = $("keyRateLimit").value.trim();
+  if (limit) {
+    body.rate_limit = Number(limit);
+    body.rate_window = Number($("keyRateWindow").value.trim() || 60);
+  }
+  const btn = $("btnKeyCreate");
+  btn.disabled = true;
+  try {
+    const r = await api("/ui/keys", { method: "POST", body: JSON.stringify(body) });
+    if (r.status === 201 && r.body && r.body.key) {
+      $("keyValue").textContent = r.body.key;
+      $("keyReveal").style.display = "block";
+      keyMsg(`Key created (prefix ${r.body.prefix}). Copy it now — it is shown once.`, true);
+      $("keyLabel").value = "";
+      await loadKeys();
+    } else {
+      keyMsg(`Could not create the key (HTTP ${r.status}): `
+             + ((r.body && r.body.error) || "unknown error"), false);
+    }
+  } catch (e) {
+    keyMsg("Could not create the key: " + e.message, false);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function revokeKey(k) {
+  if (!await showConfirm(
+      "Revoke API key",
+      `Revoke "${k.label}" (${k.prefix}…)? Any client using it will start `
+      + `failing authentication immediately. This cannot be undone.`,
+      { danger: true, okLabel: "Revoke" }
+  )) return;
+  try {
+    const r = await api(`/ui/keys/${encodeURIComponent(k.id)}/revoke`, { method: "POST" });
+    if (r.status === 200) {
+      keyMsg(`Key ${k.prefix} revoked.`, true);
+      await loadKeys();
+    } else {
+      keyMsg(`Revoke failed (HTTP ${r.status}): `
+             + ((r.body && r.body.error) || "unknown error"), false);
+    }
+  } catch (e) {
+    keyMsg("Revoke failed: " + e.message, false);
+  }
+}
+
+async function copyKey() {
+  const value = $("keyValue").textContent;
+  if (!value) return;
+  try {
+    await navigator.clipboard.writeText(value);
+    keyMsg("Key copied to the clipboard.", true);
+  } catch (e) {
+    keyMsg("Copy failed — select the key text and copy it manually.", false);
   }
 }
 
@@ -1498,9 +1783,15 @@ $("collectionSel").addEventListener("change", () => {
   currentCollection = $("collectionSel").value || "";
   feedData = [];
   newRows = [];
+  updateUnionNote();
   loadFeed();
   if (currentPageFromHash() === "graph") loadStats();
 });
+
+// API keys page: generate / copy / reload.
+$("btnKeyCreate").addEventListener("click", createKey);
+$("btnKeyCopy").addEventListener("click", copyKey);
+$("btnKeyReload").addEventListener("click", loadKeys);
 
 // Intel graph: scope switch + manual refresh.
 $("graphScope").addEventListener("change", () => {

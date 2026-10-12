@@ -17,7 +17,7 @@ Usage:
 Configuration (env vars, with defaults for a stock local server):
     TAXII_URL                default http://localhost:5000/taxii2/
     TAXII_USER / TAXII_PASSWORD        primary collection credentials
-    TAXII_COLLECTION         default threat-intel
+    TAXII_COLLECTION         default threat_intel
     TAXII_PREMIUM_USER / TAXII_PREMIUM_PASSWORD   optional second-collection
                              credentials, to verify per-collection RBAC
 
@@ -36,7 +36,7 @@ except ImportError:
 BASE = os.environ.get('TAXII_URL', 'http://localhost:5000/taxii2/')
 USER = os.environ.get('TAXII_USER', 'admin')
 PASSWORD = os.environ.get('TAXII_PASSWORD', 'admin')
-COLLECTION = os.environ.get('TAXII_COLLECTION', 'threat-intel')
+COLLECTION = os.environ.get('TAXII_COLLECTION', 'threat_intel')
 PREM_USER = os.environ.get('TAXII_PREMIUM_USER')
 PREM_PASSWORD = os.environ.get('TAXII_PREMIUM_PASSWORD')
 

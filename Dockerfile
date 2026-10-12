@@ -14,10 +14,10 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Dependencies first (layer cache). psycopg2-binary is the Postgres driver —
-# installed in the image so the container works against a Postgres service.
+# Dependencies first (layer cache). requirements.txt includes psycopg2-binary,
+# the PostgreSQL driver this server runs on.
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt psycopg2-binary
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Application files (see .dockerignore — no venv, no .env, no tests).
 COPY server.py intel-ui.html config.yaml ./

@@ -37,15 +37,21 @@ services:
     environment:
       # Only what the app needs — deliberately NOT the whole .env, so the
       # Cloudflare token never lands in the app container.
+      #
+      # DATABASE_URL is built here (not taken from .env) so it always points at
+      # the `postgres` service over the compose network, whatever .env says.
+      # The schema — stix_objects / subscriptions / puller_state / api_keys —
+      # is created at startup; an empty database volume needs no setup step.
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-taxii}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-taxii_feed}
       FLASK_SECRET: ${FLASK_SECRET:?set FLASK_SECRET in .env}
+      # Credentials for the threat_intel aggregate (the collection Vision One
+      # polls — see taxii.collections in config.yaml). gt_intel / comm_intel
+      # need none: scoped consumers get an API key from the dashboard.
       TAXII_AUTH_USER: ${TAXII_AUTH_USER}
       TAXII_AUTH_PASSWORD: ${TAXII_AUTH_PASSWORD}
       UI_AUTH_USER: ${UI_AUTH_USER}
       UI_AUTH_PASSWORD: ${UI_AUTH_PASSWORD}
       OTX_API_KEY: ${OTX_API_KEY:-}
-      PREMIUM_TAXII_USER: ${PREMIUM_TAXII_USER:-}
-      PREMIUM_TAXII_PASS: ${PREMIUM_TAXII_PASS:-}
       # Get Objects response shape: envelope (spec) | bundle (OTX-compatible)
       TAXII_OBJECTS_SHAPE: ${TAXII_OBJECTS_SHAPE:-envelope}
     ports:

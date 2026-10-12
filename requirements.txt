@@ -26,5 +26,6 @@ defusedxml==0.7.1
 # server. The OASIS reference client, for checking the feed the same way a
 # TAXII 2.1 client (Vision One / XDR) does.
 # taxii2-client==2.3.0
-# PostgreSQL driver — only if database.url / DATABASE_URL points at Postgres.
-# psycopg2-binary==2.9.9
+# PostgreSQL driver — the database this server runs on (docker compose ships a
+# PostgreSQL 16 service; database.url / DATABASE_URL point at it).
+psycopg2-binary==2.9.9

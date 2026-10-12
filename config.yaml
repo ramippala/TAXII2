@@ -17,28 +17,22 @@ server:
   cors_origins: ['https://taxii.ramippala.com']
 
 database:
-  # --- Development default: in-process SQLite (zero setup, single writer).
-  # For production (or local Postgres testing) set DATABASE_URL in .env — e.g.
-  #   postgresql+psycopg2://taxii:CHANGE_ME@127.0.0.1:5432/taxii_feed
-  url: ${DATABASE_URL:-sqlite:///taxii_feed.db}
+  # --- PostgreSQL is THE database (the docker compose stack runs one). ---
+  # The URL comes from DATABASE_URL in .env; compose injects its own for the
+  # app container (host `postgres`, the service name), so this default only
+  # applies to a host run. Every table the ORM declares — stix_objects,
+  # subscriptions, puller_state, api_keys — is created automatically at
+  # startup if missing, so an empty database needs no manual provisioning.
+  #   DB_USER / DB_PASS / DB_HOST / DB_PORT / DB_NAME in .env
+  url: '${DATABASE_URL:-postgresql+psycopg2://taxii:CHANGE_ME@127.0.0.1:5432/taxii_feed}'
 
-  # --- PRODUCTION: point at a real database instead of SQLite. ---
-  # Recommended: PostgreSQL (best concurrent read/write — Vision One polls
-  # while the poller/ingest writes). MariaDB/MySQL is a fine alternative if
-  # that's your org standard.
-  #
-  #   PostgreSQL  (pip install psycopg2-binary):
-  #   url: postgresql+psycopg2://${DB_USER}:${DB_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}
-  #
-  #   MariaDB/MySQL (pip install PyMySQL):
-  #   url: mysql+pymysql://${DB_USER}:${DB_PASS}@${DB_HOST}:${DB_PORT}/${DB_NAME}
-  #
-  # ${VAR:-default} placeholders are resolved from the environment at
-  # startup, so keep credentials in env vars, not in this file.
-  #
-  # url: postgresql+psycopg2://taxii:CHANGE_ME@localhost:5432/taxii_feed
-  #
-  # Connection pool (only used for server databases, ignored by SQLite):
+  # --- SQLite is dev-only now; this is what a fallback would look like. ---
+  # Point DATABASE_URL at it explicitly (single writer, in-process) — e.g.
+  # for a throwaway local run or the test suite:
+  #   DATABASE_URL=sqlite:///taxii_feed.db
+  # url: 'sqlite:///taxii_feed.db'
+
+  # Connection pool (server databases only — ignored by SQLite):
   pool_size: 5
   max_overflow: 10
   connection_timeout: 30
@@ -88,21 +82,47 @@ taxii:
   #                        TAXII_OBJECTS_SHAPE=envelope in .env for a
   #                        spec-strict client.
   objects_shape: '${TAXII_OBJECTS_SHAPE:-bundle}'
-  # === The ONE place Vision One is configured on THIS server ===
-  # Trend Micro Vision One is a TAXII 2.1 CLIENT. It polls this server's
-  #   http://<this-server>:5000/taxii2/
-  # using the HTTP Basic credentials below (username + password).
-  # Collection id:  threat-intel
-  collection_id: 'threat-intel'
-  collection_title: 'Custom Threat Intelligence Feed'
-  # TAXII client credentials (HTTP Basic) — enter these in Vision One.
-  # Values live in .env (see .env.example); no default here on purpose.
-  # READ-ONLY: a TAXII principal can only LIST and READ collections. Every
-  # write (ingest, purge, delete, revoke, community pull) needs the dashboard
-  # session, the UI credentials, or the optional admin principal below.
-  auth:
-    username: '${TAXII_AUTH_USER}'
-    password: '${TAXII_AUTH_PASSWORD}'
+  # === The collections this server serves ===
+  # The list below REPLACES the legacy single-collection keys
+  # (`collection_id` / `collection_title` / `auth`). Never set both: a
+  # `taxii.auth` block is a GLOBAL principal that may read every collection,
+  # which silently defeats the isolation configured here.
+  #
+  # ORDER MATTERS. The FIRST entry is the primary collection: the default
+  # target of the dashboard and of any read that passes no ?collection=.
+  # Vision One polls the union, so the union must stay first.
+  #
+  #   threat_intel   the UNION of the two below — what Vision One polls
+  #   gt_intel       manual intel (dashboard entry + CSV/Excel imports)
+  #   comm_intel     community intel (OTX + third-party TAXII pullers)
+  #
+  # A collection with `members:` is an AGGREGATE: it serves the union of its
+  # members and owns no row of its own, so it can be read but never written
+  # to (a write names one of its members). Members must be other LEAF
+  # collections — nesting is rejected, keeping the union a flat one-level
+  # fact. An aggregate with no valid members is a startup error, because a
+  # silently empty feed is the one failure that looks like "no intel yet".
+  #
+  # CREDENTIALS. The aggregate's HTTP Basic pair below is what you enter in
+  # the Vision One portal (Collection ID: threat_intel). A consumer that
+  # should see only ONE slice does not get a second static password here:
+  # generate a scoped API key in the dashboard ("API keys" tab) instead, and
+  # use its prefix as the username and the key itself as the password.
+  collections:
+    - id: threat_intel
+      title: 'Custom Threat Intelligence Feed'
+      description: >-
+        Union of the manual (gt_intel) and community (comm_intel) collections.
+      members: [gt_intel, comm_intel]
+      auth:
+        username: '${TAXII_AUTH_USER}'
+        password: '${TAXII_AUTH_PASSWORD}'
+    - id: gt_intel
+      title: 'GovTech intel (manual)'
+      description: 'GovTech intel: dashboard entry and CSV/Excel imports.'
+    - id: comm_intel
+      title: 'Community intel (pulled)'
+      description: 'Community intel pulled from OTX and third-party TAXII servers.'
 
   # Optional third principal: a script/automation credential allowed to do
   # feed-wide writes without reusing the dashboard login. Unset by default —
@@ -111,31 +131,6 @@ taxii:
   # admin_auth:
   #   username: '${TAXII_ADMIN_USER:-}'
   #   password: '${TAXII_ADMIN_PASSWORD:-}'
-
-  # === MULTI-COLLECTION / per-client RBAC (optional) ===
-  # Serve MORE than one consumer with SEPARATE credentials. When the
-  # `collections:` list is present it REPLACES the legacy `collection_id` /
-  # `auth` keys above (each collection is self-contained). A TAXII client
-  # authenticating with a collection's credentials can only LIST and READ the
-  # collection(s) its credentials authorize — GET /taxii2/collections/ shows
-  # only what the principal may read, and Get Objects for another collection
-  # returns 401. `GET /objects` / `POST /feed/ingest` (and the web UI) accept
-  # an optional `collection` field/?collection= to target a specific
-  # collection (default: the first one listed, the primary).
-  #
-  # collections:
-  #   - id: threat-intel
-  #     title: Custom Threat Intelligence Feed
-  #     description: Primary feed for Vision One
-  #     auth:
-  #       username: '${TAXII_AUTH_USER}'
-  #       password: '${TAXII_AUTH_PASSWORD}'
-  #   - id: premium
-  #     title: Premium Feed
-  #     description: Second consumer feed
-  #     auth:
-  #       username: '${PREMIUM_TAXII_USER}'
-  #       password: '${PREMIUM_TAXII_PASS}'
 
 # ---------------------------------------------------------------------------
 # INDICATOR LIFECYCLE / TTL (aging & auto-revocation)
@@ -284,6 +279,10 @@ otx:
   max_indicators_per_pulse: 1000
   max_indicators_per_poll: 5000
   object_types: ['ipv4-addr', 'domain-name', 'file-hash']
+  # Which collection on THIS server the pulled intel lands in. Defaults to
+  # comm_intel (the community leaf). Pointing this at an aggregate is
+  # ignored with a warning — community data is never filed under the union.
+  ingest_collection: comm_intel
 
 # ---------------------------------------------------------------------------
 # THIRD-PARTY TAXII 2.1 PULLERS — pull objects FROM other TAXII servers.
@@ -298,7 +297,8 @@ otx:
 #     base_url: https://otx.alienvault.com/taxii/root   # OTX TAXII 2.1 API root
 #     username: 'your-otx-api-key'      # OTX uses the API key as username
 #     password: ''
-#     collection: '<collection-uuid>'   # e.g. from /taxii/root/collections/
+#     collection: '<collection-uuid>'   # UPSTREAM collection to read
+#     ingest_collection: comm_intel     # local collection to write into
 #     poll_interval: 300
 #     max_objects_per_poll: 5000
 #     enabled: true
@@ -309,6 +309,7 @@ taxii_pullers: []
   #   username: 'your-otx-api-key'
   #   password: ''
   #   collection: '<collection-uuid>'
+  #   ingest_collection: comm_intel
   #   poll_interval: 300
   #   max_objects_per_poll: 5000
   #   enabled: false

@@ -17,6 +17,7 @@ Architecture:
 import base64
 import csv
 import hashlib
+import hashlib
 import hmac
 import html
 import io
@@ -25,6 +26,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -39,7 +41,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
-from flask import (Flask, Response, jsonify, make_response, redirect,
+from flask import (Flask, Response, g, jsonify, make_response, redirect,
                    request, send_from_directory)
 from flask_cors import CORS
 from sqlalchemy import (
@@ -233,6 +235,39 @@ class Subscription(Base):
     last_verified = Column(DateTime, nullable=True)
 
 
+class ApiKey(Base):
+    """A scoped TAXII API key (dashboard-generated consumer credential).
+
+    The plaintext secret is shown exactly once, at creation, and never
+    stored. The cleartext ``prefix`` is kept and indexed so a presented key
+    resolves to its row in one lookup and can be identified in listings and
+    log lines; only a SHA-256 of the secret is persisted. Keys are
+    high-entropy random values, so a fast hash is the correct choice here (as
+    at GitHub/Stripe) — an adaptive hash (``generate_password_hash``) would
+    run on every poll for no gain.
+
+    ``collections`` is a JSON list of collection ids the key may read;
+    ``rate_limit`` / ``rate_window`` are an optional per-key sliding window
+    (requests per window seconds). Unlike :class:`Subscription` — a
+    hashed-credential store the TAXII feed never consults — this table IS the
+    credential the feed honours.
+    """
+
+    __tablename__ = "api_keys"
+
+    id = Column(String, primary_key=True)
+    label = Column(String, nullable=False, default='')
+    prefix = Column(String, nullable=False, index=True)
+    secret_hash = Column(String, nullable=False)
+    enabled = Column(Boolean, default=True)
+    created = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=True)
+    last_used_at = Column(DateTime, nullable=True)
+    collections = Column(Text, nullable=True)   # JSON list of collection ids
+    rate_limit = Column(Integer, nullable=True)    # requests per window (0/null = off)
+    rate_window = Column(Integer, nullable=True)   # window length, seconds
+
+
 class PullerState(Base):
     """Per-community-puller state: last sync timestamp + status.
 
@@ -280,9 +315,85 @@ def create_session():
     return SessionLocal()
 
 
+def _rehome_aggregate_rows() -> int:
+    """Re-home rows stored under the pre-segregation collection id.
+
+    Before this server split its feed, every object was written under the
+    single legacy id (``DEFAULT_COLLECTION_ID``, 'threat-intel'). The
+    aggregate that replaced it owns no rows of its own, so those rows would
+    be invisible to every reader (and to Vision One). Split them by
+    provenance: manual (and unknown-source) rows become the manual member,
+    everything the pullers wrote becomes the community member.
+
+    Idempotent by construction: the predicate matches the legacy id only, and
+    no re-homed row carries it again, so a second run updates 0 rows. A no-op
+    when the feature is off — either no aggregate is configured, or the
+    legacy id is still a configured collection of its own.
+
+    Returns the number of rows re-homed.
+    """
+    member_ids = [m for c in TAXII_COLLECTIONS if c.members for m in c.members]
+    if not member_ids or DEFAULT_COLLECTION_ID in TAXII_COLLECTION_MAP:
+        return 0
+    # Derive the split targets from the configured members, not from
+    # hardcoded ids: an operator who renames a leaf still gets the right
+    # routing (with the first/last member standing in for a missing one).
+    manual_target = (DEFAULT_MANUAL_COLLECTION_ID
+                     if DEFAULT_MANUAL_COLLECTION_ID in member_ids
+                     else member_ids[0])
+    community_target = (DEFAULT_COMMUNITY_COLLECTION_ID
+                        if DEFAULT_COMMUNITY_COLLECTION_ID in member_ids
+                        else member_ids[-1])
+    with engine.begin() as conn:
+        rehomed_manual = conn.execute(
+            text(
+                "UPDATE stix_objects SET collection_id = :target "
+                "WHERE collection_id = :legacy "
+                "AND (source = 'manual' OR source IS NULL)"
+            ),
+            {'target': manual_target, 'legacy': DEFAULT_COLLECTION_ID},
+        ).rowcount
+        # Whatever is left under the legacy id came from a community puller.
+        rehomed_community = conn.execute(
+            text(
+                "UPDATE stix_objects SET collection_id = :target "
+                "WHERE collection_id = :legacy"
+            ),
+            {'target': community_target, 'legacy': DEFAULT_COLLECTION_ID},
+        ).rowcount
+    total = max(rehomed_manual, 0) + max(rehomed_community, 0)
+    if total:
+        logger.info(
+            "Re-homed %s legacy row(s) out of '%s' (%s: %s, %s: %s)",
+            total, DEFAULT_COLLECTION_ID, manual_target, rehomed_manual,
+            community_target, rehomed_community,
+        )
+    return total
+
+
 def init_db() -> None:
-    """Initialize database tables (and apply lightweight column migrations)."""
-    Base.metadata.create_all(engine)
+    """Initialize database tables (and apply lightweight column migrations).
+
+    ``create_all`` is the schema source of truth: it creates every table the
+    ORM defines (``stix_objects``, ``subscriptions``, ``puller_state``,
+    ``api_keys``) that does not already exist, so pointing the server at an
+    empty PostgreSQL database is all the provisioning it needs. The
+    add-if-missing column loop below only matters for a database created by
+    an older build.
+    """
+    try:
+        Base.metadata.create_all(engine)
+    except Exception as exc:
+        # Fail with what to fix rather than a bare driver traceback: this is
+        # the first thing that touches the database, so an unreachable or
+        # mis-credentialed PostgreSQL shows up here.
+        logger.error(
+            "Could not create the schema in %r (%s: %s). Is PostgreSQL up and "
+            "is DATABASE_URL/POSTGRES_* correct? In docker compose the database "
+            "is the `postgres` service (docker compose up -d postgres).",
+            DATABASE_URL, type(exc).__name__, exc,
+        )
+        raise
     # Lightweight migration for databases created before the `source` column
     # existed (no ORM migrations installed; add-if-missing is idempotent).
     from sqlalchemy import inspect
@@ -297,7 +408,10 @@ def init_db() -> None:
         if 'revoked_at' not in cols:
             with engine.begin() as conn:
                 conn.execute(
-                    text('ALTER TABLE stix_objects ADD COLUMN revoked_at DATETIME')
+                    # TIMESTAMP, not SQLite's DATETIME: accepted by SQLite
+                    # (type affinity) *and* by PostgreSQL, so the migration is
+                    # portable across both.
+                    text('ALTER TABLE stix_objects ADD COLUMN revoked_at TIMESTAMP')
                 )
             logger.info("Migrated stix_objects: added 'revoked_at' column")
         # Extended STIX types (url/email/ipv6/mac/...), relationships, and
@@ -319,13 +433,15 @@ def init_db() -> None:
                         text(f'ALTER TABLE stix_objects ADD COLUMN {col} {ddl}')
                     )
                 logger.info("Migrated stix_objects: added '%s' column", col)
-        # Backfill: pre-collection rows belong to the primary collection.
+        # Backfill: pre-collection rows belong to the legacy single-collection
+        # id (which _rehome_aggregate_rows below then splits by provenance).
         with engine.begin() as conn:
             conn.execute(
                 text(
-                    "UPDATE stix_objects SET collection_id = 'threat-intel' "
+                    "UPDATE stix_objects SET collection_id = :legacy "
                     "WHERE collection_id IS NULL"
-                )
+                ),
+                {'legacy': DEFAULT_COLLECTION_ID},
             )
     # `create_all` only creates indexes for tables it creates, so a database
     # that predates the poll-path indexes above never gets them. Create any
@@ -333,7 +449,17 @@ def init_db() -> None:
     # (MySQL/MariaDB have no CREATE INDEX IF NOT EXISTS).
     for index in STIXObject.__table__.indexes:
         index.create(bind=engine, checkfirst=True)
-    logger.info("Database initialized")
+    # One-time re-homing of rows written under the pre-segregation collection
+    # id. Runs AFTER the NULL backfill above, otherwise the backfilled rows
+    # would be stranded under the legacy id rather than split by provenance.
+    _rehome_aggregate_rows()
+    # Log the backend and the tables that actually exist, so a deployment can
+    # confirm the schema landed (and in which database) straight from the log.
+    logger.info(
+        "Database initialized (backend=%s, tables=%s)",
+        engine.dialect.name,
+        ', '.join(sorted(inspect(engine).get_table_names())) or 'none',
+    )
 
 
 def rehydrate_memory() -> int:
@@ -900,21 +1026,215 @@ def _credentials_match(user: str, password: str, cfg: Dict[str, Any]) -> bool:
             and hmac.compare_digest(str(password or ''), expected_pass))
 
 
+# ---------------------------------------------------------------------------
+# Scoped API keys (dashboard-generated consumer credentials)
+# ---------------------------------------------------------------------------
+# A key is an alternative to a per-collection username/password: it is
+# generated in the dashboard, scoped to one or more collections, optionally
+# time-limited and rate-limited. Vision One only speaks HTTP Basic, so the
+# key rides in the *password* position (`curl -u <prefix>:<key>` and the
+# X-Taxii-* headers work too, since _request_taxii_credentials accepts both).
+#
+# Only the O(1) lookup `prefix` and a SHA-256 of the secret are stored; the
+# plaintext is returned exactly once, at creation, and never logged.
+
+_API_KEY_PREFIX_TAG = 'taxii_'
+_API_KEY_PREFIX_LEN = 8          # hex chars after the 'taxii_' tag
+_API_KEY_SECRET_BYTES = 24       # -> 32 url-safe chars
+
+
+def _hash_api_key_secret(secret: str) -> str:
+    """SHA-256 (hex) of a key's secret.
+
+    Deliberately a fast hash: the secret is high-entropy random (not a
+    user-chosen password), so there is nothing to brute-force, and this runs
+    on every TAXII poll. Adaptive KDFs (``generate_password_hash``) are for
+    low-entropy secrets and would burn CPU on every request here.
+    """
+    return hashlib.sha256(str(secret).encode('utf-8')).hexdigest()
+
+
+def _generate_api_key() -> Tuple[str, str, str]:
+    """Mint a key: returns ``(plaintext, prefix, secret_hash)``."""
+    prefix = secrets.token_hex(_API_KEY_PREFIX_LEN // 2)
+    secret = secrets.token_urlsafe(_API_KEY_SECRET_BYTES)
+    plaintext = f'{_API_KEY_PREFIX_TAG}{prefix}_{secret}'
+    return plaintext, prefix, _hash_api_key_secret(plaintext)
+
+
+def _split_api_key(key: str) -> Optional[Tuple[str, str]]:
+    """``(prefix, full_key)`` for a well-formed key, else None."""
+    if not isinstance(key, str) or not key.startswith(_API_KEY_PREFIX_TAG):
+        return None
+    parts = key.split('_', 2)
+    if len(parts) != 3 or len(parts[1]) != _API_KEY_PREFIX_LEN or not parts[2]:
+        return None
+    return parts[1], key
+
+
+def _parse_key_collections(raw: Any) -> List[str]:
+    """Decode the stored JSON scope, tolerating a malformed/legacy value."""
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(v) for v in value if str(v or '').strip()]
+
+
+def _api_key_row(password: str) -> Optional[Dict[str, Any]]:
+    """Resolve a live (well-formed, enabled, unexpired) key to its scope.
+
+    Returns a plain dict so the caller holds no ORM object once the session
+    closes, or None for anything that is not a currently-valid key.
+    """
+    split = _split_api_key(password)
+    if split is None:
+        return None
+    prefix, key = split
+    session = create_session()
+    try:
+        row = session.query(ApiKey).filter_by(prefix=prefix).first()
+        if row is None or not row.enabled:
+            return None
+        if not hmac.compare_digest(str(row.secret_hash or ''),
+                                   _hash_api_key_secret(key)):
+            return None
+        now = datetime.utcnow()
+        if row.expires_at is not None and row.expires_at <= now:
+            return None
+        info = {
+            'id': row.id,
+            'label': row.label,
+            'prefix': row.prefix,
+            'collections': _parse_key_collections(row.collections),
+            'rate_limit': int(row.rate_limit or 0),
+            'rate_window': int(row.rate_window or 0),
+        }
+        # Touch last_used_at at most once a minute: it is dashboard
+        # information, not an audit trail, and a write per poll is waste.
+        if row.last_used_at is None or (now - row.last_used_at).total_seconds() >= 60:
+            row.last_used_at = now
+            session.commit()
+        return info
+    except Exception as exc:  # pragma: no cover - depends on DB availability
+        logger.error("API key lookup failed: %s", exc)
+        return None
+    finally:
+        session.close()
+
+
+def _api_key_for(client_pass: str) -> Optional[Dict[str, Any]]:
+    """The API key a presented password names, memoised per request.
+
+    Resolution hits the DB (and compares a hash), so it is cached on Flask's
+    ``g``: the auth seams below are called several times per request.
+    """
+    password = str(client_pass or '')
+    if not password.startswith(_API_KEY_PREFIX_TAG):
+        return None
+    try:
+        cache = getattr(g, '_taxii_api_keys', None)
+        if cache is None:
+            cache = {}
+            g._taxii_api_keys = cache
+    except RuntimeError:
+        # No request/app context (direct call from a script or unit test).
+        return _api_key_row(password)
+    if password not in cache:
+        cache[password] = _api_key_row(password)
+    return cache[password]
+
+
+_API_KEY_HITS_MAX_KEYS = 20000
+_api_key_hits: Dict[str, List[float]] = {}
+_api_key_hits_lock = threading.Lock()
+
+
+def _api_key_rate_limited(key: Dict[str, Any]) -> Optional[int]:
+    """Sliding-window rate limit for one key.
+
+    Returns the ``Retry-After`` seconds when this request is over the key's
+    limit, or None when it may proceed. In-memory and per-process — the same
+    caveat as the auth-failure throttle: counters reset on restart and would
+    need a shared store (Redis) to hold across workers. The server is
+    deliberately single-process (waitress), so one table is the whole picture.
+    """
+    limit = int(key.get('rate_limit') or 0)
+    if limit <= 0:
+        return None
+    window = max(1, int(key.get('rate_window') or 60))
+    ident = str(key.get('id') or '')
+    now = time.time()
+    with _api_key_hits_lock:
+        hits = [t for t in (_api_key_hits.get(ident) or []) if now - t < window]
+        if len(hits) >= limit:
+            _api_key_hits[ident] = hits
+            return max(1, int(round(window - (now - hits[0]))))
+        hits.append(now)
+        if ident not in _api_key_hits and len(_api_key_hits) >= _API_KEY_HITS_MAX_KEYS:
+            # Bound the table: drop keys with nothing left in their window.
+            for stale in [k for k, v in _api_key_hits.items()
+                          if not v or now - v[-1] >= window]:
+                _api_key_hits.pop(stale, None)
+        _api_key_hits[ident] = hits
+    return None
+
+
+def _too_many_key_requests_response(retry_after: int) -> Response:
+    detail = f'API key rate limit exceeded; retry after {retry_after}s'
+    if (request.path or '').startswith('/taxii2'):
+        resp = _taxii_error(429, 'Too Many Requests', detail, 'throttled')
+    else:
+        resp = jsonify({'error': detail})
+        resp.status_code = 429
+    resp.headers['Retry-After'] = str(retry_after)
+    return resp
+
+
+@app.before_request
+def _api_key_rate_gate():
+    """Enforce a key's own sliding window (429 + Retry-After once past it).
+
+    Runs before the credential checks, but only for a *well-formed, live*
+    key: an unknown or revoked key falls through to the normal 401 path and
+    is covered by the per-IP auth-failure throttle instead.
+    """
+    if _throttle_prefix(request.path) is None:
+        return None
+    _user, password = _request_taxii_credentials()
+    key = _api_key_for(password)
+    if key is None:
+        return None
+    retry_after = _api_key_rate_limited(key)
+    if retry_after is None:
+        return None
+    logger.warning("Rate-limited API key %s (%s request(s) per %ss)",
+                   key.get('prefix'), key.get('rate_limit'),
+                   key.get('rate_window'))
+    return _too_many_key_requests_response(retry_after)
+
+
 def _validate_taxii_auth(client_user: str, client_pass: str) -> bool:
     """Validate TAXII 2 authentication credentials.
 
-    True when the credentials match ANY configured collection, or the
-    legacy/test override (which can read every collection).
+    True when the credentials match ANY configured collection, the
+    legacy/test override (which can read every collection), or a live API key.
     """
     override = _get_taxii_auth_config()
     if override.get('username'):
         if _credentials_match(client_user, client_pass, override):
             return True
-    return any(
+    if any(
         _credentials_match(client_user, client_pass,
                            {'username': c.username, 'password': c.password})
         for c in TAXII_COLLECTIONS
-    )
+    ):
+        return True
+    return _api_key_for(client_pass) is not None
 
 
 def _collections_readable_by(client_user: str, client_pass: str
@@ -922,9 +1242,14 @@ def _collections_readable_by(client_user: str, client_pass: str
     """Collections a principal (TAXII credentials) may read.
 
     The legacy/test override is a global principal: it reads every
-    collection. Otherwise a principal reads exactly the collection(s)
-    whose configured username/password match its credentials.
+    collection. An API key reads exactly the collections in its scope.
+    Otherwise a principal reads exactly the collection(s) whose configured
+    username/password match its credentials.
     """
+    key = _api_key_for(client_pass)
+    if key is not None:
+        scope = set(key['collections'])
+        return [c for c in TAXII_COLLECTIONS if c.id in scope]
     override = _get_taxii_auth_config()
     if override.get('username'):
         if _credentials_match(client_user, client_pass, override):
@@ -1520,7 +1845,8 @@ def _extract_object_fields(
 
 
 def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
-                   source: str = 'manual', collection: str = 'threat-intel') -> int:
+                   source: str = 'manual',
+                   collection: Optional[str] = None) -> int:
     """Store STIX objects into the feed (memory + DB).
 
     ``mode``:
@@ -1534,14 +1860,17 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
         appended, never dropped by a poller.
 
     ``source`` tags each stored object with its origin (``'manual'`` for
-    web-UI/API ingest, ``'otx'`` for the OTX puller, ...). ``collection``
-    is the TAXII collection the objects belong to (defaults to the primary
-    collection).
+    web-UI/API ingest, ``'otx'`` for the OTX puller, ...). ``collection`` is
+    the TAXII collection the objects belong to; when omitted it resolves to
+    the manual collection (``gt_intel``) — never to the primary collection,
+    which may be the aggregate and owns no rows of its own.
 
     Objects failing :func:`_validate_stix_object` are skipped with a warning
     (never blocking the batch). Returns the number of objects stored in the
     mode-specific batch. Raises on failure.
     """
+    if not collection:
+        collection = DEFAULT_MANUAL_COLLECTION_ID
     session = create_session()
     try:
         with memory_lock:
@@ -1706,17 +2035,22 @@ def purge_all(collection: Optional[str] = None) -> int:
     """Purge threat intelligence data (memory + DB).
 
     With ``collection=None`` wipes EVERYTHING (all collections, all
-    sources). With a collection id, wipes only that collection's objects.
+    sources). With a collection id, wipes only that collection's objects —
+    and for an *aggregate*, the union of its members. The aggregate is the
+    primary collection (what the dashboard's "Purge all" targets by default),
+    so rejecting it here would silently turn that button into a no-op;
+    unlike ``collection=None`` it still spares non-member collections.
     Returns the number of rows purged.
     """
+    ids = _collection_ids_for(collection)
     session = create_session()
     try:
         with memory_lock:
-            if collection:
-                rows = session.query(STIXObject).filter_by(
-                    collection_id=collection).all()
+            if ids:
+                rows = session.query(STIXObject).filter(
+                    STIXObject.collection_id.in_(ids)).all()
                 for s in [s for s in memory_store
-                          if memory_store[s].collection == collection]:
+                          if memory_store[s].collection in ids]:
                     memory_store.pop(s, None)
             else:
                 rows = session.query(STIXObject).all()
@@ -1771,12 +2105,19 @@ def _default_page_cap() -> Optional[int]:
 
 @dataclass
 class CollectionConfig:
-    """One TAXII collection: identity + the credentials that may read it."""
+    """One TAXII collection: identity + the credentials that may read it.
+
+    ``members`` turns a collection into an *aggregate*: a virtual collection
+    that serves the union of its members' objects and owns no rows of its
+    own. Aggregates are flat (a member is never itself an aggregate) and
+    read-only — writes name a member.
+    """
     id: str
     title: str
     description: str
     username: str
     password: str
+    members: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.id = str(self.id or DEFAULT_COLLECTION_ID)
@@ -1784,6 +2125,23 @@ class CollectionConfig:
         self.description = str(self.description or '')
         self.username = str(self.username or '')
         self.password = str(self.password or '')
+        # Normalise members: coerce to str, drop blanks, dedupe preserving
+        # order, and drop a self-reference (an id nothing is ever stored
+        # under, which would be a silent no-op in the union).
+        seen = set()
+        normalised: List[str] = []
+        for member in self.members or []:
+            mid = str(member or '').strip()
+            if not mid or mid == self.id or mid in seen:
+                continue
+            seen.add(mid)
+            normalised.append(mid)
+        self.members = normalised
+
+    @property
+    def is_aggregate(self) -> bool:
+        """True when this collection serves the union of its members."""
+        return bool(self.members)
 
 
 def _build_collection_configs(taxii_cfg: Dict[str, Any]) -> List[CollectionConfig]:
@@ -1800,14 +2158,17 @@ def _build_collection_configs(taxii_cfg: Dict[str, Any]) -> List[CollectionConfi
             if not isinstance(e, dict) or not e.get('id'):
                 continue
             auth = e.get('auth') or {}
+            members = e.get('members')
             cfgs.append(CollectionConfig(
                 id=str(e['id']),
                 title=str(e.get('title') or ''),
                 description=str(e.get('description') or ''),
                 username=str(auth.get('username') or ''),
                 password=str(auth.get('password') or ''),
+                members=list(members) if isinstance(members, (list, tuple)) else [],
             ))
         return cfgs or _build_collection_configs({})
+    # Legacy single-collection form: no members, so this path is unchanged.
     auth = taxii_cfg.get('auth') or {}
     return [CollectionConfig(
         id=str(taxii_cfg.get('collection_id') or DEFAULT_COLLECTION_ID),
@@ -1831,6 +2192,64 @@ TAXII_COLLECTION_ID = TAXII_COLLECTIONS[0].id if TAXII_COLLECTIONS else DEFAULT_
 TAXII_COLLECTION_TITLE = (
     TAXII_COLLECTIONS[0].title if TAXII_COLLECTIONS else 'Custom Threat Intelligence Feed'
 )
+
+
+def _validate_collection_members() -> None:
+    """Drop unknown / nested members; refuse an aggregate left with none.
+
+    A member must name another *leaf* collection. Nested aggregates are
+    dropped rather than expanded, so the union stays a flat one-level fact
+    with no recursion, cycle detection or ordering ambiguity. Membership is
+    pruned in place, which is why this runs once, right after the registry is
+    built.
+
+    An aggregate with zero members is the one misconfiguration that makes a
+    feed look silently empty, so it raises at startup instead of serving
+    nothing.
+    """
+    for cfg in TAXII_COLLECTIONS:
+        if not cfg.members:
+            continue
+        kept: List[str] = []
+        for mid in cfg.members:
+            member = TAXII_COLLECTION_MAP.get(mid)
+            if member is None:
+                logger.warning(
+                    "Collection %r: dropping unknown member %r", cfg.id, mid)
+                continue
+            if member.members:
+                logger.warning(
+                    "Collection %r: dropping nested aggregate member %r "
+                    "(aggregates are flat)", cfg.id, mid)
+                continue
+            kept.append(mid)
+        cfg.members = kept
+        if not cfg.members:
+            raise ValueError(
+                f"taxii.collections: {cfg.id!r} is an aggregate whose members "
+                f"are all unknown or are themselves aggregates — it would "
+                f"serve an empty feed. Name at least one leaf collection."
+            )
+
+
+_validate_collection_members()
+
+
+def _leaf_or_primary(cid: str) -> str:
+    """``cid`` when it names a configured leaf, else the primary collection."""
+    cfg = TAXII_COLLECTION_MAP.get(cid)
+    if cfg is not None and not cfg.members:
+        return cid
+    return TAXII_COLLECTION_ID
+
+
+# Where the two write/ingest routes land. The manual feed (dashboard entry +
+# CSV/Excel import) and the community feed (OTX + third-party TAXII pullers)
+# are the leaves; the aggregate above is their union, which is what a
+# consumer with broad scope polls. Each falls back to the primary collection,
+# so a single-collection deployment behaves exactly as it did before.
+DEFAULT_MANUAL_COLLECTION_ID = _leaf_or_primary('gt_intel')
+DEFAULT_COMMUNITY_COLLECTION_ID = _leaf_or_primary('comm_intel')
 
 
 def _stix_now() -> str:
@@ -2287,7 +2706,9 @@ def build_stix_bundle(since: Optional[str] = None,
                 raise ValueError(f'bad since/added_after timestamp: {cutoff!r}')
             q = q.filter(STIXObject.modified >= cutoff_dt)
         if collection:
-            q = q.filter(STIXObject.collection_id == collection)
+            # An aggregate reads as the union of its members; a leaf is a
+            # plain equality filter.
+            q = _apply_collection_filter(q, collection)
         # match[id] is applied after rendering (a client may reference either
         # the served indicator id or our stored id), so it is not a SQL filter.
         match_id_set = {str(i) for i in match_ids} if match_ids else None
@@ -2481,7 +2902,16 @@ def _collection_url(base_url: str, collection_id: str) -> str:
 
 
 def _collection_resource(base_url: str, cfg: CollectionConfig) -> Dict[str, Any]:
-    """A single Collection Resource (flat — fields at top level per spec 5.2.1)."""
+    """A single Collection Resource (flat — fields at top level per spec 5.2.1).
+
+    An aggregate advertises the collections it unions in the free-form
+    ``meta`` object (``meta['members']``) rather than as a non-spec
+    top-level field. ``can_write`` stays false for every collection here:
+    the feed is read-only to TAXII clients.
+    """
+    meta: Dict[str, Any] = {'collection_url': _collection_url(base_url, cfg.id)}
+    if cfg.members:
+        meta['members'] = list(cfg.members)
     return {
         'id': cfg.id,
         'title': cfg.title,
@@ -2494,7 +2924,7 @@ def _collection_resource(base_url: str, cfg: CollectionConfig) -> Dict[str, Any]
         'can_write': False,
         'version': '2.1',
         'created': _stix_now(),
-        'meta': {'collection_url': _collection_url(base_url, cfg.id)},
+        'meta': meta,
     }
 
 
@@ -2692,7 +3122,8 @@ def _collection_param(value: Any) -> Tuple[Optional[str], Optional[str]]:
     """Validate a ?collection= / body ``collection`` against the registry.
 
     Returns ``(collection_id, None)``, ``(None, None)`` when omitted, or
-    ``(None, error)`` for an unknown collection id.
+    ``(None, error)`` for an unknown collection id. An aggregate is accepted:
+    it is a real collection that reads as the union of its members.
     """
     if value is None or value == '':
         return None, None
@@ -2700,6 +3131,80 @@ def _collection_param(value: Any) -> Tuple[Optional[str], Optional[str]]:
     if cid not in TAXII_COLLECTION_MAP:
         return None, f'unknown collection: {cid!r}'
     return cid, None
+
+
+def _collection_ids_for(cid: Optional[str]) -> List[str]:
+    """The stored ``collection_id`` values a read of ``cid`` covers.
+
+    An aggregate resolves to its members (the union); anything else to
+    itself. An id that is blank, or unknown to the registry, resolves to
+    itself too — callers validate first, and a stray id then matches nothing
+    rather than silently widening to the whole feed.
+    """
+    if not cid:
+        return []
+    cfg = TAXII_COLLECTION_MAP.get(cid)
+    if cfg is not None and cfg.members:
+        return list(cfg.members)
+    return [cid]
+
+
+def _apply_collection_filter(query, cid: Optional[str]):
+    """Restrict a STIXObject query to what a read of ``cid`` covers.
+
+    A no-op for a blank id (every collection), an equality filter for one id
+    and ``IN`` for an aggregate's union.
+    """
+    ids = _collection_ids_for(cid)
+    if not ids:
+        return query
+    if len(ids) == 1:
+        return query.filter(STIXObject.collection_id == ids[0])
+    return query.filter(STIXObject.collection_id.in_(ids))
+
+
+def _collection_write_target(value: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve the collection a *write* targets.
+
+    Omitted -> the manual collection (``gt_intel``). An aggregate is
+    rejected: it owns no rows, so a write to it would land somewhere no
+    reader of the aggregate would ever look. Returns ``(collection_id, None)``
+    or ``(None, error)``.
+    """
+    if value is None or value == '':
+        return DEFAULT_MANUAL_COLLECTION_ID, None
+    cid = str(value)
+    cfg = TAXII_COLLECTION_MAP.get(cid)
+    if cfg is None:
+        return None, f'unknown collection: {cid!r}'
+    if cfg.members:
+        return None, (
+            f'collection {cid!r} is an aggregate (the union of '
+            f'{", ".join(cfg.members)}); write to one of its members instead'
+        )
+    return cid, None
+
+
+def _resolve_ingest_target(configured: Any, default: str) -> str:
+    """Resolve a poller's configured ``ingest_collection`` to a writable leaf.
+
+    A poller must never route community data into the aggregate or into an
+    unknown id, so either falls back to ``default`` with a warning rather
+    than failing the poll.
+    """
+    if configured is None or configured == '':
+        return default
+    cid = str(configured)
+    cfg = TAXII_COLLECTION_MAP.get(cid)
+    if cfg is None:
+        logger.warning("ingest_collection %r is unknown; using %r", cid, default)
+        return default
+    if cfg.members:
+        logger.warning(
+            "ingest_collection %r is an aggregate (the union of %s); using %r",
+            cid, ', '.join(cfg.members), default)
+        return default
+    return cid
 
 
 @app.route('/feed', methods=['GET'])
@@ -2720,8 +3225,7 @@ def get_feed():
     session = create_session()
     try:
         q = session.query(STIXObject)
-        if cid:
-            q = q.filter(STIXObject.collection_id == cid)
+        q = _apply_collection_filter(q, cid)
         # Bounded like /objects: the XML feed is built in one response, so cap
         # how much a single request can materialise.
         q = q.order_by(STIXObject.modified.asc(), STIXObject.stix_id.asc())
@@ -2786,8 +3290,7 @@ def list_objects():
     session = create_session()
     try:
         q = session.query(STIXObject)
-        if cid:
-            q = q.filter(STIXObject.collection_id == cid)
+        q = _apply_collection_filter(q, cid)
         # Fetch one extra row so truncation is reported without a 2nd query.
         # (No ORDER BY: the cap is a size guard, and the previous unordered
         # read order is kept so the dashboard's list order is unchanged.)
@@ -2862,8 +3365,7 @@ def ui_stats():
     session = create_session()
     try:
         q = session.query(STIXObject)
-        if cid:
-            q = q.filter(STIXObject.collection_id == cid)
+        q = _apply_collection_filter(q, cid)
         rows = q.all()
     finally:
         session.close()
@@ -3026,10 +3528,9 @@ def ingest_data():
     if mode not in ('replace', 'merge'):
         return jsonify({'error': "mode must be 'replace' or 'merge'"}), 400
 
-    cid, err = _collection_param(data.get('collection'))
+    cid, err = _collection_write_target(data.get('collection'))
     if err:
         return jsonify({'error': err}), 400
-    cid = cid or TAXII_COLLECTION_ID
     if not _write_allowed():
         return jsonify({'error': 'Unauthorized'}), 401
 
@@ -3260,14 +3761,209 @@ def ui_logout():
 
 @app.route('/ui/collections', methods=['GET'])
 def ui_collections():
-    """GET /ui/collections — the TAXII collection registry (dashboard)."""
+    """GET /ui/collections — the TAXII collection registry (dashboard).
+
+    ``manual`` / ``community`` tell the dashboard where a write lands without
+    it having to hardcode ids: a write never targets an aggregate, so the UI
+    routes an edit made while the union is selected to ``manual``.
+    """
     if not _request_allowed():
         return jsonify({'error': 'Unauthorized'}), 401
-    collections = [{'id': c.id, 'title': c.title} for c in TAXII_COLLECTIONS]
+    collections = [
+        {
+            'id': c.id,
+            'title': c.title,
+            'members': list(c.members),
+            'aggregate': bool(c.members),
+        }
+        for c in TAXII_COLLECTIONS
+    ]
     return jsonify({
         'collections': collections,
         'primary': TAXII_COLLECTION_ID,
+        'manual': DEFAULT_MANUAL_COLLECTION_ID,
+        'community': DEFAULT_COMMUNITY_COLLECTION_ID,
     }), 200
+
+
+# ---------------------------------------------------------------------------
+# API key management (dashboard)
+# ---------------------------------------------------------------------------
+
+_MAX_KEY_LABEL = 128
+_MAX_KEY_EXPIRY_DAYS = 3650
+
+
+def _api_key_public(row: 'ApiKey') -> Dict[str, Any]:
+    """Dashboard view of a key. Never includes the secret (only its prefix)."""
+    return {
+        'id': row.id,
+        'label': row.label,
+        'prefix': row.prefix,
+        'collections': _parse_key_collections(row.collections),
+        'enabled': bool(row.enabled),
+        'created': _stix_ts(row.created),
+        'expires_at': _stix_ts(row.expires_at),
+        'last_used_at': _stix_ts(row.last_used_at),
+        'rate_limit': int(row.rate_limit or 0),
+        'rate_window': int(row.rate_window or 0),
+        'expired': bool(row.expires_at and row.expires_at <= datetime.utcnow()),
+    }
+
+
+def _validate_key_scope(value: Any) -> Tuple[Optional[List[str]], Optional[str]]:
+    """Validate the requested collection scope: a non-empty list of known ids."""
+    if not isinstance(value, (list, tuple)) or not value:
+        return None, 'collections: select at least one collection'
+    scope: List[str] = []
+    for raw in value:
+        cid = str(raw or '').strip()
+        if not cid:
+            continue
+        if cid not in TAXII_COLLECTION_MAP:
+            return None, f'unknown collection: {cid!r}'
+        if cid not in scope:
+            scope.append(cid)
+    if not scope:
+        return None, 'collections: select at least one collection'
+    return scope, None
+
+
+def _parse_key_expiry(value: Any) -> Tuple[Optional[datetime], Optional[str]]:
+    """``expires_days`` (positive int) -> an absolute expiry, or None = never."""
+    if value is None or value == '':
+        return None, None
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        return None, f'expires_days must be a positive integer, got {value!r}'
+    if days <= 0 or days > _MAX_KEY_EXPIRY_DAYS:
+        return None, f'expires_days must be between 1 and {_MAX_KEY_EXPIRY_DAYS}'
+    return datetime.utcnow() + timedelta(days=days), None
+
+
+def _parse_key_rate(data: Dict[str, Any]) -> Tuple[int, int, Optional[str]]:
+    """``(rate_limit, rate_window, error)``; a 0 limit means unlimited."""
+    raw_limit = data.get('rate_limit')
+    raw_window = data.get('rate_window')
+    limit = 0
+    if raw_limit not in (None, ''):
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return 0, 0, f'rate_limit must be a non-negative integer, got {raw_limit!r}'
+        if limit < 0:
+            return 0, 0, 'rate_limit must be a non-negative integer'
+    window = 60
+    if raw_window not in (None, ''):
+        try:
+            window = int(raw_window)
+        except (TypeError, ValueError):
+            return 0, 0, f'rate_window must be a positive integer, got {raw_window!r}'
+        if window <= 0:
+            return 0, 0, 'rate_window must be a positive integer'
+    return limit, window, None
+
+
+@app.route('/ui/keys', methods=['GET'])
+def ui_keys():
+    """GET /ui/keys — list API keys (prefixes only, never the secret)."""
+    if not _write_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    session = create_session()
+    try:
+        rows = session.query(ApiKey).order_by(ApiKey.created.desc()).all()
+        keys = [_api_key_public(r) for r in rows]
+    finally:
+        session.close()
+    return jsonify({
+        'keys': keys,
+        'collections': [
+            {'id': c.id, 'title': c.title,
+             'members': list(c.members), 'aggregate': bool(c.members)}
+            for c in TAXII_COLLECTIONS
+        ],
+        'primary': TAXII_COLLECTION_ID,
+    }), 200
+
+
+@app.route('/ui/keys', methods=['POST'])
+def ui_keys_create():
+    """POST /ui/keys — mint a key. The plaintext is returned exactly once."""
+    if not _write_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+    label = str(data.get('label') or '').strip()
+    if not label:
+        return jsonify({'error': 'label is required'}), 400
+    if len(label) > _MAX_KEY_LABEL:
+        return jsonify({'error': f'label must be at most {_MAX_KEY_LABEL} characters'}), 400
+
+    scope, err = _validate_key_scope(data.get('collections'))
+    if err:
+        return jsonify({'error': err}), 400
+    expires_at, err = _parse_key_expiry(data.get('expires_days'))
+    if err:
+        return jsonify({'error': err}), 400
+    rate_limit, rate_window, err = _parse_key_rate(data)
+    if err:
+        return jsonify({'error': err}), 400
+
+    plaintext, prefix, secret_hash = _generate_api_key()
+    session = create_session()
+    try:
+        row = ApiKey(
+            id=uuid.uuid4().hex,
+            label=label,
+            prefix=prefix,
+            secret_hash=secret_hash,
+            enabled=True,
+            expires_at=expires_at,
+            collections=json.dumps(scope),
+            rate_limit=rate_limit or None,
+            rate_window=rate_window if rate_limit else None,
+        )
+        session.add(row)
+        session.commit()
+        payload = _api_key_public(row)
+    except Exception as exc:
+        session.rollback()
+        logger.error("Could not create API key: %s", exc)
+        return jsonify({'error': 'could not create the API key'}), 500
+    finally:
+        session.close()
+    # Log the prefix only — the secret must never reach the log.
+    logger.info("API key %s created (label=%r, collections=%s)",
+                prefix, label, ','.join(scope))
+    payload['key'] = plaintext
+    payload['message'] = ('Copy this key now — it is shown once and cannot be '
+                          'retrieved again.')
+    return jsonify(payload), 201
+
+
+@app.route('/ui/keys/<key_id>/revoke', methods=['POST'])
+def ui_key_revoke(key_id: str):
+    """POST /ui/keys/<id>/revoke — disable a key (revocation is permanent)."""
+    if not _write_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    session = create_session()
+    try:
+        row = session.query(ApiKey).filter_by(id=key_id).first()
+        if row is None:
+            return jsonify({'error': f'Unknown API key: {key_id}'}), 404
+        if not row.enabled:
+            return jsonify({**_api_key_public(row), 'changed': False}), 200
+        row.enabled = False
+        session.commit()
+        payload = _api_key_public(row)
+    except Exception as exc:
+        session.rollback()
+        logger.error("Could not revoke API key: %s", exc)
+        return jsonify({'error': 'could not revoke the API key'}), 500
+    finally:
+        session.close()
+    logger.info("API key %s revoked via %s", payload['prefix'], _client_ip())
+    return jsonify({**payload, 'changed': True}), 200
 
 
 @app.route('/community/pullers', methods=['GET'])
@@ -3787,12 +4483,11 @@ def import_csv_data():
             'skipped': skipped[:50],
             'error': 'no recognizable rows (check headers/values)',
         }), 400
-    # Import target collection: form/query field, default = primary.
-    cid, err = _collection_param(
+    # Import target collection: form/query field, default = the manual feed.
+    cid, err = _collection_write_target(
         request.form.get('collection') or request.args.get('collection'))
     if err:
         return jsonify({'error': err}), 400
-    cid = cid or TAXII_COLLECTION_ID
     if not _write_allowed():
         return jsonify({'error': 'Unauthorized'}), 401
     try:
@@ -3846,6 +4541,7 @@ class OtxPoller:
         max_indicators_per_pulse: 1000         # cap indicators per pulse
         max_indicators_per_poll: 5000          # total cap per poll
         object_types: [ipv4-addr, domain-name, file-hash]
+        ingest_collection: comm_intel          # OUR collection to write into
     """
 
     SOURCE = 'otx'
@@ -3862,6 +4558,13 @@ class OtxPoller:
         self.object_types = self.config.get(
             'object_types', ['ipv4-addr', 'domain-name', 'file-hash']
         )
+        # Which of OUR collections this pull lands in. Deliberately NOT the
+        # `collection` key — on a TAXII puller that one names the *upstream*
+        # remote collection. A config pointing this at an aggregate is
+        # ignored (with a warning) so community data can never be filed
+        # under the union.
+        self.ingest_collection = _resolve_ingest_target(
+            self.config.get('ingest_collection'), DEFAULT_COMMUNITY_COLLECTION_ID)
         self.enabled = bool(self.config.get('enabled', False))
         self._stop = False
         self._thread: Optional[threading.Thread] = None
@@ -4012,7 +4715,8 @@ class OtxPoller:
             save_puller_state('otx', 'ok', 0, 'no new indicators')
             return 0
 
-        added = ingest_objects(stix_objects, mode='merge', source=self.SOURCE)
+        added = ingest_objects(stix_objects, mode='merge', source=self.SOURCE,
+                               collection=self.ingest_collection)
         self.last_poll_at = datetime.utcnow()
         self.last_poll_added = added
         save_puller_state('otx', 'ok', added, f'{added} object(s) ingested')
@@ -4029,6 +4733,7 @@ class OtxPoller:
             'enabled': self.enabled,
             'running': bool(self._thread and self._thread.is_alive()),
             'base_url': self.base_url,
+            'ingest_collection': self.ingest_collection,
             'last_sync': st.get('last_sync'),
             'last_added': st.get('last_added', 0),
             'last_status': st.get('last_status'),
@@ -4302,9 +5007,10 @@ class TaxiiPuller:
         base_url: https://server/taxii2/  # API Root URL (trailing slash ok)
         username: user
         password: pass
-        collection: threat-intel         # collection id to poll
+        collection: threat-intel         # UPSTREAM collection id to poll
         poll_interval: 300
         max_objects_per_poll: 5000
+        ingest_collection: comm_intel    # OUR collection to write into
         enabled: true
     """
 
@@ -4316,7 +5022,11 @@ class TaxiiPuller:
         self.base_url = (self.config.get('base_url') or '').rstrip('/')
         self.username = self.config.get('username') or ''
         self.password = self.config.get('password') or ''
+        # `collection` is the REMOTE (upstream) collection this puller reads.
+        # Where the objects land on THIS server is `ingest_collection`.
         self.collection = (self.config.get('collection') or '').strip().lstrip('/')
+        self.ingest_collection = _resolve_ingest_target(
+            self.config.get('ingest_collection'), DEFAULT_COMMUNITY_COLLECTION_ID)
         self.poll_interval = int(self.config.get('poll_interval', 300))
         self.max_objects_per_poll = int(self.config.get('max_objects_per_poll', 5000))
         self.enabled = bool(self.config.get('enabled', False))
@@ -4396,7 +5106,8 @@ class TaxiiPuller:
             save_puller_state(self.state_id, 'ok', 0, 'no new objects')
             return 0, None
 
-        added = ingest_objects(stix_objects, mode='merge', source=self.name)
+        added = ingest_objects(stix_objects, mode='merge', source=self.name,
+                               collection=self.ingest_collection)
         save_puller_state(self.state_id, 'ok', added, f'{added} object(s) ingested')
         return added, None
 
@@ -4427,6 +5138,7 @@ class TaxiiPuller:
             'running': bool(self._thread and self._thread.is_alive()),
             'base_url': self.base_url,
             'collection': self.collection,
+            'ingest_collection': self.ingest_collection,
             'last_sync': st.get('last_sync'),
             'last_added': st.get('last_added', 0),
             'last_status': st.get('last_status'),

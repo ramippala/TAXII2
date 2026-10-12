@@ -49,7 +49,7 @@ Vision One (see [Intel Filter](#intel-filter-filtering-between-server-and-vision
 ### Components
 
 1. **Flask REST API (TAXII 2 Server)** — Hosts TAXII 2.1 protocol endpoints and custom REST endpoints for feed management, UI login/session, community-source control, auth, subscriptions, and health.
-2. **Web UI dashboard** — Single self-contained `intel-ui.html` behind a login (`ui.auth`). Organized into four tabs: **Feed** (the current feed with per-row **source** and **gate** badges, a **collection** selector when multiple collections exist, **search / type & status filters / pagination**, withheld-by-filter panel, and manual entry/publish), **Intel graph** (a dashboard of the fed intel — KPI tiles plus bar charts for **by category** (IP / domain / file hash / …), **by source**, **confidence distribution**, **pulled-over-time**, **withheld-by-filter**, and **top labels** (donut, share of label occurrences); scope switch Community / Manual / All), **Community sources** (puller status + "Pull now", with the same **search + pagination**), and **Import CSV / Excel** (GT-team ad-hoc import: `.csv` or `.xlsx`). Serves all intel (the gate only affects what Vision One gets).
+2. **Web UI dashboard** — Single self-contained `intel-ui.html` behind a login (`ui.auth`). Organized into five tabs: **Feed** (the current feed with per-row **source** and **gate** badges, a **collection** selector when multiple collections exist, **search / type & status filters / pagination**, withheld-by-filter panel, and manual entry/publish), **Intel graph** (a dashboard of the fed intel — KPI tiles plus bar charts for **by category** (IP / domain / file hash / …), **by source**, **confidence distribution**, **pulled-over-time**, **withheld-by-filter**, and **top labels** (donut, share of label occurrences); scope switch Community / Manual / All), **Community sources** (puller status + "Pull now", with the same **search + pagination**), and **Import CSV / Excel** (GT-team ad-hoc import: `.csv` or `.xlsx`), and **API keys** (generate/revoke collection-scoped TAXII credentials). Serves all intel (the gate only affects what Vision One gets).
 3. **STIX 2.1 Store** — Stores threat intelligence objects (IPs, file hashes, domains, URLs, emails, indicators, malware / threat-actor / campaign SDOs, and STIX *relationships* — a real graph, not just flat IOCs) in SQLite (or PostgreSQL). The database is the source of truth for what is served: TAXII polls read the stored rows directly (with a composite index on `(modified, stix_id)` for keyset pagination), and an in-memory copy is kept as a dashboard/coordination cache. Every object carries a `source` tag (`manual` | `otx` | a `taxii_pullers` name) and a `collection_id` (see [Multiple collections](#multiple-collections--per-client-rbac)) so manual and community intel coexist cleanly. Puller sync state (`last_sync`, `last_added`) is persisted in a `puller_state` table so delta pulls survive restarts.
 4. **OTX Community Puller** — Background thread that periodically pulls indicators (IPv4, domains, file hashes) from **AlienVault OTX** public pulses and merges them into the feed tagged `source='otx'`. Off by default; can also be fired on demand from the UI.
 5. **Third-party TAXII 2.1 Pullers** — One generic puller per `taxii_pullers:` entry. Polls `GET {api_root}collections/{collection}/objects/?since=` from any TAXII 2.1 server (Basic auth, `application/taxii+json;version=2.1`), maps STIX 2.1 objects into the feed in merge mode tagged with the puller's `name`. Off by default per entry.
@@ -162,13 +162,18 @@ security:
   secret_key: ${FLASK_SECRET}
 
 taxii:
-  collection_id: 'threat-intel'          # collection Vision One polls
-  # TAXII client credentials (HTTP Basic) — Vision One is configured with these
-  auth:
-    username: 'your-taxii-username'
-    password: 'your-taxii-password'
+  # The collections this server serves. The AGGREGATE must come first: the
+  # first entry is the primary collection, i.e. what Vision One polls.
+  collections:
+    - id: threat_intel                    # union of the two below
+      members: [gt_intel, comm_intel]
+      auth:                               # what Vision One is configured with
+        username: 'your-taxii-username'
+        password: 'your-taxii-password'
+    - id: gt_intel                        # manual entry + CSV/Excel imports
+    - id: comm_intel                      # OTX + third-party TAXII pullers
 
-# Web UI dashboard login (SEPARATE from taxii.auth above)
+# Web UI dashboard login (SEPARATE from the TAXII credentials above)
 ui:
   auth:
     username: 'admin'
@@ -286,8 +291,9 @@ authenticate with it, so you don't re-enter anything until it expires
 
 Once logged in, the **TAXII Feed Manager** dashboard opens on the **Feed** tab.
 Use the top tabs to switch between **Feed**, **Intel graph**, **Community
-sources**, and **Import CSV / Excel** (each is a deep link — the URL hash
-updates, so `#graph` / `#sources` / `#import` open that tab directly). On the
+sources**, **Import CSV / Excel**, and **API keys** (each is a deep link — the
+URL hash updates, so `#graph` / `#sources` / `#import` / `#keys` open that tab
+directly). On the
 **Feed** tab you can:
 
 1. **Current feed** — an editable table of everything in the feed. Each row
@@ -610,7 +616,10 @@ These drive the dashboard login. They are independent of `taxii.auth`.
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /ui/session` | Current session: `{"authenticated": bool, "user": str\|null}` |
-| `GET /ui/collections` | Collection registry for the dashboard selector: `{"collections": [{id,title}], "primary": id}` |
+| `GET /ui/collections` | Collection registry for the dashboard selector: `{"collections": [{id,title,members,aggregate}], "primary": id, "manual": id, "community": id}` — `manual`/`community` are where the dashboard routes a write, since an aggregate is read-only |
+| `GET /ui/keys` | Issued API keys (prefix, label, scope, expiry, last used, enabled) — never the secret. Requires a writer principal |
+| `POST /ui/keys` | Body `{"label", "collections": [id…], "expires_days"?, "rate_limit"?, "rate_window"?}`. Returns the plaintext key **once** (`201`). Requires a writer principal |
+| `POST /ui/keys/<id>/revoke` | Disable a key permanently |
 | `GET /ui/stats` | Aggregates for the **Intel graph** tab. `?scope=community\|manual\|all` (default community) and `?collection=<id>`: totals, `categories`, `by_source`, `withheld_reasons`, `confidence` (histogram), `timeline`, `top_labels`. |
 | `POST /ui/login` | Body `{"username","password"}` checked against `ui.auth`. On success sets the http-only `taxii2_ui_session` cookie (signed with `security.secret_key`, lifetime `ui.session_ttl`); `401` on bad credentials. |
 | `POST /ui/logout` | Deletes the session cookie. |
@@ -686,17 +695,21 @@ discovery → collections → get-objects all pass.
 
 ```yaml
 taxii:
-  collection_id: 'threat-intel'      # the collection Vision One polls
-  collection_title: 'Custom Threat Intelligence Feed'
-  auth:
-    username: 'admin'                 # TAXII client username
-    password: 'admin'                 # TAXII client password
+  collections:
+    - id: threat_intel                # the union Vision One polls (primary)
+      members: [gt_intel, comm_intel]
+      auth:
+        username: 'admin'             # TAXII client username
+        password: 'admin'             # TAXII client password
+    - id: gt_intel                    # manual intel
+    - id: comm_intel                  # pulled community intel
 ```
 
 ### Step 2: Feed intel
 
 Add objects via the web UI (`http://<server>:5000/`) or `POST /feed/ingest`.
-They are stored in the database and served from the TAXII collection.
+They are stored in `gt_intel` (the manual feed) and served — together with the
+community feed — from the `threat_intel` union that Vision One polls.
 
 ### Step 3: Point Vision One at this server
 
@@ -706,14 +719,14 @@ In Vision One, create a TAXII 2.1 data source / feed subscription:
 |-------|-------|
 | **URL / Endpoint** | `http://<this-server>:5000/taxii2/` |
 | **Protocol** | TAXII 2.1 |
-| **Collection** | `threat-intel` |
-| **Username** | `admin` (from `taxii.auth`) |
-| **Password** | `admin` (from `taxii.auth`) |
+| **Collection** | `threat_intel` |
+| **Username** | `admin` (from the aggregate's `auth:`) |
+| **Password** | `admin` (from the aggregate's `auth:`) |
 | **Poll interval** | 15–30 minutes |
 | **Object types** | IPv4, domain, file hash (indicator) |
 
 The client does: discover `/taxii2/` → list `/taxii2/collections/` → poll
-`/taxii2/collections/threat-intel/objects/`, receiving a STIX 2.1 JSON bundle
+`/taxii2/collections/threat_intel/objects/`, receiving a STIX 2.1 JSON bundle
 wrapped in a TAXII 2.1 message.
 
 ### TAXII 2.1 endpoints exposed
@@ -735,9 +748,9 @@ TAXII 2.1 filtering is also supported:
 
 ```bash
 # only domains
-curl -u admin:admin 'http://localhost:5000/taxii2/collections/threat-intel/objects/?match[type]=domain-name'
+curl -u admin:admin 'http://localhost:5000/taxii2/collections/threat_intel/objects/?match[type]=domain-name'
 # only specific objects
-curl -u admin:admin 'http://localhost:5000/taxii2/collections/threat-intel/objects/?match[id]=domain-name--evil-example-com'
+curl -u admin:admin 'http://localhost:5000/taxii2/collections/threat_intel/objects/?match[id]=domain-name--evil-example-com'
 ```
 
 **Pagination (TAXII 2.1 §5.3):** `?limit=N` caps a page and the response
@@ -745,9 +758,9 @@ carries `more` + a `next` cursor (keyset-based on `(modified, stix_id)`, so
 pages stay consistent while the feed changes and never loop):
 
 ```bash
-curl -u admin:admin 'http://localhost:5000/taxii2/collections/threat-intel/objects/?limit=100'
+curl -u admin:admin 'http://localhost:5000/taxii2/collections/threat_intel/objects/?limit=100'
 # -> {..., "more": true, "next": "<opaque-cursor>", ...}
-curl -u admin:admin 'http://localhost:5000/taxii2/collections/threat-intel/objects/?limit=100&next=<opaque-cursor>'
+curl -u admin:admin 'http://localhost:5000/taxii2/collections/threat_intel/objects/?limit=100&next=<opaque-cursor>'
 ```
 
 Malformed `limit`/`since`/`next` values return a TAXII `400` (error code
@@ -783,7 +796,7 @@ stand-in is the OASIS reference client, `taxii2-client`.
 curl -u admin:admin http://localhost:5000/taxii2/
 
 # 2. Poll objects (raw TAXII 2.1 message envelope)
-curl -u admin:admin http://localhost:5000/taxii2/collections/threat-intel/objects/
+curl -u admin:admin http://localhost:5000/taxii2/collections/threat_intel/objects/
 
 # 3. One-liner with the official OASIS reference client (recommended)
 pip install taxii2-client
@@ -797,6 +810,7 @@ RBAC). Exits non-zero on any failure, so it can gate a deploy:
 ```bash
 pip install taxii2-client requests
 TAXII_URL=http://localhost:5000/taxii2/ TAXII_USER=admin TAXII_PASSWORD=admin \
+  TAXII_COLLECTION=threat_intel \
   TAXII_PREMIUM_USER=<2nd-collection-user> TAXII_PREMIUM_PASSWORD=<2nd-collection-pass> \
   python tests/verify_reference_client.py
 ```
@@ -828,27 +842,40 @@ own (see Step 3). They are optional helpers (all off by default):
 > also use *merge* mode. This keeps hand-fed intel and pulled community
 > intel independent of each other.
 
-## Multiple Collections (per-client RBAC)
+## Collections: segregation, the aggregate, and scoped API keys
 
-The server ships as a **single collection** (`threat-intel`, one credential
-set) — Vision One's setup. To serve a *second* consumer (a firewall, a SIEM,
-a partner) a **different view with different credentials**, list collections
-under `taxii.collections:` in `config.yaml`. When that list is present it
-**replaces** the legacy `collection_id` / `auth` keys:
+The feed is split by **provenance**, and consumers get exactly the slice they
+should have:
+
+| Collection | Contents | Written by |
+|---|---|---|
+| `gt_intel` | hand-curated ground truth | web UI entry + CSV/XLSX import |
+| `comm_intel` | pulled community intel | OTX + third-party TAXII pullers |
+| `threat_intel` | **the union of the two** | nobody — it is an aggregate |
+
+`threat_intel` is listed **first**, which makes it the primary collection: the
+default target of the dashboard and of any TAXII read that names no
+collection. That is what Vision One polls, so it keeps seeing everything.
+
+An **aggregate** is a collection with a `members:` list. It serves the union of
+its members' objects and owns no rows of its own, so it is **read-only**: a
+write naming it is rejected with `400` telling you which members to use. Members
+must be other *leaf* collections (a nested aggregate is dropped with a warning,
+keeping the union a flat one-level fact), and an aggregate left with no valid
+member is a **startup error** — a silently empty feed is the one failure that
+looks like "no intel yet". `GET /taxii2/collections/<id>/` advertises the union
+in `meta.members`.
 
 ```yaml
 taxii:
   collections:
-    - id: threat-intel          # feeds Vision One (primary)
-      title: Custom Threat Intelligence Feed
+    - id: threat_intel               # primary: the union Vision One polls
+      members: [gt_intel, comm_intel]
       auth:
         username: '${TAXII_AUTH_USER}'
         password: '${TAXII_AUTH_PASSWORD}'
-    - id: premium                # a second consumer's view
-      title: Premium Feed
-      auth:
-        username: '${PREMIUM_TAXII_USER}'
-        password: '${PREMIUM_TAXII_PASS}'
+    - id: gt_intel                   # manual intel
+    - id: comm_intel                 # pulled community intel
 ```
 
 **How RBAC works:**
@@ -856,28 +883,66 @@ taxii:
 - **One credential set per collection.** A TAXII client authenticates with
   the collection's own HTTP Basic credentials (or `X-Taxii-*` headers).
 - **Collection listing is scoped.** `GET /taxii2/collections/` returns only
-  the collections the authenticated principal's credentials may read, so a
-  premium-only client never sees the primary feed's existence, let alone
-  its objects. Get Objects for a collection the credentials can't read
-  returns `401`.
-- **The legacy single credential set is a "global" principal.** If you keep
-  the old `taxii.auth` / app-level credentials, they can read every
-  collection (backward compatible — existing clients keep working).
+  the collections the authenticated principal may read. Holding the
+  *aggregate's* credentials does **not** grant a direct read of a member:
+  the union is one collection, its members are others. Get Objects for a
+  collection the credentials can't read returns `401`.
 - **Objects are stored per collection.** Every object carries a
   `collection_id`; the data endpoints take an optional `collection` field /
   `?collection=` (web UI: the **Collection** selector on the Feed tab;
   default = the primary collection). `POST /feed/ingest {"collection":
-  "premium", ...}` targets a specific collection, `GET /objects?collection=
-  premium` views it, and "Purge all" now wipes *only the selected
-  collection* (a bare `DELETE /feed/purge` without `?collection=` still
-  wipes everything, for scripts). Community pullers (OTX / third-party
-  TAXII) always feed the primary collection.
+  "gt_intel", ...}` targets a specific collection and `GET
+  /objects?collection=gt_intel` views it. "Purge all" on the union clears
+  the **union of its members** (not everything): a bare `DELETE /feed/purge`
+  with no `?collection=` still wipes every collection, for scripts.
 - **Writes are operator-only.** Every item above is a *write*: it needs the
   dashboard session, the UI credentials or `taxii.admin_auth`. A collection's
   TAXII credentials can list and read that collection and nothing else.
+- **Where the pollers write** is per-puller config: `otx.ingest_collection`
+  and each `taxii_pullers[].ingest_collection`, defaulting to `comm_intel`.
+  It is *not* the puller's `collection` key — on a TAXII puller that one
+  names the **upstream** collection being read. Pointing `ingest_collection`
+  at an aggregate is ignored with a warning, so community data can never be
+  filed under the union.
 
-See the commented `collections:` block in `config.yaml` and the
-`PREMIUM_TAXII_USER` / `PREMIUM_TAXII_PASS` keys in `.env.example`.
+### API keys (scoped consumer credentials)
+
+Instead of a second static password per consumer, generate one in the
+dashboard's **API keys** tab. A key is scoped to one or more collections,
+can expire, and can carry its own rate limit.
+
+- **Format** `taxii_<prefix>_<secret>`, used exactly like a password: the
+  **prefix** as the username and the key as the password
+  (`curl -u <prefix>:<key>`). Vision One speaks HTTP Basic, so paste them
+  into its username/password fields; the `X-Taxii-Username` /
+  `X-Taxii-Password` headers work too.
+- **Stored hashed.** Only the cleartext prefix (indexed, for O(1) lookup and
+  for the listing) and a SHA-256 of the secret are persisted. A fast hash is
+  deliberate: the secret is high-entropy random, so there is nothing to
+  brute-force, and this runs on every poll. The plaintext is shown **once**,
+  at creation, and is never logged (log lines carry the prefix only).
+- **Read-only.** A key authenticates reads; every write still needs the
+  dashboard session, the UI credentials or `taxii.admin_auth`.
+- **Rate limiting.** An optional sliding window per key returns `429` with
+  `Retry-After` once exceeded. It is in-memory and per-process — the same
+  caveat as the auth-failure throttle: it resets on restart, and scaling to
+  multiple workers would need a shared store (Redis). The server is
+  deliberately single-process (waitress), so one table is the whole picture.
+- **Revocation** is permanent: `POST /ui/keys/<id>/revoke` disables the key,
+  and it starts failing authentication immediately.
+
+**Upgrading from the pre-segregation single collection.** The old rows lived
+under `collection_id='threat-intel'`, which no longer names anything. On the
+first boot with a `members:` aggregate configured, they are re-homed once —
+`source='manual'` (or unknown) to `gt_intel`, everything else to
+`comm_intel` — before the server starts serving, so there is no empty-feed
+window. The migration is idempotent and does nothing when the legacy id is
+still a configured collection. Note that the old id is **gone**: a client
+configured with `/taxii2/collections/threat-intel/objects/` must be pointed
+at `threat_intel`.
+
+See the `collections:` block in `config.yaml` and the `TAXII_AUTH_USER` /
+`TAXII_AUTH_PASSWORD` keys in `.env.example`.
 
 ## Indicator Lifecycle (TTL & revocation)
 

@@ -7,6 +7,7 @@ Vision One integration, and the OTX community-intel puller.
 
 import sys
 import os
+import base64
 import io
 import re
 import tempfile
@@ -48,12 +49,13 @@ import server as _server
 
 
 def _reset_db():
-    """Purge all feed rows (all sources) between tests."""
+    """Purge all feed rows (all sources) and issued API keys between tests."""
     import server
     session = server.create_session()
     try:
         memory_store.clear()
         session.query(server.STIXObject).delete()
+        session.query(server.ApiKey).delete()
         session.commit()
     finally:
         session.close()
@@ -808,7 +810,7 @@ class TestTaxiiServer(unittest.TestCase):
     def _taxii_values(self):
         """Values actually served to Vision One via the TAXII collection."""
         r = self.client.get(
-            '/taxii2/collections/threat-intel/objects/',
+            '/taxii2/collections/threat_intel/objects/',
             headers=self._get_auth_headers(),
         )
         self.assertEqual(r.status_code, 200)
@@ -1058,7 +1060,7 @@ class TestRevocationAndTTL(unittest.TestCase):
 
     def _bundle(self, qs=''):
         r = self.client.get(
-            '/taxii2/collections/threat-intel/objects/' + qs,
+            '/taxii2/collections/threat_intel/objects/' + qs,
             headers=self.auth,
         )
         self.assertEqual(r.status_code, 200)
@@ -1665,7 +1667,7 @@ class TestExtendedTypesAndValidation(unittest.TestCase):
 
     def _bundle(self, qs=''):
         r = self.client.get(
-            '/taxii2/collections/threat-intel/objects/' + qs,
+            '/taxii2/collections/threat_intel/objects/' + qs,
             headers=self.auth,
         )
         self.assertEqual(r.status_code, 200)
@@ -1847,7 +1849,7 @@ class TestCommunitySdoAndFidelity(unittest.TestCase):
         self.auth = {'X-Taxii-Username': 'u', 'X-Taxii-Password': 'p'}
 
     def _served(self):
-        r = self.client.get('/taxii2/collections/threat-intel/objects/',
+        r = self.client.get('/taxii2/collections/threat_intel/objects/',
                             headers=self.auth)
         self.assertEqual(r.status_code, 200)
         return r.get_json()['content']['content']['objects']
@@ -1944,7 +1946,7 @@ class TestTaxiiPagination(unittest.TestCase):
 
     def _page(self, qs):
         r = self.client.get(
-            '/taxii2/collections/threat-intel/objects/' + qs,
+            '/taxii2/collections/threat_intel/objects/' + qs,
             headers=self.auth)
         self.assertEqual(r.status_code, 200)
         return r.get_json()
@@ -2020,18 +2022,18 @@ class TestTaxiiPagination(unittest.TestCase):
         self._ingest_n(3)
         for bad in ('0', '-1', 'abc', '1.5'):
             r = self.client.get(
-                '/taxii2/collections/threat-intel/objects/?limit=' + bad,
+                '/taxii2/collections/threat_intel/objects/?limit=' + bad,
                 headers=self.auth)
             self.assertEqual(r.status_code, 400, f'limit={bad}')
 
     def test_bad_since_and_bad_next_400(self):
         self._ingest_n(2)
         r = self.client.get(
-            '/taxii2/collections/threat-intel/objects/?since=garbage',
+            '/taxii2/collections/threat_intel/objects/?since=garbage',
             headers=self.auth)
         self.assertEqual(r.status_code, 400)
         r = self.client.get(
-            '/taxii2/collections/threat-intel/objects/?next=%%%',
+            '/taxii2/collections/threat_intel/objects/?next=%%%',
             headers=self.auth)
         self.assertEqual(r.status_code, 400)
 
@@ -2480,6 +2482,513 @@ class TestCollectionsRbac(unittest.TestCase):
         self.assertEqual(r.get_json()['count'], 1)
 
 
+class _CollectionRegistryTestCase(unittest.TestCase):
+    """Shared plumbing for tests that swap the collection registry.
+
+    Restores the module-level registry (and the two write-target constants)
+    on teardown, and keeps the per-IP auth-failure throttle from leaking
+    between tests — these tests deliberately provoke 401s.
+    """
+
+    _GLOBALS = ('TAXII_COLLECTIONS', 'TAXII_COLLECTION_MAP',
+                'TAXII_COLLECTION_ID', 'TAXII_COLLECTION_TITLE',
+                'DEFAULT_MANUAL_COLLECTION_ID',
+                'DEFAULT_COMMUNITY_COLLECTION_ID')
+
+    def _save_registry(self):
+        self._saved = {k: getattr(_server, k) for k in self._GLOBALS}
+        _server._auth_failures.clear()
+        _server._api_key_hits.clear()
+
+    def _restore_registry(self):
+        for k, v in self._saved.items():
+            setattr(_server, k, v)
+        app.config.pop('TAXII_ADMIN_AUTH', None)
+        _server._auth_failures.clear()
+        _server._api_key_hits.clear()
+
+    def _set_registry(self, collections):
+        """Install ``collections`` as the registry, aggregate first."""
+        _server.TAXII_COLLECTIONS = list(collections)
+        _server.TAXII_COLLECTION_MAP = {c.id: c for c in collections}
+        _server.TAXII_COLLECTION_ID = collections[0].id
+        _server.TAXII_COLLECTION_TITLE = collections[0].title
+
+
+class TestAggregateCollections(_CollectionRegistryTestCase):
+    """Segregated collections: gt_intel (manual), comm_intel (community) and
+    threat_intel — the read-only aggregate that serves their union.
+    """
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        self._save_registry()
+        cc = _server.CollectionConfig
+        self.gt = cc(id='gt_intel', title='Ground truth', description='manual',
+                     username='gt_user', password='gt_pass')
+        self.comm = cc(id='comm_intel', title='Community', description='pulled',
+                       username='comm_user', password='comm_pass')
+        self.other = cc(id='sandbox', title='Sandbox', description='not a member',
+                        username='s_user', password='s_pass')
+        self.union = cc(id='threat_intel', title='Union', description='union',
+                        username='union_user', password='union_pass',
+                        members=['gt_intel', 'comm_intel'])
+        self._set_registry([self.union, self.gt, self.comm, self.other])
+        _server.DEFAULT_MANUAL_COLLECTION_ID = 'gt_intel'
+        _server.DEFAULT_COMMUNITY_COLLECTION_ID = 'comm_intel'
+        # NO global credential override: only per-collection creds exist.
+        app.config['TAXII_AUTH'] = {'username': '', 'password': ''}
+        app.config['TAXII_ADMIN_AUTH'] = {'username': 'admin', 'password': 'admin'}
+        self.admin_auth = {'X-Taxii-Username': 'admin', 'X-Taxii-Password': 'admin'}
+        self.union_auth = {'X-Taxii-Username': 'union_user',
+                           'X-Taxii-Password': 'union_pass'}
+        self.gt_auth = {'X-Taxii-Username': 'gt_user', 'X-Taxii-Password': 'gt_pass'}
+
+    def tearDown(self):
+        self._restore_registry()
+
+    def _ingest(self, objs, collection=None, headers=None):
+        body = {'stix_objects': objs, 'mode': 'merge'}
+        if collection:
+            body['collection'] = collection
+        return self.client.post('/feed/ingest', json=body,
+                                headers=headers or self.admin_auth)
+
+    def _community(self, objs, collection='comm_intel'):
+        """Write as a community puller would (source != 'manual')."""
+        return _server.ingest_objects(objs, mode='merge', source='otx',
+                                      collection=collection)
+
+    def _placements(self):
+        session = _server.create_session()
+        try:
+            return {r.stix_id: r.collection_id
+                    for r in session.query(_server.STIXObject).all()}
+        finally:
+            session.close()
+
+    def _taxii_values(self, collection, headers):
+        r = self.client.get(f'/taxii2/collections/{collection}/objects/',
+                            headers=headers)
+        self.assertEqual(r.status_code, 200)
+        return {served_value(o)
+                for o in r.get_json()['content']['content']['objects']}
+
+    # --- read path ------------------------------------------------------
+
+    def test_aggregate_serves_the_union_of_its_members(self):
+        self._ingest([_manual_obj('1.1.1.1')])                 # -> gt_intel
+        self._community([_otx_obj('8.8.8.8')])                 # -> comm_intel
+        self.assertEqual(self._placements(), {
+            'ipv4-addr--1-1-1-1': 'gt_intel',
+            'ipv4-addr--8-8-8-8': 'comm_intel',
+        })
+        self.assertEqual(self._taxii_values('threat_intel', self.union_auth),
+                         {'1.1.1.1', '8.8.8.8'})
+        # A member is still its own collection, not the union.
+        self.assertEqual(self._taxii_values('gt_intel', self.gt_auth),
+                         {'1.1.1.1'})
+
+    def test_members_are_isolated_from_each_other(self):
+        self._ingest([_manual_obj('1.1.1.1')])
+        self._community([_otx_obj('8.8.8.8')])
+        # The aggregate credential reads the union ...
+        self.assertEqual(self._taxii_values('threat_intel', self.union_auth),
+                         {'1.1.1.1', '8.8.8.8'})
+        # ... but it grants no direct access to a member ...
+        r = self.client.get('/taxii2/collections/gt_intel/objects/',
+                            headers=self.union_auth)
+        self.assertEqual(r.status_code, 401)
+        # ... and a member credential cannot read a sibling, nor the union.
+        r = self.client.get('/taxii2/collections/comm_intel/objects/',
+                            headers=self.gt_auth)
+        self.assertEqual(r.status_code, 401)
+        r = self.client.get('/taxii2/collections/threat_intel/objects/',
+                            headers=self.gt_auth)
+        self.assertEqual(r.status_code, 401)
+
+    def test_collection_listing_respects_the_scope(self):
+        r = self.client.get('/taxii2/collections/', headers=self.union_auth)
+        self.assertEqual([c['id'] for c in r.get_json()['collections']],
+                         ['threat_intel'])
+        r = self.client.get('/taxii2/collections/', headers=self.gt_auth)
+        self.assertEqual([c['id'] for c in r.get_json()['collections']],
+                         ['gt_intel'])
+
+    def test_collection_resource_advertises_members(self):
+        r = self.client.get('/taxii2/collections/threat_intel/',
+                            headers=self.union_auth)
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertEqual(body['meta']['members'], ['gt_intel', 'comm_intel'])
+        self.assertFalse(body['can_write'])
+        # A leaf advertises no members (it is nobody's union).
+        r = self.client.get('/taxii2/collections/gt_intel/', headers=self.gt_auth)
+        self.assertNotIn('members', r.get_json()['meta'])
+
+    def test_dashboard_defaults_and_column_reads_cover_the_union(self):
+        self._ingest([_manual_obj('1.1.1.1')])
+        self._community([_otx_obj('8.8.8.8')])
+        # /objects and /ui/stats default to the primary (the union) ...
+        r = self.client.get('/objects', headers=self.admin_auth)
+        self.assertEqual({o['value'] for o in r.get_json()['objects']},
+                         {'1.1.1.1', '8.8.8.8'})
+        r = self.client.get('/ui/stats?scope=all', headers=self.admin_auth)
+        self.assertEqual(r.get_json()['total'], 2)
+        # ... and ?collection=<member> narrows it back down.
+        r = self.client.get('/objects?collection=comm_intel', headers=self.admin_auth)
+        self.assertEqual({o['value'] for o in r.get_json()['objects']}, {'8.8.8.8'})
+        r = self.client.get('/feed', headers=self.admin_auth)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'1.1.1.1', r.data)
+        self.assertIn(b'8.8.8.8', r.data)
+
+    # --- write path -----------------------------------------------------
+
+    def test_ingest_defaults_to_the_manual_collection(self):
+        r = self._ingest([_manual_obj('1.1.1.1')])
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()['collection'], 'gt_intel')
+        self.assertEqual(self._placements(), {'ipv4-addr--1-1-1-1': 'gt_intel'})
+
+    def test_write_to_the_aggregate_is_rejected(self):
+        r = self._ingest([_manual_obj('1.1.1.1')], collection='threat_intel')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('aggregate', r.get_json()['error'])
+        self.assertEqual(self._placements(), {})
+
+    def test_csv_import_to_the_aggregate_is_rejected_and_defaults_to_manual(self):
+        payload = 'ip\n1.1.1.1\n'
+        r = self.client.post(
+            '/feed/import-csv',
+            data={'file': (io.BytesIO(payload.encode()), 'gt.csv'),
+                  'collection': 'threat_intel'},
+            headers=self.admin_auth)
+        self.assertEqual(r.status_code, 400)
+        r = self.client.post(
+            '/feed/import-csv',
+            data={'file': (io.BytesIO(payload.encode()), 'gt.csv')},
+            headers=self.admin_auth)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self._placements(), {'ipv4-addr--1-1-1-1': 'gt_intel'})
+
+    def test_replace_ingest_into_a_member_leaves_its_sibling_alone(self):
+        self._ingest([_manual_obj('1.1.1.1')], collection='gt_intel')
+        self._community([_otx_obj('8.8.8.8')])
+        r = self.client.post(
+            '/feed/ingest',
+            json={'stix_objects': [_manual_obj('9.9.9.9')],
+                  'collection': 'gt_intel', 'mode': 'replace'},
+            headers=self.admin_auth)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self._placements(), {
+            'ipv4-addr--9-9-9-9': 'gt_intel',
+            'ipv4-addr--8-8-8-8': 'comm_intel',
+        })
+
+    def test_purging_the_aggregate_clears_members_only(self):
+        self._ingest([_manual_obj('1.1.1.1')])
+        self._community([_otx_obj('8.8.8.8')])
+        self._community([_otx_obj('7.7.7.7')], collection='sandbox')
+        r = self.client.delete('/feed/purge?collection=threat_intel',
+                               headers=self.admin_auth)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()['purged'], 2)
+        # The non-member collection survives (unlike a collection-less purge).
+        self.assertEqual(self._placements(), {'ipv4-addr--7-7-7-7': 'sandbox'})
+
+    def test_purge_without_a_collection_still_wipes_everything(self):
+        self._ingest([_manual_obj('1.1.1.1')])
+        self._community([_otx_obj('7.7.7.7')], collection='sandbox')
+        r = self.client.delete('/feed/purge', headers=self.admin_auth)
+        self.assertEqual(r.get_json()['purged'], 2)
+        self.assertEqual(self._placements(), {})
+
+    # --- community ingest routing ---------------------------------------
+
+    def test_pullers_target_the_configured_ingest_collection(self):
+        p = _server.OtxPoller({'base_url': 'https://x/', 'enabled': False})
+        self.assertEqual(p.ingest_collection, 'comm_intel')
+        t = _server.TaxiiPuller({'name': 't', 'base_url': 'https://x/',
+                                 'collection': 'remote-id'})
+        # `collection` still means the UPSTREAM collection ...
+        self.assertEqual(t.collection, 'remote-id')
+        # ... while the local target defaults to the community leaf.
+        self.assertEqual(t.ingest_collection, 'comm_intel')
+
+    def test_ingest_collection_refuses_the_aggregate(self):
+        # Pointing a poller at the union must not file community data there.
+        t = _server.TaxiiPuller({'name': 't', 'base_url': 'https://x/',
+                                 'collection': 'remote-id',
+                                 'ingest_collection': 'threat_intel'})
+        self.assertEqual(t.ingest_collection, 'comm_intel')
+        # ... nor at an unknown collection.
+        t = _server.TaxiiPuller({'name': 't', 'base_url': 'https://x/',
+                                 'collection': 'remote-id',
+                                 'ingest_collection': 'nope'})
+        self.assertEqual(t.ingest_collection, 'comm_intel')
+
+    # --- migration ------------------------------------------------------
+
+    def _legacy_row(self, stix_id, source):
+        session = _server.create_session()
+        try:
+            session.add(_server.STIXObject(
+                id=stix_id, stix_id=stix_id, object_type='ipv4-addr',
+                collection_id=_server.DEFAULT_COLLECTION_ID, source=source))
+            session.commit()
+        finally:
+            session.close()
+
+    def test_migration_rehomes_legacy_rows_and_is_idempotent(self):
+        self._legacy_row('ipv4-addr--9-9-9-9', 'manual')
+        self._legacy_row('ipv4-addr--8-8-8-8', 'otx')
+        self._legacy_row('ipv4-addr--6-6-6-6', None)
+        self.assertEqual(_server._rehome_aggregate_rows(), 3)
+        self.assertEqual(self._placements(), {
+            'ipv4-addr--9-9-9-9': 'gt_intel',    # manual
+            'ipv4-addr--8-8-8-8': 'comm_intel',  # pulled
+            'ipv4-addr--6-6-6-6': 'gt_intel',    # unknown provenance
+        })
+        # Idempotent: nothing carries the legacy id any more.
+        self.assertEqual(_server._rehome_aggregate_rows(), 0)
+
+    def test_migration_is_a_noop_when_the_feature_is_off(self):
+        # With the legacy id still a collection of its own there is nothing to
+        # re-home: its rows are exactly where they belong.
+        legacy = _server.CollectionConfig(
+            id=_server.DEFAULT_COLLECTION_ID, title='Legacy', description='',
+            username='', password='')
+        self._set_registry([legacy])
+        self._legacy_row('ipv4-addr--9-9-9-9', 'manual')
+        self.assertEqual(_server._rehome_aggregate_rows(), 0)
+        self.assertEqual(self._placements(),
+                         {'ipv4-addr--9-9-9-9': _server.DEFAULT_COLLECTION_ID})
+
+    # --- configuration --------------------------------------------------
+
+    def test_members_are_normalised(self):
+        cfg = _server.CollectionConfig(
+            id='a', title='', description='', username='', password='',
+            members=['b', '', None, 'b', 'a', 'c'])
+        # blanks dropped, duplicates collapsed, self-reference removed
+        self.assertEqual(cfg.members, ['b', 'c'])
+        self.assertTrue(cfg.is_aggregate)
+        self.assertFalse(self.gt.is_aggregate)
+
+    def test_unknown_and_nested_members_are_dropped(self):
+        cc = _server.CollectionConfig
+        inner = cc(id='inner', title='', description='', username='',
+                   password='', members=['leaf'])
+        outer = cc(id='outer', title='', description='', username='',
+                   password='', members=['inner', 'leaf', 'ghost'])
+        leaf = cc(id='leaf', title='', description='', username='', password='')
+        self._set_registry([outer, inner, leaf])
+        _server._validate_collection_members()
+        self.assertEqual(outer.members, ['leaf'])   # nested + unknown dropped
+        self.assertEqual(inner.members, ['leaf'])
+
+    def test_aggregate_with_no_valid_member_is_a_startup_error(self):
+        cc = _server.CollectionConfig
+        broken = cc(id='broken', title='', description='', username='',
+                    password='', members=['ghost'])
+        self._set_registry([broken])
+        with self.assertRaises(ValueError):
+            _server._validate_collection_members()
+
+    def test_config_parses_members_from_the_list_form(self):
+        cfgs = _server._build_collection_configs({'collections': [
+            {'id': 'union', 'members': ['a', 'b']},
+            {'id': 'a'}, {'id': 'b'},
+        ]})
+        self.assertEqual([c.id for c in cfgs], ['union', 'a', 'b'])
+        self.assertEqual(cfgs[0].members, ['a', 'b'])
+        self.assertEqual(cfgs[1].members, [])
+        # The legacy single-collection form yields no members.
+        legacy = _server._build_collection_configs({'collection_id': 'solo'})
+        self.assertEqual(legacy[0].members, [])
+        self.assertEqual(legacy[0].id, 'solo')
+
+    def test_ui_collections_reports_members_and_write_targets(self):
+        r = self.client.get('/ui/collections', headers=self.admin_auth)
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        by_id = {c['id']: c for c in body['collections']}
+        self.assertTrue(by_id['threat_intel']['aggregate'])
+        self.assertEqual(by_id['threat_intel']['members'],
+                         ['gt_intel', 'comm_intel'])
+        self.assertFalse(by_id['gt_intel']['aggregate'])
+        # Writes are routed without the dashboard hardcoding ids.
+        self.assertEqual(body['primary'], 'threat_intel')
+        self.assertEqual(body['manual'], 'gt_intel')
+        self.assertEqual(body['community'], 'comm_intel')
+
+
+class TestApiKeys(_CollectionRegistryTestCase):
+    """Dashboard-issued, collection-scoped API keys."""
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        self._save_registry()
+        cc = _server.CollectionConfig
+        self.alpha = cc(id='alpha', title='Alpha', description='',
+                        username='a_user', password='a_pass')
+        self.beta = cc(id='beta', title='Beta', description='',
+                       username='b_user', password='b_pass')
+        self._set_registry([self.alpha, self.beta])
+        app.config['TAXII_AUTH'] = {'username': '', 'password': ''}
+        app.config['TAXII_ADMIN_AUTH'] = {'username': 'admin', 'password': 'admin'}
+        self.admin_auth = {'X-Taxii-Username': 'admin', 'X-Taxii-Password': 'admin'}
+
+    def tearDown(self):
+        self._restore_registry()
+
+    def _create(self, label='key', collections=('alpha',), **extra):
+        body = {'label': label, 'collections': list(collections)}
+        body.update(extra)
+        return self.client.post('/ui/keys', json=body, headers=self.admin_auth)
+
+    def _basic(self, credentials):
+        """HTTP Basic headers for ``user:password`` — what Vision One speaks."""
+        token = base64.b64encode(credentials.encode('utf-8')).decode('ascii')
+        return {'Authorization': f'Basic {token}'}
+
+    def _use(self, key, path='/taxii2/collections/', with_prefix=True):
+        # A key rides in the password position; the username is its prefix
+        # (or anything else — only the password is inspected).
+        creds = f"{key.split('_')[1]}:{key}" if with_prefix else f"user:{key}"
+        return self.client.get(path, headers=self._basic(creds))
+
+    def test_key_is_returned_once_and_stored_hashed(self):
+        r = self._create(label='vision one', collections=['alpha'])
+        self.assertEqual(r.status_code, 201)
+        body = r.get_json()
+        key = body['key']
+        self.assertTrue(key.startswith('taxii_'))
+        self.assertEqual(body['collections'], ['alpha'])
+        # Stored: only the prefix and a hash, never the secret.
+        session = _server.create_session()
+        try:
+            row = session.query(_server.ApiKey).one()
+        finally:
+            session.close()
+        self.assertNotIn(key, (row.secret_hash or ''))
+        self.assertEqual(row.secret_hash,
+                         _server._hash_api_key_secret(key))
+        self.assertTrue(key.startswith('taxii_' + row.prefix + '_'))
+        # The listing exposes the prefix, never the secret.
+        r = self.client.get('/ui/keys', headers=self.admin_auth)
+        listed = r.get_json()['keys']
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]['prefix'], row.prefix)
+        self.assertNotIn('key', listed[0])
+        self.assertNotIn('secret_hash', listed[0])
+
+    def test_key_reads_only_its_own_scope(self):
+        key = self._create(collections=['alpha']).get_json()['key']
+        r = self._use(key)
+        self.assertEqual([c['id'] for c in r.get_json()['collections']], ['alpha'])
+        self.assertEqual(
+            self._use(key, '/taxii2/collections/alpha/objects/').status_code, 200)
+        # The sibling collection is not readable with a key scoped elsewhere.
+        self.assertEqual(
+            self._use(key, '/taxii2/collections/beta/objects/').status_code, 401)
+
+    def test_key_never_writes(self):
+        key = self._create(collections=['alpha']).get_json()['key']
+        auth = self._basic(key)
+        r = self.client.post('/feed/ingest',
+                             json={'stix_objects': [_manual_obj('1.1.1.1')]},
+                             headers=auth)
+        self.assertEqual(r.status_code, 401)
+        r = self.client.delete('/feed/purge?collection=alpha', headers=auth)
+        self.assertEqual(r.status_code, 401)
+        r = self.client.post('/community/pull/otx', headers=auth)
+        self.assertEqual(r.status_code, 401)
+
+    def test_revoked_key_is_rejected_and_others_survive(self):
+        a = self._create(label='a', collections=['alpha']).get_json()
+        b = self._create(label='b', collections=['beta']).get_json()
+        self.assertEqual(self._use(a['key']).status_code, 200)
+        r = self.client.post(f"/ui/keys/{a['id']}/revoke", headers=self.admin_auth)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self._use(a['key']).status_code, 401)
+        # A different key is untouched.
+        self.assertEqual(self._use(b['key']).status_code, 200)
+        # Revoking twice reports no change rather than erroring.
+        r = self.client.post(f"/ui/keys/{a['id']}/revoke", headers=self.admin_auth)
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.get_json()['changed'])
+
+    def test_expired_key_is_rejected(self):
+        created = self._create(expires_days=1).get_json()
+        self.assertEqual(self._use(created['key']).status_code, 200)
+        session = _server.create_session()
+        try:
+            row = session.query(_server.ApiKey).filter_by(id=created['id']).one()
+            row.expires_at = datetime.utcnow() - timedelta(minutes=1)
+            session.commit()
+        finally:
+            session.close()
+        self.assertEqual(self._use(created['key']).status_code, 401)
+
+    def test_rate_limit_is_per_key(self):
+        limited = self._create(label='limited', collections=['alpha'],
+                               rate_limit=2, rate_window=60).get_json()
+        other = self._create(label='other', collections=['beta']).get_json()
+        self.assertEqual(self._use(limited['key']).status_code, 200)
+        self.assertEqual(self._use(limited['key']).status_code, 200)
+        r = self._use(limited['key'])
+        self.assertEqual(r.status_code, 429)
+        self.assertIn('Retry-After', r.headers)
+        self.assertGreaterEqual(int(r.headers['Retry-After']), 1)
+        # A second key is unaffected by the first key's window.
+        self.assertEqual(self._use(other['key']).status_code, 200)
+
+    def test_key_creation_validates_its_input(self):
+        self.assertEqual(self._create(label='').status_code, 400)
+        self.assertEqual(self._create(collections=[]).status_code, 400)
+        self.assertEqual(self._create(collections=['nope']).status_code, 400)
+        self.assertEqual(self._create(expires_days=0).status_code, 400)
+        self.assertEqual(self._create(rate_limit=-1).status_code, 400)
+        self.assertEqual(self._create(rate_window=0).status_code, 400)
+
+    def test_key_management_requires_a_writer(self):
+        # A read-only collection credential cannot mint or list keys.
+        self.assertEqual(
+            self.client.get('/ui/keys', headers={
+                'X-Taxii-Username': 'a_user', 'X-Taxii-Password': 'a_pass',
+            }).status_code, 401)
+        self.assertEqual(self.client.get('/ui/keys').status_code, 401)
+        self.assertEqual(self.client.post('/ui/keys', json={
+            'label': 'x', 'collections': ['alpha']}).status_code, 401)
+
+    def test_revoking_an_unknown_key_is_404(self):
+        r = self.client.post('/ui/keys/nope/revoke', headers=self.admin_auth)
+        self.assertEqual(r.status_code, 404)
+
+    def test_aggregate_scoped_key_reads_the_union(self):
+        # The Vision One case: one key that sees manual + community intel.
+        cc = _server.CollectionConfig
+        union = cc(id='threat_intel', title='Union', description='',
+                   username='', password='', members=['alpha', 'beta'])
+        self._set_registry([union, self.alpha, self.beta])
+        _server.DEFAULT_MANUAL_COLLECTION_ID = 'alpha'
+        _server.DEFAULT_COMMUNITY_COLLECTION_ID = 'beta'
+        _server.ingest_objects([_manual_obj('1.1.1.1')], mode='merge',
+                               source='manual', collection='alpha')
+        _server.ingest_objects([_otx_obj('8.8.8.8')], mode='merge',
+                               source='otx', collection='beta')
+        key = self._create(collections=['threat_intel']).get_json()['key']
+        r = self._use(key, '/taxii2/collections/threat_intel/objects/')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(
+            {served_value(o) for o in r.get_json()['content']['content']['objects']},
+            {'1.1.1.1', '8.8.8.8'})
+
+
 class TestSecurityHardening(unittest.TestCase):
     """Response headers, cookie flags, upload guards and auth throttling."""
 
@@ -2563,7 +3072,7 @@ class TestSecurityHardening(unittest.TestCase):
         # Nothing executed: the table is intact and every value round-trips
         # verbatim as data...
         served = self.client.get(
-            '/taxii2/collections/threat-intel/objects/',
+            '/taxii2/collections/threat_intel/objects/',
             headers=self.auth).get_json()['content']['content']['objects']
         values = {served_value(o) for o in served}
         for literal in ("=cmd|' /C calc'!A0", '<script>alert(1)</script>',
@@ -2650,14 +3159,14 @@ class TestSecurityHardening(unittest.TestCase):
             self.client.get('/taxii2/collections/nope/objects/').status_code,
             401)
         self.assertEqual(
-            self.client.get('/taxii2/collections/threat-intel/objects/'
+            self.client.get('/taxii2/collections/threat_intel/objects/'
                             ).status_code, 401)
         # Authenticated: a real collection resolves, an unknown one 404s.
         self.assertEqual(
             self.client.get('/taxii2/collections/nope/objects/',
                             headers=self.auth).status_code, 404)
         self.assertEqual(
-            self.client.get('/taxii2/collections/threat-intel/objects/',
+            self.client.get('/taxii2/collections/threat_intel/objects/',
                             headers=self.auth).status_code, 200)
 
 
@@ -2681,7 +3190,7 @@ class TestServedTimestamps(unittest.TestCase):
         app.config.pop('TAXII_ADMIN_AUTH', None)
 
     def _served(self):
-        r = self.client.get('/taxii2/collections/threat-intel/objects/',
+        r = self.client.get('/taxii2/collections/threat_intel/objects/',
                             headers=self.auth)
         self.assertEqual(r.status_code, 200)
         return r.get_json()['content']['content']['objects']
@@ -2753,7 +3262,7 @@ class TestServedTimestamps(unittest.TestCase):
         self._ingest('2.2.2.2')
         watermark = self._served()[0]['modified']  # the backdated object
         r = self.client.get(
-            '/taxii2/collections/threat-intel/objects/?added_after='
+            '/taxii2/collections/threat_intel/objects/?added_after='
             + urllib.parse.quote(watermark),
             headers=self.auth)
         self.assertEqual(r.status_code, 200)
@@ -2786,7 +3295,7 @@ class TestFeedReadsFromTheDatabase(unittest.TestCase):
         # such objects silently, shortening pages and dropping data.
         with _server.memory_lock:
             _server.memory_store.clear()
-        resp = self.client.get('/taxii2/collections/threat-intel/objects/',
+        resp = self.client.get('/taxii2/collections/threat_intel/objects/',
                                headers=self.auth)
         self.assertEqual(resp.status_code, 200)
         values = {served_value(o)
