@@ -57,6 +57,7 @@ def _reset_db():
         session.query(server.STIXObject).delete()
         session.query(server.ApiKey).delete()
         session.query(server.UIUser).delete()
+        session.query(server.AuditEvent).delete()
         session.commit()
     finally:
         session.close()
@@ -3603,6 +3604,256 @@ class TestDashboardUsers(unittest.TestCase):
         self.assertIn('editor', joined)
 
 
+class TestAuditLog(unittest.TestCase):
+    """The durable audit trail (GET /ui/audit) and its call sites.
+
+    Every successful mutation and login appends a row; failed requests do not,
+    and secrets never appear. The trail is admin-only.
+    """
+
+    ADMIN = ('root', 'root-password-123')
+    PW = 'password-12345'
+
+    def setUp(self):
+        _reset_db()
+        self._saved = (_server._ui_username, _server._ui_password)
+        _server._ui_username, _server._ui_password = self.ADMIN
+        self.admin = app.test_client()
+        r = self.admin.post('/ui/login', json={
+            'username': self.ADMIN[0], 'password': self.ADMIN[1]})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+
+    def tearDown(self):
+        _server._ui_username, _server._ui_password = self._saved
+
+    # --- helpers -----------------------------------------------------------
+
+    def _mkuser(self, username, role):
+        r = self.admin.post('/ui/users', json={
+            'username': username, 'password': self.PW, 'role': role})
+        self.assertEqual(r.status_code, 201, r.get_data(as_text=True))
+        return r.get_json()
+
+    def _login(self, username, password=None):
+        client = app.test_client()
+        r = client.post('/ui/login', json={
+            'username': username, 'password': password or self.PW})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        return client
+
+    def _events(self, **filters):
+        """Audit rows matching ``filters``, oldest first (direct DB read)."""
+        session = _server.create_session()
+        try:
+            query = session.query(_server.AuditEvent)
+            for key, value in filters.items():
+                query = query.filter(getattr(_server.AuditEvent, key) == value)
+            return query.order_by(_server.AuditEvent.created.asc(),
+                                  _server.AuditEvent.id.asc()).all()
+        finally:
+            session.close()
+
+    def _one(self, **filters):
+        rows = self._events(**filters)
+        self.assertEqual(len(rows), 1,
+                         f'expected one {filters!r} row, got {len(rows)}')
+        return rows[0]
+
+    # --- access control ----------------------------------------------------
+
+    def test_admin_can_read_the_log(self):
+        r = self.admin.get('/ui/audit')
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertIn('events', body)
+        self.assertEqual(body['limit'], 200)
+        self.assertEqual(body['max_limit'], 1000)
+        self.assertIn('feed.ingest', body['actions'])
+
+    def test_non_admins_get_401(self):
+        self._mkuser('ed', 'editor')
+        self._mkuser('vi', 'viewer')
+        self.assertEqual(self._login('ed').get('/ui/audit').status_code, 401)
+        self.assertEqual(self._login('vi').get('/ui/audit').status_code, 401)
+        self.assertEqual(app.test_client().get('/ui/audit').status_code, 401)
+
+    # --- what gets recorded ------------------------------------------------
+
+    def test_static_login_is_recorded(self):
+        row = self._one(action='auth.login', actor='root')
+        self.assertEqual(row.role, 'admin')
+        self.assertEqual(row.via, 'ui_auth')     # static break-glass pair
+        self.assertEqual(row.detail, 'local')
+
+    def test_real_user_login_is_recorded(self):
+        self._mkuser('alice', 'editor')
+        self._login('alice')
+        row = self._one(action='auth.login', actor='alice')
+        self.assertEqual(row.role, 'editor')
+        self.assertEqual(row.via, 'session')
+        self.assertEqual(row.detail, 'local')
+
+    def test_ingest_records_actor_role_via_target_and_count(self):
+        self._mkuser('ed', 'editor')
+        editor = self._login('ed')
+        r = editor.post('/feed/ingest',
+                        json={'stix_objects': [_manual_obj('7.7.7.7')]})
+        self.assertEqual(r.status_code, 200)
+        row = self._one(action='feed.ingest', actor='ed')
+        self.assertEqual(row.role, 'editor')
+        self.assertEqual(row.via, 'session')
+        self.assertEqual(row.target, _server.DEFAULT_MANUAL_COLLECTION_ID)
+        self.assertEqual(row.collection, _server.DEFAULT_MANUAL_COLLECTION_ID)
+        self.assertEqual(row.count, 1)
+        self.assertEqual(row.detail, 'mode=replace')
+        self.assertTrue(row.ip)
+
+    def test_revoke_records_the_object_and_source(self):
+        self._mkuser('ed', 'editor')
+        editor = self._login('ed')
+        editor.post('/feed/ingest', json={'stix_objects': [_manual_obj('7.7.7.7')]})
+        stix_id = _manual_obj('7.7.7.7')['id']
+        r = editor.post(f'/objects/{stix_id}/revoke', json={'action': 'revoke'})
+        self.assertEqual(r.status_code, 200)
+        row = self._one(action='object.revoke', target=stix_id)
+        self.assertEqual(row.actor, 'ed')
+        self.assertEqual(row.collection, _server.DEFAULT_MANUAL_COLLECTION_ID)
+        self.assertEqual(row.detail, 'manual')
+
+    def test_delete_records_count_and_ids(self):
+        self._mkuser('ed', 'editor')
+        editor = self._login('ed')
+        editor.post('/feed/ingest', json={'stix_objects': [_manual_obj('7.7.7.7')]})
+        stix_id = _manual_obj('7.7.7.7')['id']
+        r = editor.post('/feed/delete', json={'ids': [stix_id]})
+        self.assertEqual(r.status_code, 200)
+        row = self._one(action='feed.delete')
+        self.assertEqual(row.count, 1)
+        self.assertIn(stix_id, row.detail)
+
+    def test_purge_records_the_collection(self):
+        self._mkuser('ed', 'editor')
+        editor = self._login('ed')
+        editor.post('/feed/ingest', json={'stix_objects': [_manual_obj('7.7.7.7')]})
+        r = editor.delete(
+            f"/feed/purge?collection={_server.DEFAULT_MANUAL_COLLECTION_ID}")
+        self.assertEqual(r.status_code, 200)
+        row = self._one(action='feed.purge')
+        self.assertEqual(row.target, _server.DEFAULT_MANUAL_COLLECTION_ID)
+        self.assertEqual(row.count, 1)
+
+    def test_key_create_records_prefix_never_the_secret(self):
+        r = self.admin.post('/ui/keys', json={
+            'label': 'ci-key',
+            'collections': [_server.DEFAULT_MANUAL_COLLECTION_ID]})
+        self.assertEqual(r.status_code, 201)
+        body = r.get_json()
+        row = self._one(action='key.create')
+        self.assertEqual(row.target, body['prefix'])
+        self.assertNotIn(body['key'], row.detail or '')
+        self.assertNotIn(body['key'], row.target or '')
+        self.assertIn('ci-key', row.detail)
+
+    def test_key_revoke_is_recorded(self):
+        created = self.admin.post('/ui/keys', json={
+            'label': 'k',
+            'collections': [_server.DEFAULT_MANUAL_COLLECTION_ID]}).get_json()
+        r = self.admin.post(f"/ui/keys/{created['id']}/revoke")
+        self.assertEqual(r.status_code, 200)
+        row = self._one(action='key.revoke')
+        self.assertEqual(row.target, created['prefix'])
+
+    def test_user_lifecycle_is_recorded(self):
+        user = self._mkuser('bob', 'viewer')
+        self.assertEqual(self._one(action='user.create', target='bob').detail,
+                         'role=viewer')
+        r = self.admin.post(f"/ui/users/{user['id']}", json={'role': 'editor'})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('role', self._one(action='user.update', target='bob').detail)
+        r = self.admin.post(f"/ui/users/{user['id']}/delete")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self._one(action='user.delete', target='bob').actor, 'root')
+
+    def test_failed_request_writes_no_row(self):
+        self._mkuser('ed', 'editor')
+        editor = self._login('ed')
+        r = editor.post('/feed/ingest', json={})     # 400: no stix_objects
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self._events(action='feed.ingest'), [])
+
+    # --- window / filters --------------------------------------------------
+
+    def test_limit_one_returns_only_the_newest(self):
+        self._mkuser('ed', 'editor')
+        editor = self._login('ed')
+        for value in ('7.7.7.7', '8.8.8.8'):
+            editor.post('/feed/ingest',
+                        json={'stix_objects': [_manual_obj(value)]})
+        body = self.admin.get('/ui/audit?limit=1').get_json()
+        self.assertEqual(body['count'], 1)
+        self.assertTrue(body['truncated'])
+        self.assertEqual(body['events'][0]['action'], 'feed.ingest')
+
+    def test_limit_is_validated(self):
+        self.assertEqual(self.admin.get('/ui/audit?limit=0').status_code, 400)
+        self.assertEqual(self.admin.get('/ui/audit?limit=abc').status_code, 400)
+
+    def test_action_and_actor_filters(self):
+        self._mkuser('ed', 'editor')
+        editor = self._login('ed')
+        editor.post('/feed/ingest', json={'stix_objects': [_manual_obj('7.7.7.7')]})
+        self.admin.post('/ui/keys', json={
+            'label': 'k', 'collections': [_server.DEFAULT_MANUAL_COLLECTION_ID]})
+        only_ingest = self.admin.get('/ui/audit?action=feed.ingest').get_json()
+        self.assertTrue(only_ingest['events'])
+        self.assertTrue(all(e['action'] == 'feed.ingest'
+                            for e in only_ingest['events']))
+        only_ed = self.admin.get('/ui/audit?actor=ed').get_json()
+        self.assertTrue(only_ed['events'])
+        self.assertTrue(all(e['actor'] == 'ed' for e in only_ed['events']))
+        # An unknown value is an empty result, not an error.
+        unknown = self.admin.get('/ui/audit?actor=nobody&action=no.such')
+        self.assertEqual(unknown.status_code, 200)
+        self.assertEqual(unknown.get_json()['events'], [])
+
+    def test_newest_first_ordering(self):
+        session = _server.create_session()
+        try:
+            session.query(_server.AuditEvent).delete()
+            now = datetime.utcnow()
+            for i, action in enumerate(
+                    ('feed.ingest', 'feed.purge', 'feed.delete')):
+                session.add(_server.AuditEvent(
+                    id=f'id{i}', actor='root', action=action,
+                    created=now - timedelta(seconds=i)))
+            session.commit()
+        finally:
+            session.close()
+        events = self.admin.get('/ui/audit').get_json()['events']
+        self.assertEqual([e['action'] for e in events],
+                         ['feed.ingest', 'feed.purge', 'feed.delete'])
+
+    def test_audit_write_failure_does_not_break_the_request(self):
+        # Best-effort: if appending the row blows up, the mutation still succeeds.
+        self._mkuser('ed', 'editor')
+        editor = self._login('ed')
+        editor.post('/feed/ingest', json={'stix_objects': [_manual_obj('7.7.7.7')]})
+        stix_id = _manual_obj('7.7.7.7')['id']
+        original = _server.AuditEvent
+
+        class _Boom:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError('audit store unavailable')
+
+        _server.AuditEvent = _Boom
+        try:
+            r = editor.post(f'/objects/{stix_id}/revoke', json={'action': 'revoke'})
+        finally:
+            _server.AuditEvent = original
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json()['revoked'])
+
+
 class TestUiPageWiring(unittest.TestCase):
     """Static checks on intel-ui.html — the dashboard's page wiring.
 
@@ -3647,6 +3898,53 @@ class _FakeJwkClient:
         key = types.SimpleNamespace()
         key.key = self._pub
         return key
+
+
+class TestSchemaDdl(unittest.TestCase):
+    """The schema is auto-created from the ORM models, and the DDL a DBA-managed
+    deployment is told to run (IMPLEMENTATION_GUIDE.md) is generated from those
+    same models by tools/dump_schema.py. A table/column/index added, renamed or
+    dropped without updating that script (and the guide) fails here — which is
+    how api_keys/ui_users were missing from the docs despite being live tables.
+    """
+
+    EXPECTED_TABLES = {'stix_objects', 'subscriptions', 'api_keys',
+                       'ui_users', 'puller_state', 'audit_events'}
+    POLL_INDEXES = {'ix_stix_objects_modified_id',
+                    'ix_stix_objects_coll_modified_id'}
+
+    def _dump_schema(self):
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                            'tools', 'dump_schema.py')
+        spec = importlib.util.spec_from_file_location('dump_schema', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_models_define_every_expected_table(self):
+        self.assertEqual(set(_server.Base.metadata.tables), self.EXPECTED_TABLES,
+                         'a model was added/renamed/dropped — update '
+                         'tools/dump_schema.py and the guide DDL to match')
+
+    def test_later_release_columns_are_present(self):
+        # api_keys.max_objects and ui_users.role arrived after the tables first
+        # shipped; both are load-bearing for the per-key ceiling and RBAC.
+        self.assertIn('max_objects',
+                      _server.Base.metadata.tables['api_keys'].columns)
+        self.assertIn('role', _server.Base.metadata.tables['ui_users'].columns)
+
+    def test_generated_ddl_covers_tables_and_poll_indexes(self):
+        # PostgreSQL is the deployment target (docker compose); the DDL a
+        # DBA runs is the Postgres dialect from tools/dump_schema.py.
+        ddl = self._dump_schema()._ddl_for(_server.Base.metadata, 'postgresql')
+        for table in self.EXPECTED_TABLES:
+            self.assertIn(f'CREATE TABLE {table} ', ddl)
+        for index in self.POLL_INDEXES:
+            self.assertIn(index, ddl)
+
+    def test_check_mode_passes_on_current_models(self):
+        self.assertEqual(self._dump_schema()._check(_server.Base.metadata), 0)
 
 
 if __name__ == '__main__':

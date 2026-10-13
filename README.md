@@ -26,9 +26,9 @@ Vision One (see [Intel Filter](#intel-filter-filtering-between-server-and-vision
 │  │                          │   │   with its source)               │  │
 │  │  / (web UI, login-guard) │   │  - STIXObject (indicator, ipv4-  │  │
 │  │  /ui/login|session|logout│   │    addr, file-hash, domain-name) │  │
-│  │  /objects  /feed/ingest  │   │  - Subscription                 │  │
-│  │  /community/pullers|pull │   │  - PullerState (last sync per    │  │
-│  │  /taxii2/  (gate applied)│   │    community source)            │  │
+│  │  /objects  /feed/ingest  │   │  - Subscription, PullerState     │  │
+│  │  /community/pullers|pull │   │  - ApiKey, UIUser                │  │
+│  │  /taxii2/  (gate applied)│   │    (scoped keys + logins)        │  │
 │  │  /health                 │   └──────────┬───────────────────────┘  │
 │  └──────────────────────────┘             │                            │
 │                                                                          │
@@ -50,7 +50,7 @@ Vision One (see [Intel Filter](#intel-filter-filtering-between-server-and-vision
 
 1. **Flask REST API (TAXII 2 Server)** — Hosts TAXII 2.1 protocol endpoints and custom REST endpoints for feed management, UI login/session, community-source control, auth, subscriptions, and health.
 2. **Web UI dashboard** — Single self-contained `intel-ui.html` behind a login (`ui.auth`). Organized into five tabs: **Feed** (the current feed with per-row **source** and **gate** badges, a **collection** selector when multiple collections exist, **search / type & status filters / pagination**, withheld-by-filter panel, and manual entry/publish), **Intel graph** (a dashboard of the fed intel — KPI tiles plus bar charts for **by category** (IP / domain / file hash / …), **by source**, **confidence distribution**, **pulled-over-time**, **withheld-by-filter**, and **top labels** (donut, share of label occurrences); scope switch Community / Manual / All), **Community sources** (puller status + "Pull now", with the same **search + pagination**), and **Import CSV / Excel** (GT-team ad-hoc import: `.csv` or `.xlsx`), and **API keys** (generate/revoke collection-scoped TAXII credentials). Serves all intel (the gate only affects what Vision One gets).
-3. **STIX 2.1 Store** — Stores threat intelligence objects (IPs, file hashes, domains, URLs, emails, indicators, malware / threat-actor / campaign SDOs, and STIX *relationships* — a real graph, not just flat IOCs) in SQLite (or PostgreSQL). The database is the source of truth for what is served: TAXII polls read the stored rows directly (with a composite index on `(modified, stix_id)` for keyset pagination), and an in-memory copy is kept as a dashboard/coordination cache. Every object carries a `source` tag (`manual` | `otx` | a `taxii_pullers` name) and a `collection_id` (see [Multiple collections](#multiple-collections--per-client-rbac)) so manual and community intel coexist cleanly. Puller sync state (`last_sync`, `last_added`) is persisted in a `puller_state` table so delta pulls survive restarts.
+3. **STIX 2.1 Store** — Stores threat intelligence objects (IPs, file hashes, domains, URLs, emails, indicators, malware / threat-actor / campaign SDOs, and STIX *relationships* — a real graph, not just flat IOCs) in SQLite (or PostgreSQL). The database is the source of truth for what is served: TAXII polls read the stored rows directly (with a composite index on `(modified, stix_id)` for keyset pagination), and an in-memory copy is kept as a dashboard/coordination cache. Every object carries a `source` tag (`manual` | `otx` | a `taxii_pullers` name) and a `collection_id` (see [Multiple collections](#multiple-collections--per-client-rbac)) so manual and community intel coexist cleanly. Puller sync state (`last_sync`, `last_added`) is persisted in a `puller_state` table so delta pulls survive restarts. Dashboard mutations and logins are persisted in an `audit_events` table (see [Audit log](#audit-log)).
 4. **OTX Community Puller** — Background thread that periodically pulls indicators (IPv4, domains, file hashes) from **AlienVault OTX** public pulses and merges them into the feed tagged `source='otx'`. Off by default; can also be fired on demand from the UI.
 5. **Third-party TAXII 2.1 Pullers** — One generic puller per `taxii_pullers:` entry. Polls `GET {api_root}collections/{collection}/objects/?since=` from any TAXII 2.1 server (Basic auth, `application/taxii+json;version=2.1`), maps STIX 2.1 objects into the feed in merge mode tagged with the puller's `name`. Off by default per entry.
 6. **Self-check Poller** — Background thread that periodically fetches the local `/feed` endpoint to verify the feed is reachable and well-formed. Off by default.
@@ -89,18 +89,17 @@ Dependencies:
 | PyJWT 2.15.1 | SSO — verify the Microsoft ID-token JWT (only used when `sso.enabled`) |
 | cryptography 50.0.2 | SSO — RSA key handling for ID-token signature verification |
 | psycopg2-binary *(optional)* | PostgreSQL driver — only if you use a Postgres `database.url` |
-| PyMySQL *(optional)* | MariaDB/MySQL driver — only if you use a MySQL `database.url` |
 
-> SQLite (the default) needs no driver. Install one of the optional drivers
-> only when you switch `database.url` to PostgreSQL or MariaDB.
+> SQLite (the default) needs no driver. Install `psycopg2-binary` only when you
+> switch `database.url` to PostgreSQL.
 
 ### Choosing the database
 
-| | SQLite (default) | PostgreSQL (recommended) | MariaDB/MySQL |
-|---|---|---|---|
-| Setup | None | `createdb taxii_feed` | `CREATE DATABASE taxii_feed` |
-| Concurrent read + write | Single writer (file lock) | MVCC — readers never block the writer | Good (InnoDB MVCC) |
-| Best for | Dev / single small feed | **Production** | Production (if that's your standard) |
+| | SQLite (default) | PostgreSQL (recommended) |
+|---|---|---|
+| Setup | None | `createdb taxii_feed` |
+| Concurrent read + write | Single writer (file lock) | MVCC — readers never block the writer |
+| Best for | Dev / single small feed | **Production** |
 
 > **Schema & production setup** (tables, DDL, DBA-managed provisioning,
 > privileges): see [Database Schema & Production Setup](IMPLEMENTATION_GUIDE.md#database-schema--production-setup)
@@ -114,7 +113,10 @@ your ingests write. Postgres MVCC handles that cleanly, its indexed
 the strongest JSON support (`JSONB`) if you later want to store raw STIX
 objects and query them.
 
-**MariaDB** is a solid second choice if your environment standardizes on it.
+**MariaDB/MySQL is not supported.** The models declare unbounded `VARCHAR`,
+which SQLite and PostgreSQL accept but MySQL rejects (`VARCHAR requires a length
+on dialect mysql`), so `init_db()` cannot create the schema there. Adding it
+would mean giving every string column an explicit length.
 
 **Switching from SQLite → PostgreSQL (3 steps):**
 
@@ -154,7 +156,7 @@ server:
 
 database:
   # Dev default: in-process SQLite (zero setup). For production, point this at
-  # PostgreSQL (recommended) or MariaDB — see the `database:` block in
+  # PostgreSQL (recommended) — see the `database:` block in
   # config.yaml for the exact URL format + driver to pip install.
   url: sqlite:///taxii_feed.db
 
@@ -624,6 +626,7 @@ These drive the dashboard login. They are independent of `taxii.auth`.
 | `POST /ui/users` | Body `{"username", "password", "role"}` (role: `viewer`\|`editor`\|`admin`). `409` on a duplicate, `400` on a bad role or a password under 12 chars. Returns `201` (admin) |
 | `POST /ui/users/<id>` | Change a user's `role`, `enabled` or `password`. `400` if it would remove the last enabled admin (admin) |
 | `POST /ui/users/<id>/delete` | Delete a user; their session stops working immediately (admin) |
+| `GET /ui/audit` | Audit trail, newest first: `{"events": [{id,created,actor,role,via,ip,action,target,collection,count,detail}], "count", "limit", "max_limit", "truncated", "actions", "generated"}`. `?limit=` (default 200, cap 1000), `?action=` / `?actor=` exact-match filters. Requires an **admin** principal |
 | `GET /ui/stats` | Aggregates for the **Intel graph** tab. `?scope=community\|manual\|all` (default community) and `?collection=<id>`: totals, `categories`, `by_source`, `withheld_reasons`, `confidence` (histogram), `timeline`, `top_labels`. |
 | `POST /ui/login` | Body `{"username","password"}` checked against `ui.auth`. On success sets the http-only `taxii2_ui_session` cookie (signed with `security.secret_key`, lifetime `ui.session_ttl`); `401` on bad credentials. |
 | `POST /ui/logout` | Deletes the session cookie. |
@@ -990,11 +993,47 @@ only) creates logins, each with a role:
 - **Audit lines name the actor.** Mutations log
   `… by alice (editor via session) from 203.0.113.9`, so a shared login is no
   longer indistinguishable — you can tell *who* purged the feed, not just from
-  which IP.
+  which IP. See [Audit log](#audit-log) for the durable, queryable trail.
 
 > First run: log in with `ui.auth`, open **Users**, and create yourself a real
 > admin account before sharing the dashboard. Leave `ui.auth` set as the
 > break-glass credential.
+
+### Audit log
+
+Every successful dashboard mutation and every successful login is also
+appended to an `audit_events` table, readable in-app at `GET /ui/audit` (or the
+**Audit log** tab, admins only). It answers "who changed what, from where"
+without grepping the server log — and the rows outlive a restart.
+
+**Recorded actions:** `feed.ingest`, `feed.import`, `feed.delete`,
+`feed.purge`, `object.revoke`, `object.unrevoke`, `community.pull`,
+`key.create`, `key.revoke`, `user.create`, `user.update`, `user.delete` and
+`auth.login`. Failed logins and failed (4xx/5xx) requests are **not** recorded,
+and secrets never are: a `key.create` row stores the key **prefix**, never the
+plaintext.
+
+Each row carries `created`, `actor` (username, or `anonymous`), `role`, `via`
+(`session` \| `ui_auth` \| `sso` \| `admin_auth`), `ip`, `action`, `target`
+(e.g. a STIX id, username or key prefix), `collection`, `count` and a
+human-readable `detail`.
+
+```bash
+curl -u "$UI_AUTH_USER:$UI_AUTH_PASSWORD" \
+  'http://localhost:5000/ui/audit?limit=100&action=feed.purge&actor=alice'
+```
+
+`GET /ui/audit` returns a **bounded newest-first window** — `?limit=` (default
+200, hard cap 1000), plus optional exact-match `?action=` / `?actor=`. The tab
+searches and pages the window client-side. A malformed `limit` is a `400`; an
+unknown `action`/`actor` is simply an empty result.
+
+**Retention is destructive and configurable** (`audit:` in `config.yaml`):
+`retention_days` (default 90) drops older rows and `max_events` (default
+100000) trims the oldest beyond the cap. Set either to `0`/`null` to disable
+that bound — `0`/`0` keeps every row forever, and then no pruner thread starts.
+Audit writes are best-effort: a failure is logged and swallowed, so it can
+never fail the request it is recording.
 
 **Upgrading from the pre-segregation single collection.** The old rows lived
 under `collection_id='threat-intel'`, which no longer names anything. On the

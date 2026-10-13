@@ -38,9 +38,9 @@ This guide explains how to implement and deploy a TAXII 2 server that feeds STIX
 - **Protocol**: TAXII 2.0 over HTTP
 - **Format**: STIX 2.1 JSON responses
 
-### 2. Storage (SQLite / PostgreSQL / MariaDB via SQLAlchemy)
-- **Purpose**: Persistent storage for threat intelligence, puller state and subscriptions
-- **Data Model**: `stix_objects` (the feed), `puller_state` (poller delta + status), `subscriptions`
+### 2. Storage (SQLite / PostgreSQL via SQLAlchemy)
+- **Purpose**: Persistent storage for threat intelligence, puller state, subscriptions, API keys, dashboard users and the audit trail
+- **Data Model**: `stix_objects` (the feed), `puller_state` (poller delta + status), `subscriptions`, `api_keys` (scoped TAXII consumer keys), `ui_users` (dashboard logins + roles), `audit_events` (mutation + login trail)
 - **See**: [Database Schema & Production Setup](#database-schema--production-setup) for the full schema, DDL and production setup.
 
 ### 3. API Endpoints
@@ -240,11 +240,21 @@ export FLASK_DEBUG=0
 
 ## Database Schema & Production Setup
 
-The server keeps everything in **three tables**. The schema is defined by the
-SQLAlchemy models in `server.py` (`STIXObject`, `PullerState`, `Subscription`)
-and created automatically on first start (`Base.metadata.create_all()` inside
-`init_db()`), so **no manual DDL is required** — but the exact DDL is below for
-a DBA-managed deployment.
+The server keeps everything in **six tables**. The schema is defined by the
+SQLAlchemy models in `server.py` (`STIXObject`, `Subscription`, `ApiKey`,
+`UIUser`, `PullerState`, `AuditEvent`) and created automatically on first start
+(`Base.metadata.create_all()` inside `init_db()`), so **no manual DDL is
+required** — but the exact DDL is below for a DBA-managed deployment.
+
+> The DDL below is compiled from those models by `tools/dump_schema.py`, so it
+> tracks the code instead of being hand-maintained:
+>
+> ```bash
+> python tools/dump_schema.py                    # PostgreSQL (default)
+> python tools/dump_schema.py --dialect sqlite   # or --dialect all
+> python tools/dump_schema.py --check            # fail if the models drifted
+> python tools/dump_schema.py --create           # create it in the configured DB
+> ```
 
 ### Tables
 
@@ -253,6 +263,9 @@ a DBA-managed deployment.
 | `stix_objects` | The feed — one row per STIX id. IOCs are *served* as STIX 2.1 `indicator`; stored types also include the extra SCOs (`url`, `email-addr`, `ipv6-addr`, `mac-addr`, `windows-registry-key`, `autonomous-system`) and the SDO/SROs (`malware`, `threat-actor`, `campaign`, `report`, `identity`, `attack-pattern`, `vulnerability`, `relationship`). |
 | `puller_state` | Per-community-puller delta state (`last_sync` feeds the poller's `?since=`) plus the last-run status shown in the dashboard. `id` is `otx` or `taxii:<name>`. |
 | `subscriptions` | Legacy TAXII client subscriptions used by `POST /subscriptions/<client_id>` and `POST /auth`. |
+| `api_keys` | Dashboard-generated, collection-scoped TAXII consumer keys. Only the cleartext `prefix` (indexed for O(1) lookup) and a SHA-256 of the secret are stored; the plaintext is shown **once**, at creation. Optional per-key expiry, sliding-window rate limit (`rate_limit`/`rate_window`) and per-response IOC ceiling (`max_objects`). |
+| `ui_users` | Dashboard logins with a role (`viewer` \| `editor` \| `admin`). Passwords are werkzeug-hashed (scrypt/pbkdf2) and the role is re-resolved per request, so disabling a user takes effect immediately. The static `ui.auth` break-glass admin is deliberately **not** stored here. |
+| `audit_events` | Append-only trail of dashboard mutations (ingest/import/delete/purge/revoke, community pull, key + user management) and successful logins. One row per action, never mutated; read by admins at `GET /ui/audit`. Never stores secrets (a key create records the **prefix**, not the plaintext). Bounded by `audit.retention_days` / `audit.max_events`; `0` keeps rows forever. |
 
 ### DDL (PostgreSQL)
 
@@ -285,8 +298,12 @@ CREATE TABLE stix_objects (
     PRIMARY KEY (id)
 );
 CREATE INDEX        ix_stix_objects_object_type   ON stix_objects (object_type);
+CREATE INDEX        ix_stix_objects_id            ON stix_objects (id);
 CREATE INDEX        ix_stix_objects_collection_id ON stix_objects (collection_id);
 CREATE UNIQUE INDEX ix_stix_objects_stix_id       ON stix_objects (stix_id);
+-- Poll-path keyset pagination (Get Objects ordered by modified, stix_id):
+CREATE INDEX        ix_stix_objects_modified_id      ON stix_objects (modified, stix_id);
+CREATE INDEX        ix_stix_objects_coll_modified_id ON stix_objects (collection_id, modified, stix_id);
 
 CREATE TABLE puller_state (
     id           VARCHAR NOT NULL,                -- 'otx' | 'taxii:<name>'
@@ -308,6 +325,56 @@ CREATE TABLE subscriptions (
     PRIMARY KEY (id)
 );
 CREATE INDEX ix_subscriptions_client_id ON subscriptions (client_id);
+
+-- Scoped TAXII consumer credentials minted in the dashboard's API keys tab.
+CREATE TABLE api_keys (
+    id           VARCHAR NOT NULL,
+    label        VARCHAR NOT NULL,             -- human label for the dashboard
+    prefix       VARCHAR NOT NULL,             -- cleartext key prefix (indexed, for O(1) lookup)
+    secret_hash  VARCHAR NOT NULL,             -- SHA-256 of the secret; plaintext never stored
+    enabled      BOOLEAN,
+    created      TIMESTAMP,
+    expires_at   TIMESTAMP,
+    last_used_at TIMESTAMP,
+    collections  TEXT,                         -- JSON list of collection ids the key may read
+    rate_limit   INTEGER,                      -- requests per window (0/null = off)
+    rate_window  INTEGER,                      -- window length, seconds
+    max_objects  INTEGER,                      -- per-response IOC ceiling (0/null = server cap)
+    PRIMARY KEY (id)
+);
+CREATE INDEX ix_api_keys_prefix ON api_keys (prefix);
+
+-- Dashboard logins with a role. The static ui.auth break-glass admin is NOT here.
+CREATE TABLE ui_users (
+    id            VARCHAR NOT NULL,
+    username      VARCHAR NOT NULL,
+    password_hash VARCHAR NOT NULL,            -- werkzeug scrypt/pbkdf2 (once per login)
+    role          VARCHAR NOT NULL,            -- viewer | editor | admin
+    enabled       BOOLEAN,
+    created       TIMESTAMP,
+    last_login_at TIMESTAMP,
+    PRIMARY KEY (id)
+);
+CREATE UNIQUE INDEX ix_ui_users_username ON ui_users (username);
+
+-- Append-only trail of mutations + successful logins (dashboard "Audit log").
+CREATE TABLE audit_events (
+    id         VARCHAR NOT NULL,                -- uuid4().hex
+    created    TIMESTAMP,                       -- naive UTC
+    actor      VARCHAR NOT NULL,                -- username; 'anonymous' if no principal
+    role       VARCHAR,                         -- viewer | editor | admin
+    via        VARCHAR,                         -- ui_auth | sso | session | admin_auth
+    ip         VARCHAR,                         -- client address (proxy-aware)
+    action     VARCHAR NOT NULL,                -- 'feed.ingest', 'user.update', …
+    target     VARCHAR,                         -- stix_id | username | key prefix | collection
+    collection VARCHAR,
+    count      INTEGER,                         -- objects affected, when meaningful
+    detail     TEXT,                            -- human-readable summary (never a secret)
+    PRIMARY KEY (id)
+);
+CREATE INDEX ix_audit_events_created_id       ON audit_events (created, id);
+CREATE INDEX ix_audit_events_action_created   ON audit_events (action, created);
+CREATE INDEX ix_audit_events_actor            ON audit_events (actor);
 ```
 
 > **Design notes.** There are **no foreign keys** — the store is deliberately
@@ -320,10 +387,16 @@ CREATE INDEX ix_subscriptions_client_id ON subscriptions (client_id);
 
 ### Choose the database
 
-| | SQLite (default) | PostgreSQL (recommended) | MariaDB/MySQL |
-|---|---|---|---|
-| Setup | none | create role + database | create database |
-| Best for | dev / small single feed | **production** (read-heavy + concurrent writes) | if that's your standard |
+| | SQLite (default) | PostgreSQL (recommended) |
+|---|---|---|
+| Setup | none | create role + database |
+| Best for | dev / small single feed | **production** (read-heavy + concurrent writes) |
+
+> **SQLite and PostgreSQL only.** The models declare unbounded `VARCHAR`, which
+> both accept; MySQL/MariaDB reject it (`VARCHAR requires a length on dialect
+> mysql`), so `init_db()` cannot create the schema on MariaDB/MySQL and the app
+> will not start there. Supporting it would mean giving every string column an
+> explicit length — not a documented capability today.
 
 ### Path A — let the app create the schema (simplest)
 
@@ -355,24 +428,30 @@ GRANT USAGE   ON SCHEMA public TO taxii;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO taxii;
 ```
 
-> **Privileges caveat.** At startup the app also runs **idempotent column
-> migrations** (`ALTER TABLE … ADD COLUMN` for `source`, `collection_id`,
-> `value`, `object_refs`, `valid_from`, …) — but only for columns that are
-> *missing*. If you pre-create the **complete** schema above, no `ALTER` is
-> attempted and DML-only grants are sufficient. If a required column is absent
-> and the role cannot `ALTER`, `init_db()` raises and the app will not start —
-> so run once as the owner, or pre-create the full schema.
+> **Privileges caveat.** At startup `init_db()` runs `create_all` (which
+> `CREATE TABLE`s any table the models define that is **missing**) followed by
+> **idempotent column migrations** (`ALTER TABLE … ADD COLUMN` for `source`,
+> `collection_id`, `value`, `object_refs`, `valid_from`, `api_keys.max_objects`,
+> …). Both are no-ops only when the schema is already **complete**. So a
+> DML-only role (no `CREATE`/`ALTER`) must be given the *full* six-table schema
+> above — including `api_keys`, `ui_users` and `audit_events`, which later
+> releases added. If a
+> table or column is absent and the role cannot create/alter it, `init_db()`
+> raises and the app will not start: run once as the owner (or
+> `python tools/dump_schema.py --create`), or pre-create the full schema.
 
 ### Verify
 
 ```bash
-psql "postgresql://taxii:***@db-host:5432/taxii_feed" -c '\dt'   # 3 tables + indexes
+psql "postgresql://taxii:***@db-host:5432/taxii_feed" -c '\dt'   # 5 tables + indexes
 curl -s http://host:5000/health | jq '.database'                # "connected"
 ```
 
-The same schema runs on **SQLite** (default, zero setup) and **MariaDB/MySQL** —
+The same schema runs on **SQLite** (default, zero setup) and **PostgreSQL** —
 only `database.url` (and the pip driver) change. See the README's
 [Choosing the database] section for the connection-string formats.
+(MariaDB/MySQL is *not* supported by the current models — see the note under
+[Choose the database](#choose-the-database).)
 
 ## Troubleshooting
 
@@ -409,7 +488,9 @@ server:
   Dynamic indicators are auto-**revoked** by the TTL lifecycle rather than deleted, so
   growth is mostly bounded by the pollers' caps (`max_indicators_per_poll`, `limit`).
 - **Indexes**: the schema ships with the indexes it needs (`stix_id` unique, `object_type`,
-  `collection_id`). After large purges run `VACUUM ANALYZE` (PostgreSQL) / `VACUUM` (SQLite).
+  `collection_id`, `api_keys.prefix`, and the composite `(modified, stix_id)` /
+  `(collection_id, modified, stix_id)` that back keyset pagination). After large purges
+  run `VACUUM ANALYZE` (PostgreSQL) / `VACUUM` (SQLite).
 - Full schema, DDL and production setup: [Database Schema & Production Setup](#database-schema--production-setup).
 
 ### Performance Optimization

@@ -21,8 +21,8 @@ database:
   # The URL comes from DATABASE_URL in .env; compose injects its own for the
   # app container (host `postgres`, the service name), so this default only
   # applies to a host run. Every table the ORM declares — stix_objects,
-  # subscriptions, puller_state, api_keys — is created automatically at
-  # startup if missing, so an empty database needs no manual provisioning.
+  # subscriptions, puller_state, api_keys, ui_users — is created automatically
+  # at startup if missing, so an empty database needs no manual provisioning.
   #   DB_USER / DB_PASS / DB_HOST / DB_PORT / DB_NAME in .env
   url: '${DATABASE_URL:-postgresql+psycopg2://taxii:CHANGE_ME@127.0.0.1:5432/taxii_feed}'
 
@@ -204,6 +204,28 @@ ui:
     username: '${UI_AUTH_USER}'
     password: '${UI_AUTH_PASSWORD}'
   session_ttl: 43200        # session lifetime, seconds (default 12 h)
+
+# ---------------------------------------------------------------------------
+# AUDIT LOG — who changed what, and successful logins
+#
+# Every dashboard mutation (ingest, import, delete, purge, revoke/unrevoke,
+# community pull, key create/revoke, user create/update/delete) and every
+# successful login (local + SSO) appends a row to the `audit_events` table.
+# Admins read it at GET /ui/audit or the dashboard's "Audit log" tab. Failed
+# logins and failed mutations are NOT recorded.
+#
+# Retention is destructive: rows older than `retention_days` are pruned, then
+# the oldest are trimmed down to `max_events`. Set either to 0 (or null) to
+# disable that bound — 0/0 keeps every row forever. Pruning runs in a single
+# background thread, `prune_interval` seconds apart; a disabled audit block or
+# a 0/0 pair starts no thread at all. Audit writes are best-effort: a failure
+# is logged and swallowed so it can never fail the request it records.
+# ---------------------------------------------------------------------------
+audit:
+  enabled: true
+  retention_days: 90       # drop rows older than this; 0/null = keep forever
+  max_events: 100000       # keep at most this many newest rows; 0/null = no cap
+  prune_interval: 86400    # seconds between prune runs
 
 # ---------------------------------------------------------------------------
 # SSO — Microsoft Entra ID (Azure AD) via OIDC. OFF by default.

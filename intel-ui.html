@@ -217,6 +217,7 @@
       <button class="tab" data-page="import">Import CSV / Excel</button>
       <button class="tab admin-only" data-page="keys">API keys</button>
       <button class="tab admin-only" data-page="users">Users</button>
+      <button class="tab admin-only" data-page="audit">Audit log</button>
     </div>
 
     <!-- ============ PAGE: FEED ============ -->
@@ -489,6 +490,45 @@
 
     </section>
 
+    <!-- ============ PAGE: AUDIT LOG ============ -->
+    <section data-page="audit">
+
+    <div class="panel">
+      <h2>Audit log</h2>
+      <div class="hint" style="margin:0 0 10px">
+        Who changed what, and successful logins — recorded durably on the server
+        (append-only, newest first). Failed logins and failed requests are not
+        recorded, and secrets never are. Admins only.
+      </div>
+      <div class="feedtools">
+        <input type="search" id="auditSearch" placeholder="Search actor, action, target, collection or detail…" autocomplete="off">
+        <select id="auditAction" title="Filter by action">
+          <option value="">All actions</option>
+        </select>
+        <button id="btnAuditReload" class="ghost">Reload</button>
+        <span class="currange mono" id="auditRange"></span>
+      </div>
+      <table id="auditTable" style="display:none">
+        <thead>
+          <tr>
+            <th>Time</th><th>Actor</th><th>Role (via)</th><th>Action</th>
+            <th>Target</th><th>Collection</th><th>Count</th><th>Detail</th><th>IP</th>
+          </tr>
+        </thead>
+        <tbody id="auditBody"></tbody>
+      </table>
+      <div class="pager" id="auditPager">
+        <button id="apgFirst" class="ghost" title="First page">«</button>
+        <button id="apgPrev" class="ghost" title="Previous page">‹</button>
+        <span class="mono" id="apgInfo"></span>
+        <button id="apgNext" class="ghost" title="Next page">›</button>
+        <button id="apgLast" class="ghost" title="Last page">»</button>
+      </div>
+      <div class="hint" id="auditHint">No audit events yet.</div>
+    </div>
+
+    </section>
+
     <!-- ============ PAGE: INTEL GRAPH ============ -->
     <section data-page="graph">
 
@@ -585,6 +625,12 @@ const EDITABLE_TYPES = ["ipv4-addr", "domain-name", "file-hash", "url", "email-a
 // --- Community sources model (same search/pagination pattern as the feed) ---
 let pullerData = [];        // every configured puller, in server order
 let pullerPage = 1;
+
+// --- Audit log model (same search/pagination pattern; admin only) ---
+let auditData = [];         // newest-first window from /ui/audit
+let auditPage = 1;
+let auditFilter = { q: "", action: "" };
+let auditTruncNote = "";    // non-empty when the server window was capped
 
 const $ = (id) => document.getElementById(id);
 
@@ -750,14 +796,14 @@ function showDashboard(user) {
 function applyRole() {
   document.body.classList.toggle("no-write", !CAN_WRITE);
   document.body.classList.toggle("no-admin", !CAN_ADMIN);
-  if (!CAN_ADMIN && ["keys", "users"].includes(currentPageFromHash())) {
+  if (!CAN_ADMIN && ["keys", "users", "audit"].includes(currentPageFromHash())) {
     showPage("feed");
     location.hash = "#feed";
   }
 }
 
 // --- Dashboard page tabs (Feed / Intel graph / Community sources / Import) ---
-const PAGE_NAMES = ["feed", "graph", "sources", "import", "keys", "users"];
+const PAGE_NAMES = ["feed", "graph", "sources", "import", "keys", "users", "audit"];
 function currentPageFromHash() {
   const h = (location.hash || "").replace(/^#/, "");
   return PAGE_NAMES.includes(h) ? h : "feed";
@@ -776,6 +822,7 @@ function showPage(name) {
   if (name === "graph") loadStats();  // aggregated view: fetch on entry
   if (name === "keys") loadKeys();    // keys: fetch on entry
   if (name === "users") loadUsers();  // users: fetch on entry
+  if (name === "audit") loadAudit();  // audit log: fetch on entry
 }
 function onTabClick(e) {
   const name = e.currentTarget.dataset.page;
@@ -855,6 +902,13 @@ async function doLogout() {
   $("userBody").innerHTML = "";
   $("userTable").style.display = "none";
   $("userMsg").className = "msg";
+  auditData = [];
+  auditPage = 1;
+  auditFilter = { q: "", action: "" };
+  auditTruncNote = "";
+  $("auditBody").innerHTML = "";
+  $("auditTable").style.display = "none";
+  $("auditSearch").value = "";
   // Drop the cached role so a later login re-reads it from the server.
   CURRENT_ROLE = null; CAN_WRITE = false; CAN_ADMIN = false;
   renderFeed();
@@ -1709,6 +1763,114 @@ async function deleteUser(u) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Audit log (admin only) — a bounded newest-first window, filtered + paged
+// client-side exactly like the Feed tab.
+// ---------------------------------------------------------------------------
+function auditMatched() {
+  const f = auditFilter;
+  return auditData.filter(e => {
+    if (f.action && e.action !== f.action) return false;
+    if (f.q) {
+      const hay = [e.actor, e.action, e.target, e.collection, e.detail, e.ip,
+                   e.role, e.via]
+        .map(v => (v == null ? "" : String(v))).join(" ").toLowerCase();
+      if (!hay.includes(f.q)) return false;
+    }
+    return true;
+  });
+}
+
+// Rebuild the action dropdown from the server's canonical action list, keeping
+// the operator's current selection across reloads.
+function renderAuditActionOptions(actions) {
+  const sel = $("auditAction");
+  const wanted = actions.join(",");
+  if (sel.dataset.actions === wanted) return;
+  const current = sel.value;
+  sel.dataset.actions = wanted;
+  sel.innerHTML = "";
+  const all = document.createElement("option");
+  all.value = ""; all.textContent = "All actions";
+  sel.appendChild(all);
+  actions.forEach(a => {
+    const o = document.createElement("option");
+    o.value = a; o.textContent = a;
+    sel.appendChild(o);
+  });
+  if (actions.includes(current)) sel.value = current;
+}
+
+async function loadAudit() {
+  try {
+    const r = await api("/ui/audit");
+    if (r.status !== 200) {
+      $("auditHint").textContent = `Could not load the audit log (HTTP ${r.status}).`;
+      $("auditHint").style.display = "block";
+      return;
+    }
+    const b = r.body || {};
+    renderAuditActionOptions(b.actions || []);
+    auditData = b.events || [];
+    auditTruncNote = b.truncated
+      ? `Showing the newest ${b.limit} events (window capped at ${b.max_limit}) — older events are not listed.`
+      : "";
+    auditPage = 1;
+    renderAudit();
+  } catch (e) {
+    $("auditHint").textContent = "Could not load the audit log: " + e.message;
+    $("auditHint").style.display = "block";
+  }
+}
+
+function renderAudit() {
+  const filtered = auditMatched();
+  const totalPages = Math.max(1, Math.ceil(filtered.length / FEED_PAGE_SIZE));
+  auditPage = Math.min(Math.max(1, auditPage), totalPages);
+  const start = (auditPage - 1) * FEED_PAGE_SIZE;
+  const slice = filtered.slice(start, start + FEED_PAGE_SIZE);
+
+  const body = $("auditBody");
+  body.innerHTML = "";
+  slice.forEach(e => {
+    const tr = document.createElement("tr");
+    const role = e.role ? (e.role + (e.via ? ` (${e.via})` : "")) : (e.via || "");
+    const cells = [
+      fmtKeyTs(e.created), e.actor || "anonymous", role, e.action,
+      e.target || "", e.collection || "", e.count == null ? "" : String(e.count),
+      e.detail || "", e.ip || "",
+    ];
+    cells.forEach(v => {
+      const td = document.createElement("td");
+      td.textContent = v;
+      tr.appendChild(td);
+    });
+    body.appendChild(tr);
+  });
+
+  const has = filtered.length > 0;
+  $("auditTable").style.display = has ? "table" : "none";
+  $("auditPager").style.display = has ? "flex" : "none";
+  const note = has
+    ? (auditTruncNote || "")
+    : (auditData.length ? "No events match your filter." : "No audit events yet.");
+  $("auditHint").textContent = note;
+  $("auditHint").style.display = note ? "block" : "none";
+
+  const info = has
+    ? `${start + 1}–${start + slice.length} of ${filtered.length}` +
+      ((auditFilter.q || auditFilter.action) ? ` (filtered from ${auditData.length})` : "")
+    : "no matches";
+  $("apgInfo").textContent = `Page ${auditPage} / ${totalPages} · ${info}`;
+  $("apgFirst").disabled = auditPage <= 1;
+  $("apgPrev").disabled = auditPage <= 1;
+  $("apgNext").disabled = auditPage >= totalPages;
+  $("apgLast").disabled = auditPage >= totalPages;
+  $("auditRange").textContent = has ? `matching ${filtered.length}` : "";
+}
+
+function setAuditPage(p) { auditPage = p; renderAudit(); }
+
 // Generates a ready-to-edit template covering every supported header style.
 // Pure client-side (Blob) — works offline, no server asset.
 function downloadCsvSample() {
@@ -2058,6 +2220,26 @@ $("btnKeyReload").addEventListener("click", loadKeys);
 // Dashboard users page: create / reload (per-row actions are wired on render).
 $("btnUserCreate").addEventListener("click", createUser);
 $("btnUserReload").addEventListener("click", loadUsers);
+
+// Audit log page: search + action filter + reload + pagination (client-side).
+$("auditSearch").addEventListener("input", () => {
+  auditFilter.q = $("auditSearch").value.trim().toLowerCase();
+  auditPage = 1;
+  renderAudit();
+});
+$("auditAction").addEventListener("change", () => {
+  auditFilter.action = $("auditAction").value;
+  auditPage = 1;
+  renderAudit();
+});
+$("btnAuditReload").addEventListener("click", loadAudit);
+$("apgFirst").addEventListener("click", () => setAuditPage(1));
+$("apgPrev").addEventListener("click", () => setAuditPage(auditPage - 1));
+$("apgNext").addEventListener("click", () => setAuditPage(auditPage + 1));
+$("apgLast").addEventListener("click", () => {
+  const pages = Math.max(1, Math.ceil(auditMatched().length / FEED_PAGE_SIZE));
+  setAuditPage(pages);
+});
 
 // Intel graph: scope switch + manual refresh.
 $("graphScope").addEventListener("change", () => {

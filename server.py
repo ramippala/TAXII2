@@ -318,6 +318,41 @@ class PullerState(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class AuditEvent(Base):
+    """Append-only audit trail of dashboard mutations and successful logins.
+
+    The server already logs every mutation as a *line* (``logger.info(... by
+    %s, _actor())``), but a log line is not queryable in-app. This table makes
+    "which user changed what, and from where" answerable through
+    ``GET /ui/audit`` (admin only) and the dashboard's Audit log tab.
+
+    Rows are written only on success, only for the actions in
+    :data:`AUDIT_ACTIONS`, and NEVER carry secrets (an API-key create records
+    the prefix, never the plaintext). There is deliberately no ``onupdate``:
+    an audit row is written once and never mutated. Retention is bounded by
+    :func:`prune_audit_events`; ``retention_days: 0`` keeps rows forever.
+    """
+
+    __tablename__ = "audit_events"
+
+    id = Column(String, primary_key=True)            # uuid4().hex
+    created = Column(DateTime, default=datetime.utcnow)  # naive UTC, like every other ts
+    actor = Column(String, nullable=False)           # bare username; 'anonymous' if none
+    role = Column(String, nullable=True)             # viewer | editor | admin
+    via = Column(String, nullable=True)              # ui_auth | sso | session | admin_auth
+    ip = Column(String, nullable=True)
+    action = Column(String, nullable=False)          # 'feed.ingest', …
+    target = Column(String, nullable=True)           # stix_id | username | prefix | collection
+    collection = Column(String, nullable=True)
+    count = Column(Integer, nullable=True)
+    detail = Column(Text, nullable=True)             # human-readable summary
+    __table_args__ = (
+        Index('ix_audit_events_created_id', 'created', 'id'),
+        Index('ix_audit_events_action_created', 'action', 'created'),
+        Index('ix_audit_events_actor', 'actor'),
+    )
+
+
 def _utc_now_iso() -> str:
     """Current UTC time as ISO-8601 'Z' (STIX 2.1 / TAXII ?since= format)."""
     return datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -409,8 +444,9 @@ def init_db() -> None:
 
     ``create_all`` is the schema source of truth: it creates every table the
     ORM defines (``stix_objects``, ``subscriptions``, ``puller_state``,
-    ``api_keys``) that does not already exist, so pointing the server at an
-    empty PostgreSQL database is all the provisioning it needs. The
+    ``api_keys``, ``ui_users``, ``audit_events``) that does not already exist,
+    so pointing the server at an empty PostgreSQL database is all the
+    provisioning it needs. The
     add-if-missing column loop below only matters for a database created by
     an older build.
     """
@@ -619,6 +655,119 @@ def start_ttl_sweeper() -> None:
     logger.info(
         "TTL sweeper started (interval=%ss, ttl_days=%s)",
         LIFECYCLE_SWEEP_INTERVAL, LIFECYCLE_TTL_DAYS,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Audit log (who changed what — durable, queryable mutation trail)
+# ---------------------------------------------------------------------------
+# Every dashboard mutation (and every successful login) appends a row to
+# `audit_events`, surfaced to admins at GET /ui/audit and in the dashboard's
+# Audit log tab. This is observability, not correctness: a failed audit write
+# is logged and swallowed so it can never change (or fail) the request it is
+# recording. Retention is bounded below; `retention_days: 0` opts into keeping
+# rows forever.
+
+AUDIT_CFG: Dict[str, Any] = CONFIG.get('audit', {}) or {}
+AUDIT_ENABLED = bool(AUDIT_CFG.get('enabled', True))
+AUDIT_RETENTION_DAYS = AUDIT_CFG.get('retention_days', 90)
+AUDIT_MAX_EVENTS = AUDIT_CFG.get('max_events', 100000)
+AUDIT_PRUNE_INTERVAL = int(AUDIT_CFG.get('prune_interval', 86400) or 0)
+
+# The complete set of recorded actions. Kept explicit so the dashboard's
+# action filter and the tests can enumerate them, and a typo'd action at a
+# call site is easy to spot. ('auth.login' is the one non-mutation.)
+AUDIT_ACTIONS = (
+    'object.revoke', 'object.unrevoke', 'feed.ingest', 'feed.delete',
+    'feed.purge', 'feed.import', 'community.pull', 'key.create',
+    'key.revoke', 'user.create', 'user.update', 'user.delete', 'auth.login',
+)
+
+# Field caps — audit text is operator-facing, not a data store, so oversize
+# values are truncated rather than stored whole (a CSV import's id list, an
+# error message, a huge form value).
+_AUDIT_TARGET_MAX = 255
+_AUDIT_DETAIL_MAX = 500
+
+
+def prune_audit_events(now: Optional[datetime] = None) -> int:
+    """Trim the audit trail to the configured retention window / count cap.
+
+    Deletes rows older than ``retention_days`` (when > 0), then — if more than
+    ``max_events`` remain — the oldest rows beyond that cap. Both knobs are
+    optional (0/null = keep forever). Best-effort: a failure is logged and
+    swallowed so the diagnostic thread can never take the server down.
+
+    DESTRUCTIVE: pruned rows are gone. This is the documented cost of a bounded
+    trail; set ``retention_days: 0`` and ``max_events: 0`` to keep everything.
+    Returns the number of rows deleted.
+    """
+    if not AUDIT_ENABLED:
+        return 0
+    now = now or datetime.utcnow()
+    session = create_session()
+    try:
+        deleted = 0
+        if isinstance(AUDIT_RETENTION_DAYS, int) and AUDIT_RETENTION_DAYS > 0:
+            cutoff = now - timedelta(days=AUDIT_RETENTION_DAYS)
+            deleted += (session.query(AuditEvent)
+                        .filter(AuditEvent.created < cutoff)
+                        .delete(synchronize_session=False))
+        if isinstance(AUDIT_MAX_EVENTS, int) and AUDIT_MAX_EVENTS > 0:
+            total = session.query(AuditEvent).count()
+            excess = total - AUDIT_MAX_EVENTS
+            if excess > 0:
+                # Drop the oldest `excess` rows (newest are the ones worth
+                # keeping). Uses the created/id ordering the endpoint serves.
+                cutoff_ids = [
+                    row_id for (row_id,) in
+                    session.query(AuditEvent.id)
+                    .order_by(AuditEvent.created.asc(), AuditEvent.id.asc())
+                    .limit(excess)
+                    .all()
+                ]
+                if cutoff_ids:
+                    deleted += (session.query(AuditEvent)
+                                .filter(AuditEvent.id.in_(cutoff_ids))
+                                .delete(synchronize_session=False))
+        if deleted:
+            session.commit()
+            logger.info("Pruned %s audit event(s)", deleted)
+        return deleted
+    except Exception as exc:  # pragma: no cover - best-effort maintenance
+        session.rollback()
+        logger.error("Audit prune failed: %s", exc)
+        return 0
+    finally:
+        session.close()
+
+
+def start_audit_pruner() -> None:
+    """Background thread that periodically prunes the audit trail.
+
+    Skipped entirely when audit is disabled or both retention knobs are off
+    (nothing to prune), so a keep-forever deployment runs no extra thread.
+    """
+    if not AUDIT_ENABLED:
+        return
+    time_capped = isinstance(AUDIT_RETENTION_DAYS, int) and AUDIT_RETENTION_DAYS > 0
+    count_capped = isinstance(AUDIT_MAX_EVENTS, int) and AUDIT_MAX_EVENTS > 0
+    if not (time_capped or count_capped) or AUDIT_PRUNE_INTERVAL <= 0:
+        return
+
+    def _loop() -> None:
+        while True:
+            try:
+                time.sleep(AUDIT_PRUNE_INTERVAL)
+                prune_audit_events()
+            except Exception:  # pragma: no cover - best-effort loop guard
+                pass
+
+    thread = threading.Thread(target=_loop, name='AuditPruner', daemon=True)
+    thread.start()
+    logger.info(
+        "Audit pruner started (interval=%ss, retention_days=%s, max_events=%s)",
+        AUDIT_PRUNE_INTERVAL, AUDIT_RETENTION_DAYS, AUDIT_MAX_EVENTS,
     )
 
 
@@ -1460,6 +1609,59 @@ def _actor() -> str:
             f"from {_client_ip()}")
 
 
+def _audit(action: str, *, target: Optional[str] = None,
+           detail: Optional[str] = None, collection: Optional[str] = None,
+           count: Optional[int] = None, actor: Optional[str] = None,
+           role: Optional[str] = None, via: Optional[str] = None) -> None:
+    """Append one row to the audit trail. NEVER raises into the request.
+
+    Best-effort observability: any failure is logged and swallowed, because a
+    broken audit write must not turn a successful mutation into a 500. Identity
+    comes from :func:`_principal` + :func:`_client_ip` (both memoised, so no
+    extra DB work), unless ``actor``/``role``/``via`` are passed explicitly —
+    the login event needs that, since the principal does not exist yet on the
+    request that creates the session.
+
+    Uses its OWN short-lived session (independent of the endpoint's), so it is
+    safe to call after that session has closed. Text fields are truncated
+    defensively; secrets must never be passed in.
+    """
+    if not AUDIT_ENABLED:
+        return
+    try:
+        if actor is None:
+            principal = _principal()
+            if principal:
+                actor = str(principal['user'])
+                role = role if role is not None else str(principal.get('role') or '')
+                via = via if via is not None else str(principal.get('via') or '')
+            else:
+                actor = 'anonymous'
+        row = AuditEvent(
+            id=uuid.uuid4().hex,
+            actor=(str(actor) or 'anonymous')[:_AUDIT_TARGET_MAX],
+            role=(str(role)[:_AUDIT_TARGET_MAX] if role else None),
+            via=(str(via)[:_AUDIT_TARGET_MAX] if via else None),
+            ip=_client_ip(),
+            action=str(action)[:_AUDIT_TARGET_MAX],
+            target=(str(target)[:_AUDIT_TARGET_MAX] if target else None),
+            collection=(str(collection)[:_AUDIT_TARGET_MAX] if collection else None),
+            count=(int(count) if count is not None else None),
+            detail=(str(detail)[:_AUDIT_DETAIL_MAX] if detail else None),
+        )
+        session = create_session()
+        try:
+            session.add(row)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+    except Exception as exc:  # pragma: no cover - audit must never break a request
+        logger.warning("Audit write failed for action %r: %s", action, exc)
+
+
 def _ui_session_valid() -> bool:
     return _principal() is not None
 
@@ -1801,6 +2003,8 @@ def ui_sso_callback():
                        secure=True)
     logger.info("SSO login successful for %s (role=%s)", username,
                 SSO_DEFAULT_ROLE)
+    _audit('auth.login', target=username, actor=username,
+           role=SSO_DEFAULT_ROLE, via='sso', detail='sso')
     return resp
 
 
@@ -3705,6 +3909,8 @@ def revoke_object(stix_id: str):
             "Object %s %s (source=%s) by %s",
             stix_id, action, row.source, _actor(),
         )
+        _audit(f'object.{action}', target=stix_id,
+               collection=row.collection_id, detail=row.source)
         return jsonify({'id': stix_id, 'revoked': bool(row.revoked), 'changed': True})
     except Exception as exc:
         session.rollback()
@@ -3764,6 +3970,8 @@ def ingest_data():
 
     logger.info("Ingest via /feed/ingest: %d object(s) into '%s' (mode=%s) by %s",
                 count, cid, mode, _actor())
+    _audit('feed.ingest', target=cid, collection=cid, count=count,
+           detail=f'mode={mode}')
     return jsonify({
         'message': 'Data ingested successfully',
         'mode': mode,
@@ -3806,6 +4014,8 @@ def delete_objects_data():
         session.close()
     logger.info("Deleted %d object(s) via /feed/delete by %s",
                 len(deleted), _actor())
+    _audit('feed.delete', count=len(deleted),
+           detail=('ids: ' + ', '.join(deleted[:10])) if deleted else None)
     return jsonify({'deleted': len(deleted), 'ids': deleted}), 200
 
 
@@ -3834,6 +4044,8 @@ def purge_data():
         return jsonify({'error': 'could not purge the feed'}), 500
     logger.info("Purge via /feed/purge: %d object(s) from %s by %s",
                 purged, f"'{cid}'" if cid else 'ALL collections', _actor())
+    _audit('feed.purge', target=cid or 'ALL', collection=cid, count=purged,
+           detail='all collections' if not cid else f"collection '{cid}'")
     if cid:
         return jsonify({
             'message': f"Collection '{cid}' purged successfully",
@@ -3973,6 +4185,12 @@ def ui_login():
     if who is None:
         return jsonify({'error': 'Invalid credentials'}), 401
     logger.info("Dashboard login: %s (role=%s)", who['user'], who['role'])
+    # The principal does not exist yet on this request (the cookie is set in
+    # the response), so identity is passed explicitly.
+    _audit('auth.login', target=who['user'], actor=who['user'],
+           role=who['role'],
+           via='ui_auth' if who['src'] == 'static' else 'session',
+           detail='local')
     resp = jsonify({'message': 'Logged in', 'user': who['user'],
                     'role': who['role']})
     resp.set_cookie(
@@ -4027,6 +4245,12 @@ def ui_collections():
 
 _MAX_KEY_LABEL = 128
 _MAX_KEY_EXPIRY_DAYS = 3650
+
+# Audit window served to the dashboard: newest-first, bounded. The tab filters
+# and pages this window client-side (like the Feed tab), so the server never
+# streams an unbounded trail.
+_DEFAULT_AUDIT_LIMIT = 200
+_MAX_AUDIT_LIMIT = 1000
 
 
 def _api_key_public(row: 'ApiKey') -> Dict[str, Any]:
@@ -4173,6 +4397,23 @@ def _user_public(row: 'UIUser') -> Dict[str, Any]:
     }
 
 
+def _audit_public(row: 'AuditEvent') -> Dict[str, Any]:
+    """Dashboard view of one audit event (timestamps as STIX 'Z' strings)."""
+    return {
+        'id': row.id,
+        'created': _stix_ts(row.created),
+        'actor': row.actor,
+        'role': row.role,
+        'via': row.via,
+        'ip': row.ip,
+        'action': row.action,
+        'target': row.target,
+        'collection': row.collection,
+        'count': row.count,
+        'detail': row.detail,
+    }
+
+
 def _enabled_admin_count(session, exclude_id: Optional[str] = None) -> int:
     """Enabled admins, optionally ignoring one row.
 
@@ -4203,6 +4444,56 @@ def ui_users():
         'roles': sorted(ROLE_LEVELS, key=lambda r: ROLE_LEVELS[r]),
         # Surfaced so the UI can explain why the static login still works.
         'bootstrap_configured': bool(_ui_username and _ui_password),
+    }), 200
+
+
+@app.route('/ui/audit', methods=['GET'])
+def ui_audit():
+    """GET /ui/audit — the mutation/login audit trail, newest first (admin).
+
+    Bounded window (``?limit=``, default 200, hard cap 1000); the dashboard
+    tab searches and pages it client-side. ``?action=`` / ``?actor=`` are
+    exact-match filters — an unknown value simply matches nothing (200 with an
+    empty list), it is not an error. A malformed ``limit`` is a 400.
+    """
+    if not _admin_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    raw_limit = request.args.get('limit')
+    limit = _DEFAULT_AUDIT_LIMIT
+    if raw_limit not in (None, ''):
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return jsonify({
+                'error': f'limit must be an integer, got {raw_limit!r}'
+            }), 400
+        if limit < 1:
+            return jsonify({'error': 'limit must be at least 1'}), 400
+        limit = min(limit, _MAX_AUDIT_LIMIT)
+    session = create_session()
+    try:
+        query = session.query(AuditEvent)
+        action = request.args.get('action')
+        if action:
+            query = query.filter(AuditEvent.action == action)
+        actor = request.args.get('actor')
+        if actor:
+            query = query.filter(AuditEvent.actor == actor)
+        # Fetch one extra to detect truncation without a second COUNT query.
+        rows = (query.order_by(AuditEvent.created.desc(), AuditEvent.id.desc())
+                .limit(limit + 1).all())
+        truncated = len(rows) > limit
+        events = [_audit_public(r) for r in rows[:limit]]
+    finally:
+        session.close()
+    return jsonify({
+        'events': events,
+        'count': len(events),
+        'limit': limit,
+        'max_limit': _MAX_AUDIT_LIMIT,
+        'truncated': truncated,
+        'actions': list(AUDIT_ACTIONS),
+        'generated': _stix_now(),
     }), 200
 
 
@@ -4239,6 +4530,7 @@ def ui_users_create():
         session.close()
     logger.info("Dashboard user %r created (role=%s) by %s",
                 username, role, _actor())
+    _audit('user.create', target=username, detail=f'role={role}')
     return jsonify(payload), 201
 
 
@@ -4283,6 +4575,10 @@ def ui_users_update(user_id: str):
     logger.info("Dashboard user %r updated (role=%s, enabled=%s) by %s",
                 payload['username'], payload['role'], payload['enabled'],
                 _actor())
+    changed = [k for k in ('role', 'enabled', 'password')
+               if data.get(k) not in (None, '')]
+    _audit('user.update', target=payload['username'],
+           detail='fields: ' + ','.join(changed) if changed else None)
     return jsonify(payload), 200
 
 
@@ -4309,6 +4605,7 @@ def ui_users_delete(user_id: str):
     finally:
         session.close()
     logger.info("Dashboard user %r deleted by %s", username, _actor())
+    _audit('user.delete', target=username)
     return jsonify({'message': f'user {username!r} deleted'}), 200
 
 
@@ -4386,6 +4683,9 @@ def ui_keys_create():
     # Log the prefix only — the secret must never reach the log.
     logger.info("API key %s created (label=%r, collections=%s) by %s",
                 prefix, label, ','.join(scope), _actor())
+    # Prefix only — the secret must never reach the audit trail either.
+    _audit('key.create', target=prefix,
+           detail=f'label={label!r}, collections={",".join(scope)}')
     payload['key'] = plaintext
     payload['message'] = ('Copy this key now — it is shown once and cannot be '
                           'retrieved again.')
@@ -4414,6 +4714,7 @@ def ui_key_revoke(key_id: str):
     finally:
         session.close()
     logger.info("API key %s revoked by %s", payload['prefix'], _actor())
+    _audit('key.revoke', target=payload['prefix'])
     return jsonify({**payload, 'changed': True}), 200
 
 
@@ -4462,6 +4763,10 @@ def community_pull(name: str):
         return jsonify(result), 400
     logger.info("Community pull '%s' by %s: %s", name, _actor(),
                 result.get('added', result.get('error', 'ok')))
+    added = result.get('added')
+    _audit('community.pull', target=name,
+           count=added if isinstance(added, int) else None,
+           detail=(f"error: {result['error']}" if result.get('error') else 'ok'))
     return jsonify(result), 200
 
 
@@ -4952,6 +5257,8 @@ def import_csv_data():
     logger.info("Import via /feed/import-csv: +%d object(s) into '%s' "
                 "(source=manual, skipped %d) by %s",
                 added, cid, len(skipped), _actor())
+    _audit('feed.import', target=cid, collection=cid, count=added,
+           detail=f'skipped {len(skipped)}')
     return jsonify({
         'imported': added,
         'skipped': skipped[:50],
@@ -5682,6 +5989,9 @@ def start_background_jobs() -> None:
     # then start the periodic TTL sweeper.
     sweep_expired_indicators()
     start_ttl_sweeper()
+
+    # Bound the audit trail (only when a retention knob is set).
+    start_audit_pruner()
 
     if otx_poller.enabled and otx_poller.base_url:
         otx_poller.start()
