@@ -2847,8 +2847,12 @@ class TestApiKeys(_CollectionRegistryTestCase):
     def tearDown(self):
         self._restore_registry()
 
-    def _create(self, label='key', collections=('alpha',), **extra):
-        body = {'label': label, 'collections': list(collections)}
+    def _create(self, label='key', collections=('alpha',), types=None, **extra):
+        # `types` is a required scope now; default it to every stored type so
+        # tests that don't care about type filtering behave as before.
+        body = {'label': label, 'collections': list(collections),
+                'types': list(types) if types is not None
+                         else sorted(_server._SUPPORTED_STIX_TYPES)}
         body.update(extra)
         return self.client.post('/ui/keys', json=body, headers=self.admin_auth)
 
@@ -2955,6 +2959,13 @@ class TestApiKeys(_CollectionRegistryTestCase):
         self.assertEqual(self._create(collections=['nope']).status_code, 400)
         self.assertEqual(self._create(expires_days=0).status_code, 400)
         self.assertEqual(self._create(rate_limit=-1).status_code, 400)
+        # Object types are a required, strict allow-list.
+        self.assertEqual(self._create(types=[]).status_code, 400)
+        self.assertEqual(self._create(types=['nope']).status_code, 400)
+        body = self.client.post('/ui/keys', json={
+            'label': 'no-types', 'collections': ['alpha']},
+            headers=self.admin_auth)
+        self.assertEqual(body.status_code, 400)
         self.assertEqual(self._create(rate_window=0).status_code, 400)
 
     def test_key_management_requires_a_writer(self):
@@ -3057,6 +3068,90 @@ class TestApiKeys(_CollectionRegistryTestCase):
                                headers=self.admin_auth).get_json()['keys']
         capped = next(k for k in keys if k['label'] == 'capped')
         self.assertEqual(capped['max_objects'], 7)
+
+    # --- per-key object-type allow-list ------------------------------------
+
+    @staticmethod
+    def _obj(stix_id, obj_type, props):
+        return {'id': stix_id, 'type': obj_type, 'object': {obj_type: props},
+                'labels': ['threat'], 'confidence': 90}
+
+    def _seed_mixed(self, collection='alpha'):
+        """An ipv4, a domain and a non-IOC (malware) object in the feed."""
+        _server.ingest_objects([
+            self._obj('ipv4-addr--10-0-0-1', 'ipv4-addr', {'value': '10.0.0.1'}),
+            self._obj('domain-name--evil-example', 'domain-name',
+                      {'value': 'evil.example'}),
+            self._obj('malware--m1', 'malware', {'name': 'Zbot'}),
+        ], mode='merge', source='manual', collection=collection)
+
+    def _kinds(self, key, path='/taxii2/collections/alpha/objects/'):
+        return {served_kind(o) for o in self._objects(key, path)[0]}
+
+    def test_key_types_required_and_reported(self):
+        # Required: absent/empty/unknown selections are all rejected.
+        absent = self.client.post('/ui/keys', json={
+            'label': 'k', 'collections': ['alpha']}, headers=self.admin_auth)
+        self.assertEqual(absent.status_code, 400)
+        self.assertEqual(self._create(types=[]).status_code, 400)
+        self.assertEqual(self._create(types=['nope']).status_code, 400)
+        # A valid selection is echoed back and listed on GET.
+        body = self._create(label='typed',
+                            types=['domain-name', 'ipv4-addr']).get_json()
+        self.assertEqual(sorted(body['types']), ['domain-name', 'ipv4-addr'])
+        listed = self.client.get('/ui/keys', headers=self.admin_auth).get_json()
+        self.assertEqual(set(listed['types']), set(_server._SUPPORTED_STIX_TYPES))
+        typed = next(k for k in listed['keys'] if k['label'] == 'typed')
+        self.assertEqual(sorted(typed['types']), ['domain-name', 'ipv4-addr'])
+
+    def test_key_serves_only_its_selected_types(self):
+        self._seed_mixed()
+        key = self._create(types=['ipv4-addr']).get_json()['key']
+        self.assertEqual(self._kinds(key), {'ipv4-addr'})
+
+    def test_key_types_are_a_strict_allow_list(self):
+        """Non-IOC context objects are withheld unless the key lists them."""
+        self._seed_mixed()
+        ioc_only = self._create(
+            label='ioc', types=['ipv4-addr', 'domain-name']).get_json()['key']
+        self.assertEqual(self._kinds(ioc_only), {'ipv4-addr', 'domain-name'})
+        with_malware = self._create(
+            label='all',
+            types=['ipv4-addr', 'domain-name', 'malware']).get_json()['key']
+        self.assertIn('malware', self._kinds(with_malware))
+
+    def test_indicator_selects_every_ioc_type(self):
+        """'indicator' is an alias for all IOC values (they serve as indicators);
+        it still does not unlock non-IOC objects."""
+        self._seed_mixed()
+        key = self._create(types=['indicator']).get_json()['key']
+        self.assertEqual(self._kinds(key), {'ipv4-addr', 'domain-name'})
+
+    def test_client_match_type_narrows_but_never_widens_the_key(self):
+        self._seed_mixed()
+        key = self._create(types=['domain-name']).get_json()['key']
+        # The client asks for indicators; the key still only yields domains.
+        self.assertEqual(
+            self._kinds(key,
+                        '/taxii2/collections/alpha/objects/?match[type]=indicator'),
+            {'domain-name'})
+
+    def test_legacy_row_without_types_serves_everything(self):
+        """A pre-column (NULL types) key keeps serving all types."""
+        self._seed_mixed()
+        key = self._create(types=['ipv4-addr']).get_json()['key']
+        session = _server.create_session()
+        try:
+            session.query(_server.ApiKey).delete()
+            session.add(_server.ApiKey(
+                id='legacy', prefix=key.split('_')[1],
+                secret_hash=_server._hash_api_key_secret(key), enabled=True,
+                collections='["alpha"]', types=None))
+            session.commit()
+        finally:
+            session.close()
+        self.assertEqual(self._kinds(key),
+                         {'ipv4-addr', 'domain-name', 'malware'})
 
 
 class TestSecurityHardening(unittest.TestCase):
@@ -3549,7 +3644,8 @@ class TestDashboardUsers(unittest.TestCase):
         admin = self._login('adm')
         self.assertEqual(admin.get('/ui/users').status_code, 200)
         self.assertEqual(admin.post('/ui/keys', json={
-            'label': 'k', 'collections': ['gt_intel']}).status_code, 201)
+            'label': 'k', 'collections': ['gt_intel'],
+            'types': ['ipv4-addr']}).status_code, 201)
 
     # --- changes apply without a re-login -----------------------------------
 
@@ -3745,7 +3841,8 @@ class TestAuditLog(unittest.TestCase):
     def test_key_create_records_prefix_never_the_secret(self):
         r = self.admin.post('/ui/keys', json={
             'label': 'ci-key',
-            'collections': [_server.DEFAULT_MANUAL_COLLECTION_ID]})
+            'collections': [_server.DEFAULT_MANUAL_COLLECTION_ID],
+            'types': ['ipv4-addr']})
         self.assertEqual(r.status_code, 201)
         body = r.get_json()
         row = self._one(action='key.create')
@@ -3757,7 +3854,8 @@ class TestAuditLog(unittest.TestCase):
     def test_key_revoke_is_recorded(self):
         created = self.admin.post('/ui/keys', json={
             'label': 'k',
-            'collections': [_server.DEFAULT_MANUAL_COLLECTION_ID]}).get_json()
+            'collections': [_server.DEFAULT_MANUAL_COLLECTION_ID],
+            'types': ['ipv4-addr']}).get_json()
         r = self.admin.post(f"/ui/keys/{created['id']}/revoke")
         self.assertEqual(r.status_code, 200)
         row = self._one(action='key.revoke')
@@ -3803,7 +3901,8 @@ class TestAuditLog(unittest.TestCase):
         editor = self._login('ed')
         editor.post('/feed/ingest', json={'stix_objects': [_manual_obj('7.7.7.7')]})
         self.admin.post('/ui/keys', json={
-            'label': 'k', 'collections': [_server.DEFAULT_MANUAL_COLLECTION_ID]})
+            'label': 'k', 'collections': [_server.DEFAULT_MANUAL_COLLECTION_ID],
+            'types': ['ipv4-addr']})
         only_ingest = self.admin.get('/ui/audit?action=feed.ingest').get_json()
         self.assertTrue(only_ingest['events'])
         self.assertTrue(all(e['action'] == 'feed.ingest'

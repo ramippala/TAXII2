@@ -274,6 +274,13 @@ class ApiKey(Base):
     # follow `more`/`next` (or poll with added_after) to make progress, or it
     # will keep receiving the same first page.
     max_objects = Column(Integer, nullable=True)
+    # Object-TYPE allow-list for this key: a JSON list of stored STIX object
+    # types (see _SUPPORTED_STIX_TYPES) the key may be SERVED by Get Objects.
+    # Unlike max_objects (a delivery throttle), this narrows entitlement: a
+    # type outside the list is never returned. NULL (a legacy row) means "all
+    # types" — init_db backfills existing keys with the full list so their
+    # behaviour is unchanged. Enforced only on the /taxii2/ read path.
+    types = Column(Text, nullable=True)
 
 
 class UIUser(Base):
@@ -523,6 +530,20 @@ def init_db() -> None:
                     text('ALTER TABLE api_keys ADD COLUMN max_objects INTEGER')
                 )
             logger.info("Migrated api_keys: added 'max_objects' column")
+        # `types` (the per-key object-type allow-list) also arrived later. Add
+        # it, then backfill every existing key with the FULL type list so the
+        # now-strict allow-list does not silently strip types (reports,
+        # relationships, …) from keys that predate the column.
+        if 'types' not in key_cols:
+            all_types = json.dumps(sorted(_SUPPORTED_STIX_TYPES))
+            with engine.begin() as conn:
+                conn.execute(text('ALTER TABLE api_keys ADD COLUMN types TEXT'))
+                conn.execute(
+                    text('UPDATE api_keys SET types = :all WHERE types IS NULL'),
+                    {'all': all_types},
+                )
+            logger.info("Migrated api_keys: added 'types' column (backfilled)")
+
     # `create_all` only creates indexes for tables it creates, so a database
     # that predates the poll-path indexes above never gets them. Create any
     # missing ones explicitly — checkfirst makes this idempotent and portable
@@ -1278,6 +1299,40 @@ def _parse_key_collections(raw: Any) -> List[str]:
     return [str(v) for v in value if str(v or '').strip()]
 
 
+def _all_key_object_types() -> List[str]:
+    """The full sorted list of stored object types a key may be scoped to.
+
+    Sourced from ``_SUPPORTED_STIX_TYPES`` — everything the feed stores — so the
+    strict allow-list can express any type, not just IOCs.
+    """
+    return sorted(_SUPPORTED_STIX_TYPES)
+
+
+def _parse_key_object_types(raw: Any) -> List[str]:
+    """Decode a key's object-type allow-list (JSON list).
+
+    Mirrors :func:`_parse_key_collections`, but never returns an empty list: a
+    falsy/malformed/empty value falls back to ALL types, so a legacy or corrupt
+    row can never silently lock a live consumer out of the feed.
+    """
+    if not raw:
+        return _all_key_object_types()
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return _all_key_object_types()
+    if not isinstance(value, list):
+        return _all_key_object_types()
+    parsed = [str(v) for v in value if str(v or '').strip()
+              and str(v) in _SUPPORTED_STIX_TYPES]
+    # De-dupe, preserving order.
+    seen: List[str] = []
+    for t in parsed:
+        if t not in seen:
+            seen.append(t)
+    return seen or _all_key_object_types()
+
+
 def _api_key_row(password: str) -> Optional[Dict[str, Any]]:
     """Resolve a live (well-formed, enabled, unexpired) key to its scope.
 
@@ -1304,6 +1359,7 @@ def _api_key_row(password: str) -> Optional[Dict[str, Any]]:
             'label': row.label,
             'prefix': row.prefix,
             'collections': _parse_key_collections(row.collections),
+            'types': _parse_key_object_types(row.types),
             'rate_limit': int(row.rate_limit or 0),
             'rate_window': int(row.rate_window or 0),
             'max_objects': int(row.max_objects or 0),
@@ -3075,7 +3131,8 @@ def build_stix_bundle(since: Optional[str] = None,
                       added_after: Optional[str] = None,
                       collection: Optional[str] = None,
                       limit: Optional[int] = None,
-                      next_cursor: Optional[str] = None) -> Tuple[Dict[str, Any], bool, Optional[str]]:
+                      next_cursor: Optional[str] = None,
+                      allowed_types: Optional[List[str]] = None) -> Tuple[Dict[str, Any], bool, Optional[str]]:
     """Build a STIX 2.1 bundle of the current feed (optionally filtered/paged).
 
     TAXII 2.1 Get Objects parameters:
@@ -3086,6 +3143,9 @@ def build_stix_bundle(since: Optional[str] = None,
       * ``match_types``: ``match[type]`` - only these STIX object types.
       * ``match_ids``: ``match[id]`` - only these exact object ids.
       * ``collection``: only objects of this TAXII collection (None = all).
+      * ``allowed_types``: a per-API-key ALLOW-LIST of stored object types
+        (None = unrestricted). Applied in ADDITION to ``match_types`` — a
+        client can narrow further but never widen past its key's scope.
       * ``limit`` / ``next_cursor``: keyset pagination in (modified, stix_id)
         order — pages stay consistent while the feed changes underneath and
         never loop. Returns ``more`` (more pages exist) and ``next_cursor``
@@ -3121,6 +3181,18 @@ def build_stix_bundle(since: Optional[str] = None,
             type_filter = type_filter | _IOC_STORED_TYPES
         if type_filter:
             q = q.filter(STIXObject.object_type.in_(type_filter))
+        # Per-key object-type allow-list (independent of, and ANDed with,
+        # match[type]): the key can only ever be served the stored types it was
+        # scoped to. 'indicator' expands the same way as above (it is an alias
+        # for every IOC value, since those are all served as indicators).
+        allowed_filter = None
+        if allowed_types is not None:
+            allowed_filter = {str(t) for t in allowed_types}
+            if 'indicator' in allowed_filter:
+                allowed_filter = allowed_filter | _IOC_STORED_TYPES
+            # An empty allow-list (never produced by key validation, but
+            # defensive) matches nothing rather than falling open.
+            q = q.filter(STIXObject.object_type.in_(allowed_filter))
 
         # Keyset pagination: consistent (modified, stix_id) ordering.
         q = q.order_by(STIXObject.modified.asc(), STIXObject.stix_id.asc())
@@ -3168,6 +3240,9 @@ def build_stix_bundle(since: Optional[str] = None,
         # match[type] - filter on the stored type we would render
         # (matches the SQL-level filter above; kept for direct callers).
         if type_filter is not None and row.object_type not in type_filter:
+            continue
+        # Per-key allow-list (kept for direct callers; matches the SQL filter).
+        if allowed_filter is not None and row.object_type not in allowed_filter:
             continue
         # Community-intel gate (manual intel is never gated).
         verdict = gate_verdict(obj, row)
@@ -3489,6 +3564,9 @@ def taxii_objects(collection_id: str):
             since=since, match_types=match_types, match_ids=match_ids,
             collection=collection_id, limit=effective_limit,
             next_cursor=next_cursor,
+            # The key's object-type allow-list bounds what this consumer can
+            # ever be served; non-key auth (static creds / UI session) is None.
+            allowed_types=(key or {}).get('types'),
         )
     except ValueError as exc:
         return _taxii_error(400, 'Bad Request', str(exc), 'malformed')
@@ -4260,6 +4338,7 @@ def _api_key_public(row: 'ApiKey') -> Dict[str, Any]:
         'label': row.label,
         'prefix': row.prefix,
         'collections': _parse_key_collections(row.collections),
+        'types': _parse_key_object_types(row.types),
         'enabled': bool(row.enabled),
         'created': _stix_ts(row.created),
         'expires_at': _stix_ts(row.expires_at),
@@ -4287,6 +4366,29 @@ def _validate_key_scope(value: Any) -> Tuple[Optional[List[str]], Optional[str]]
     if not scope:
         return None, 'collections: select at least one collection'
     return scope, None
+
+
+def _validate_key_types(value: Any) -> Tuple[Optional[List[str]], Optional[str]]:
+    """Validate a key's object-type allow-list: a non-empty list of known types.
+
+    The list is *required* (a key must declare its type scope) and every member
+    must be a stored type (``_SUPPORTED_STIX_TYPES``). Unknown values are
+    rejected so a typo can't create a key that silently serves nothing.
+    """
+    if not isinstance(value, (list, tuple)) or not value:
+        return None, 'types: select at least one object type'
+    types: List[str] = []
+    for raw in value:
+        t = str(raw or '').strip()
+        if not t:
+            continue
+        if t not in _SUPPORTED_STIX_TYPES:
+            return None, f'unknown object type: {t!r}'
+        if t not in types:
+            types.append(t)
+    if not types:
+        return None, 'types: select at least one object type'
+    return types, None
 
 
 def _parse_key_expiry(value: Any) -> Tuple[Optional[datetime], Optional[str]]:
@@ -4627,6 +4729,8 @@ def ui_keys():
              'members': list(c.members), 'aggregate': bool(c.members)}
             for c in TAXII_COLLECTIONS
         ],
+        # Canonical vocabulary for the dashboard's object-type checkboxes.
+        'types': _all_key_object_types(),
         'primary': TAXII_COLLECTION_ID,
     }), 200
 
@@ -4644,6 +4748,9 @@ def ui_keys_create():
         return jsonify({'error': f'label must be at most {_MAX_KEY_LABEL} characters'}), 400
 
     scope, err = _validate_key_scope(data.get('collections'))
+    if err:
+        return jsonify({'error': err}), 400
+    types, err = _validate_key_types(data.get('types'))
     if err:
         return jsonify({'error': err}), 400
     expires_at, err = _parse_key_expiry(data.get('expires_days'))
@@ -4667,6 +4774,7 @@ def ui_keys_create():
             enabled=True,
             expires_at=expires_at,
             collections=json.dumps(scope),
+            types=json.dumps(types),
             rate_limit=rate_limit or None,
             rate_window=rate_window if rate_limit else None,
             max_objects=key_max_objects,
@@ -4681,11 +4789,12 @@ def ui_keys_create():
     finally:
         session.close()
     # Log the prefix only — the secret must never reach the log.
-    logger.info("API key %s created (label=%r, collections=%s) by %s",
-                prefix, label, ','.join(scope), _actor())
+    logger.info("API key %s created (label=%r, collections=%s, types=%s) by %s",
+                prefix, label, ','.join(scope), ','.join(types), _actor())
     # Prefix only — the secret must never reach the audit trail either.
     _audit('key.create', target=prefix,
-           detail=f'label={label!r}, collections={",".join(scope)}')
+           detail=(f'label={label!r}, collections={",".join(scope)}, '
+                   f'types={",".join(types)}'))
     payload['key'] = plaintext
     payload['message'] = ('Copy this key now — it is shown once and cannot be '
                           'retrieved again.')

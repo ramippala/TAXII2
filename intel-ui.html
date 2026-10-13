@@ -403,6 +403,10 @@
       <div class="row" style="margin-top:10px">
         <span class="muted">Collections (at least one):</span>
         <span id="keyScope" class="keyScope"></span>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <span class="muted" title="What this key may be served by Get Objects. Only ticked types are ever returned; other objects are withheld. 'indicator' selects every IOC value (they are all served as indicators).">Object types (at least one):</span>
+        <span id="keyTypes" class="keyScope"></span>
         <button id="btnKeyCreate" class="ghost">Generate key</button>
       </div>
       <div id="keyMsg" class="msg" style="margin-top:10px"></div>
@@ -423,7 +427,7 @@
       <table id="keyTable" style="display:none">
         <thead>
           <tr>
-            <th>Label</th><th>Prefix</th><th>Collections</th><th>Rate limit</th>
+            <th>Label</th><th>Prefix</th><th>Collections</th><th>Types</th><th>Rate limit</th>
             <th>Max IOCs</th>
             <th>Expires</th><th>Last used</th><th>Status</th><th></th>
           </tr>
@@ -899,6 +903,8 @@ async function doLogout() {
   $("keyMsg").className = "msg";
   $("keyScope").innerHTML = "";
   delete $("keyScope").dataset.ids;
+  $("keyTypes").innerHTML = "";
+  delete $("keyTypes").dataset.types;
   $("userBody").innerHTML = "";
   $("userTable").style.display = "none";
   $("userMsg").className = "msg";
@@ -1492,6 +1498,38 @@ function selectedKeyScope() {
   return [...$("keyScope").querySelectorAll("input:checked")].map(i => i.value);
 }
 
+// Object-type allow-list checkboxes. Unlike the collections scope these are
+// NOT pre-ticked — the operator must declare the key's type scope explicitly.
+// IOC types are listed first (the common ask), 'indicator' labelled because it
+// selects every IOC value.
+const KEY_IOC_TYPES = ["ipv4-addr", "domain-name", "file-hash", "url",
+  "email-addr", "ipv6-addr", "mac-addr", "indicator",
+  "windows-registry-key", "autonomous-system"];
+function renderKeyTypes(types) {
+  const box = $("keyTypes");
+  const ordered = KEY_IOC_TYPES.filter(t => types.includes(t))
+    .concat(types.filter(t => !KEY_IOC_TYPES.includes(t)));
+  const wanted = ordered.join(",");
+  if (box.dataset.types === wanted) return;
+  const ticked = new Set([...box.querySelectorAll("input:checked")].map(i => i.value));
+  box.dataset.types = wanted;
+  box.innerHTML = "";
+  ordered.forEach(t => {
+    const label = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.value = t;
+    if (ticked.has(t)) cb.checked = true;
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(
+      t === "indicator" ? "indicator (all IOC values)" : t));
+    box.appendChild(label);
+  });
+}
+
+function selectedKeyTypes() {
+  return [...$("keyTypes").querySelectorAll("input:checked")].map(i => i.value);
+}
+
 function renderKeyTable(keys) {
   const body = $("keyBody");
   const table = $("keyTable");
@@ -1505,6 +1543,7 @@ function renderKeyTable(keys) {
       k.label,
       k.prefix,
       k.collections.join(", "),
+      (k.types || []).join(", "),
       k.rate_limit ? `${k.rate_limit} / ${k.rate_window || 60}s` : "unlimited",
       k.max_objects ? `${k.max_objects} / response` : "server default",
       fmtKeyTs(k.expires_at),
@@ -1538,6 +1577,7 @@ async function loadKeys() {
     }
     const b = r.body || {};
     renderKeyScope(b.collections || []);
+    renderKeyTypes(b.types || []);
     renderKeyTable(b.keys || []);
   } catch (e) {
     keyMsg("Could not load keys: " + e.message, false);
@@ -1549,7 +1589,9 @@ async function createKey() {
   if (!label) { keyMsg("A label is required.", false); return; }
   const scope = selectedKeyScope();
   if (!scope.length) { keyMsg("Select at least one collection.", false); return; }
-  const body = { label, collections: scope };
+  const types = selectedKeyTypes();
+  if (!types.length) { keyMsg("Select at least one object type.", false); return; }
+  const body = { label, collections: scope, types };
   const days = $("keyExpiry").value.trim();
   if (days) body.expires_days = Number(days);
   const limit = $("keyRateLimit").value.trim();

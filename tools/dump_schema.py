@@ -103,6 +103,10 @@ def _check(metadata) -> int:
     if 'max_objects' not in metadata.tables['api_keys'].columns:
         print('FAIL: api_keys.max_objects is gone', file=sys.stderr)
         return 1
+    if 'types' not in metadata.tables['api_keys'].columns:
+        print('FAIL: api_keys.types (object-type allow-list) is gone',
+              file=sys.stderr)
+        return 1
     composite = {'ix_stix_objects_modified_id', 'ix_stix_objects_coll_modified_id'}
     have_idx = {i.name for t in metadata.tables.values() for i in t.indexes}
     missing_idx = sorted(composite - have_idx)

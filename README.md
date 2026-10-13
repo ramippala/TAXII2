@@ -619,8 +619,8 @@ These drive the dashboard login. They are independent of `taxii.auth`.
 |----------|---------|
 | `GET /ui/session` | Current session: `{"authenticated": bool, "user": str\|null, "role": str\|null, "can_write": bool, "can_admin": bool}` |
 | `GET /ui/collections` | Collection registry for the dashboard selector: `{"collections": [{id,title,members,aggregate}], "primary": id, "manual": id, "community": id}` — `manual`/`community` are where the dashboard routes a write, since an aggregate is read-only |
-| `GET /ui/keys` | Issued API keys (prefix, label, scope, expiry, last used, enabled) — never the secret. Requires an **admin** principal |
-| `POST /ui/keys` | Body `{"label", "collections": [id…], "expires_days"?, "rate_limit"?, "rate_window"?, "max_objects"?}`. Returns the plaintext key **once** (`201`). Requires an **admin** principal |
+| `GET /ui/keys` | Issued API keys (prefix, label, collections, types, expiry, last used, enabled) — never the secret. Also returns the `collections` and `types` registries for the dashboard. Requires an **admin** principal |
+| `POST /ui/keys` | Body `{"label", "collections": [id…], "types": [type…], "expires_days"?, "rate_limit"?, "rate_window"?, "max_objects"?}`. `types` is the required object-type allow-list. Returns the plaintext key **once** (`201`). Requires an **admin** principal |
 | `POST /ui/keys/<id>/revoke` | Disable a key permanently (admin) |
 | `GET /ui/users` | Dashboard users (username, role, enabled, created, last login) — never a password hash. Requires an **admin** principal |
 | `POST /ui/users` | Body `{"username", "password", "role"}` (role: `viewer`\|`editor`\|`admin`). `409` on a duplicate, `400` on a bad role or a password under 12 chars. Returns `201` (admin) |
@@ -743,7 +743,7 @@ wrapped in a TAXII 2.1 message.
 | `GET /taxii2/` | API Root + Server Discovery |
 | `GET /taxii2/collections/` | List collections — **only the collections the authenticated principal's credentials may read** (multi-collection RBAC; one collection = one credential set) |
 | `GET /taxii2/collections/<id>/` | Collection info (`can_read`) — `404` unknown id, `401` with another collection's credentials |
-| `GET /taxii2/collections/<id>/objects/` | **Poll STIX 2.1 objects** (supports `?since=`/`?added_after=`, `?match[type]=`, `?match[id]=` — comma-separated lists allowed — and `?limit=` + `?next=` pagination) |
+| `GET /taxii2/collections/<id>/objects/` | **Poll STIX 2.1 objects** (supports `?since=`/`?added_after=`, `?match[type]=`, `?match[id]=` — comma-separated lists allowed — and `?limit=` + `?next=` pagination). With an API key, the result is additionally narrowed to the key's `types` allow-list and capped by its `max_objects`. |
 | `POST /taxii2/collections/<id>/objects/` | Add-objects ack (read-only feed → no-op) |
 | `GET /taxii2/status/<id>/` | Status (reports `complete`) |
 | `GET /taxii2/subscriptions/` | Subscription list (empty) |
@@ -915,8 +915,8 @@ taxii:
 ### API keys (scoped consumer credentials)
 
 Instead of a second static password per consumer, generate one in the
-dashboard's **API keys** tab. A key is scoped to one or more collections,
-can expire, and can carry its own rate limit.
+dashboard's **API keys** tab. A key is scoped to one or more collections and to
+a set of object types, can expire, and can carry its own rate limit.
 
 - **Format** `taxii_<prefix>_<secret>`, used exactly like a password: the
   **prefix** as the username and the key as the password
@@ -959,6 +959,24 @@ can expire, and can carry its own rate limit.
   > is not, and the cap is starving it — raise the cap, or fix the client's
   > polling. The correct client pattern is
   > `?limit=500&added_after=<modified of the newest object received>`.
+- **Object-type allow-list (`types`).** A key must be scoped to the object
+  **types** it may be served — a strict allow-list. Any type not selected is
+  withheld from that key's Get Objects responses (unlike `max_objects`, this
+  changes *which* objects the key may see). Every stored type is selectable, so
+  the list covers both the IOC kinds (`ipv4-addr`, `domain-name`, `file-hash`,
+  `url`, `email-addr`, `ipv6-addr`, …) and the STIX context objects (`report`,
+  `relationship`, `malware`, `threat-actor`, …). Selecting `indicator` means
+  *all* IOC values (they are all served as STIX `indicator`s) — it does not
+  unlock non-IOC objects. The scope is applied in addition to the client's
+  `match[type]`, so a client can narrow further but never widen past its key.
+  A key's `types` is required at creation (at least one); existing keys were
+  backfilled with the full list, so their behaviour is unchanged.
+
+  > **Boundary note.** The type scope is enforced on the `/taxii2/` Get Objects
+  > surface (where a consumer key polls). The dashboard's `/objects` and
+  > `/feed` endpoints are read with a UI session or other credentials and are
+  > not scoped by a key's `types` — exactly as they are not scoped by its
+  > `collections` today.
 - **Revocation** is permanent: `POST /ui/keys/<id>/revoke` disables the key,
   and it starts failing authentication immediately.
 

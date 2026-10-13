@@ -263,7 +263,7 @@ required** — but the exact DDL is below for a DBA-managed deployment.
 | `stix_objects` | The feed — one row per STIX id. IOCs are *served* as STIX 2.1 `indicator`; stored types also include the extra SCOs (`url`, `email-addr`, `ipv6-addr`, `mac-addr`, `windows-registry-key`, `autonomous-system`) and the SDO/SROs (`malware`, `threat-actor`, `campaign`, `report`, `identity`, `attack-pattern`, `vulnerability`, `relationship`). |
 | `puller_state` | Per-community-puller delta state (`last_sync` feeds the poller's `?since=`) plus the last-run status shown in the dashboard. `id` is `otx` or `taxii:<name>`. |
 | `subscriptions` | Legacy TAXII client subscriptions used by `POST /subscriptions/<client_id>` and `POST /auth`. |
-| `api_keys` | Dashboard-generated, collection-scoped TAXII consumer keys. Only the cleartext `prefix` (indexed for O(1) lookup) and a SHA-256 of the secret are stored; the plaintext is shown **once**, at creation. Optional per-key expiry, sliding-window rate limit (`rate_limit`/`rate_window`) and per-response IOC ceiling (`max_objects`). |
+| `api_keys` | Dashboard-generated, collection-scoped TAXII consumer keys. Only the cleartext `prefix` (indexed for O(1) lookup) and a SHA-256 of the secret are stored; the plaintext is shown **once**, at creation. Optional per-key expiry, sliding-window rate limit (`rate_limit`/`rate_window`), per-response IOC ceiling (`max_objects`) and object-type allow-list (`types`). |
 | `ui_users` | Dashboard logins with a role (`viewer` \| `editor` \| `admin`). Passwords are werkzeug-hashed (scrypt/pbkdf2) and the role is re-resolved per request, so disabling a user takes effect immediately. The static `ui.auth` break-glass admin is deliberately **not** stored here. |
 | `audit_events` | Append-only trail of dashboard mutations (ingest/import/delete/purge/revoke, community pull, key + user management) and successful logins. One row per action, never mutated; read by admins at `GET /ui/audit`. Never stores secrets (a key create records the **prefix**, not the plaintext). Bounded by `audit.retention_days` / `audit.max_events`; `0` keeps rows forever. |
 
@@ -340,6 +340,7 @@ CREATE TABLE api_keys (
     rate_limit   INTEGER,                      -- requests per window (0/null = off)
     rate_window  INTEGER,                      -- window length, seconds
     max_objects  INTEGER,                      -- per-response IOC ceiling (0/null = server cap)
+    types        TEXT,                         -- JSON list of stored object types served (NULL = all)
     PRIMARY KEY (id)
 );
 CREATE INDEX ix_api_keys_prefix ON api_keys (prefix);
@@ -432,6 +433,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO taxii;
 > `CREATE TABLE`s any table the models define that is **missing**) followed by
 > **idempotent column migrations** (`ALTER TABLE … ADD COLUMN` for `source`,
 > `collection_id`, `value`, `object_refs`, `valid_from`, `api_keys.max_objects`,
+> `api_keys.types`,
 > …). Both are no-ops only when the schema is already **complete**. So a
 > DML-only role (no `CREATE`/`ALTER`) must be given the *full* six-table schema
 > above — including `api_keys`, `ui_users` and `audit_events`, which later
