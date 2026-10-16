@@ -54,6 +54,7 @@ EXPECTED_TABLES = (
     'puller_state',
     'audit_events',
     'benign_values',
+    'vt_cache',
 )
 
 

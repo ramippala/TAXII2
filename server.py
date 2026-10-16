@@ -9,9 +9,13 @@ Architecture:
         |
         |  <-- Trend Micro Vision One polls /taxii2/ (external TAXII 2.1 client)
         |
-    Optional background pollers (both off by default):
+    Optional background pollers (all off by default):
         - otx        : pull community intel FROM AlienVault OTX (pulses/indicators)
+        - abuse_ch   : pull community intel FROM abuse.ch (ThreatFox/Feodo/URLhaus)
+        - taxii      : pull objects from any third-party TAXII 2.1 server
         - self_check : self-test that polls our own /feed for reachability
+    Optional enrichment (on demand, off by default):
+        - virus_total: cached VirusTotal lookups (a false-positive tie-breaker)
 """
 
 import base64
@@ -393,6 +397,32 @@ class BenignValue(Base):
     note = Column(String, nullable=True)             # why (free text, optional)
     created = Column(DateTime, default=datetime.utcnow)
     created_by = Column(String, nullable=True)       # actor (user or 'anonymous')
+
+
+class VtCache(Base):
+    """Cached VirusTotal verdict for one value (on-demand enrichment).
+
+    The free VirusTotal tier allows only ~4 requests/min and 500/day, so a
+    lookup result is stored and reused until it ages out (``virus_total.cache_ttl``)
+    — a repeat check of the same value never spends quota. One row per value
+    (lowercased), upserted on each fresh lookup. This is a *tie-breaker* for the
+    false-positive workflow: a flagged domain that VT reports as clean is a good
+    candidate for the known-legitimate filter, and the operator decides.
+    """
+
+    __tablename__ = "vt_cache"
+
+    value = Column(String, primary_key=True)     # lowercased value (URL kept whole)
+    kind = Column(String, nullable=False)        # ip | domain | url | hash
+    malicious = Column(Integer, default=0)
+    suspicious = Column(Integer, default=0)
+    harmless = Column(Integer, default=0)
+    undetected = Column(Integer, default=0)
+    reputation = Column(Integer, nullable=True)
+    categories = Column(String, nullable=True)   # comma-joined VT categories
+    link = Column(String, nullable=True)         # VT GUI permalink
+    fetched = Column(DateTime, default=datetime.utcnow)
+    fetched_by = Column(String, nullable=True)   # actor (user or 'anonymous')
 
 
 def _utc_now_iso() -> str:
@@ -5229,13 +5259,64 @@ def ui_benign_delete(benign_id: str):
                     'deleted': True}), 200
 
 
+@app.route('/ui/vt', methods=['GET'])
+def ui_vt_status():
+    """GET /ui/vt — VirusTotal integration status + cache/quota usage.
+
+    Reports whether it is enabled/configured and how much of the free-tier
+    budget (4/min, 500/day) has been spent in the last rolling 24h.
+    """
+    if not _request_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    return jsonify(vt_client.status()), 200
+
+
+@app.route('/ui/vt/lookup', methods=['POST'])
+def ui_vt_lookup():
+    """POST /ui/vt/lookup — one on-demand, cached VirusTotal lookup.
+
+    The false-positive tie-breaker: ask VT about a single value and decide
+    whether to Exclude it. Body: ``{"value": str, "kind"?: str, "force"?: bool}``
+    — or ``{"object_id": stix_id}`` to derive the value from a stored object.
+    ``force: true`` ignores a fresh cache entry. Write role required (it spends
+    the shared quota and writes the cache).
+    """
+    if not _write_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+    value = data.get('value')
+    kind = data.get('kind')
+    if not value and data.get('object_id'):
+        session = create_session()
+        try:
+            row = session.query(STIXObject).filter_by(
+                stix_id=str(data['object_id'])).first()
+            if row is None:
+                return jsonify({'error': f"Object not found: {data['object_id']}"}), 404
+            obj = _row_to_threat_intel(row)
+            value = (obj.domain or obj.ip_address or obj.value
+                     or obj.hash_value or obj.name)
+            if not kind:
+                kind = _VT_KIND_BY_TYPE.get(obj.object_type)
+        finally:
+            session.close()
+    result = vt_client.lookup(value, kind=kind, force=bool(data.get('force')))
+    if result.get('error'):
+        return jsonify(result), 400
+    logger.info("VirusTotal lookup %s (%s) by %s: %s", result.get('value'),
+                result.get('kind'), _actor(), result.get('verdict'))
+    return jsonify(result), 200
+
+
 @app.route('/community/pullers', methods=['GET'])
 def community_pullers():
     """GET /community/pullers — status of all community sources (dashboard)."""
     if not _request_allowed():
         return jsonify({'error': 'Unauthorized'}), 401
     return jsonify({
-        'pullers': [otx_poller.status()] + [p.status() for p in taxii_pullers],
+        'pullers': ([otx_poller.status()]
+                    + [p.status() for p in taxii_pullers]
+                    + [abuse_ch_poller.status()]),
     }), 200
 
 
@@ -5263,6 +5344,8 @@ def community_pull(name: str):
             }), 400
     if name == 'otx':
         puller = otx_poller
+    elif name == abuse_ch_poller.STATE_ID:
+        puller = abuse_ch_poller
     else:
         puller = next((p for p in taxii_pullers if p.name == name), None)
     if puller is None:
@@ -5307,6 +5390,13 @@ def health_check():
                     'otx': _poller_state(otx_poller),
                     'self_check': _poller_state(self_check_poller),
                     'taxii': {p.name: _poller_state(p) for p in taxii_pullers},
+                    'abuse_ch': _poller_state(abuse_ch_poller),
+                },
+                'virus_total': {
+                    'enabled': vt_client.enabled,
+                    'configured': vt_client.configured,
+                    'quota_used_24h': vt_client.quota_used(),
+                    'daily_limit': vt_client.daily_limit,
                 },
             }
         ),
@@ -6452,6 +6542,671 @@ class TaxiiPuller:
 
 
 # ---------------------------------------------------------------------------
+# abuse.ch HTTP puller (ThreatFox / Feodo Tracker / URLhaus)
+# ---------------------------------------------------------------------------
+# abuse.ch publishes no STIX/TAXII feed (their FAQ dropped it), so this is a
+# native HTTP puller rather than a `taxii_pullers:` entry. One free Auth-Key
+# (from auth.abuse.ch) covers all the JSON APIs.
+
+_ABUSE_HASH_ALGOS = {
+    'md5_hash': 'md5', 'md5': 'md5',
+    'sha1_hash': 'sha1', 'sha1': 'sha1',
+    'sha256_hash': 'sha256', 'sha256': 'sha256',
+}
+
+
+def _abuse_hash_descriptor(value: str, algo: str, confidence: int,
+                           labels: List[str], description: str) -> Optional[Dict[str, Any]]:
+    v = str(value or '').strip().lower()
+    if not v or not _HASH_RE.match(v):
+        return None
+    return {
+        'id': f'file-hash--{v[:16]}',
+        'type': 'file-hash',
+        'object': {'hash_value': {'algorithm': algo, 'value': v}},
+        'labels': [algo] + list(labels),
+        'confidence': confidence,
+        'description': description,
+    }
+
+
+def _abuse_ioc_descriptor(raw_value: Any, ioc_type: str, confidence: Any,
+                          labels: List[str],
+                          description: str) -> Optional[Dict[str, Any]]:
+    """Map one abuse.ch IOC to an ingestable STIX descriptor (or None).
+
+    ``ioc_type`` is abuse.ch's own type string where known (ThreatFox:
+    ``ip:port`` / ``domain`` / ``url`` / ``*_hash``); when it is blank the value
+    shape is used instead (handy for URLhaus hosts, which can be an IP *or* a
+    domain). Only IPv4 / domain / URL / md5 / sha1 / sha256 are consumed.
+    """
+    v = str(raw_value or '').strip()
+    if not v:
+        return None
+    it = str(ioc_type or '').strip().lower()
+    try:
+        conf = int(confidence)
+    except (TypeError, ValueError):
+        conf = 50
+    conf = max(0, min(100, conf))
+    base = {'labels': list(labels), 'confidence': conf, 'description': description}
+
+    algo = _ABUSE_HASH_ALGOS.get(it)
+    if algo:
+        return _abuse_hash_descriptor(v, algo, conf, list(labels), description)
+
+    if it in ('ip:port', 'ip', 'ipv4'):
+        ip = v.rsplit(':', 1)[0] if ':' in v else v
+        if _is_valid_ipv4(ip):
+            return {**base, 'id': f'ipv4-addr--{ip.replace(".", "-")}',
+                    'type': 'ipv4-addr', 'object': {'ipv4-addr': {'value': ip}}}
+        return None
+
+    if it in ('domain', 'domain-name'):
+        d = v.lower()
+        if _DOMAIN_RE.match(d):
+            return {**base, 'id': f'domain-name--{d.replace(".", "-")}',
+                    'type': 'domain-name', 'object': {'domain-name': {'value': d}}}
+        return None
+
+    if it == 'url':
+        if _URL_RE.match(v):
+            return {**base, 'id': 'url--' + uuid.uuid5(uuid.NAMESPACE_OID, v).hex,
+                    'type': 'url', 'object': {'url': {'value': v}}}
+        return None
+
+    # No usable type hint: infer from the value shape.
+    guessed, g_algo = _guess_object_type(v)
+    if guessed == 'ipv4-addr':
+        return {**base, 'id': f'ipv4-addr--{v.replace(".", "-")}',
+                'type': 'ipv4-addr', 'object': {'ipv4-addr': {'value': v}}}
+    if guessed == 'domain-name':
+        return {**base, 'id': f'domain-name--{v.replace(".", "-")}',
+                'type': 'domain-name', 'object': {'domain-name': {'value': v}}}
+    if guessed == 'url':
+        return {**base, 'id': 'url--' + uuid.uuid5(uuid.NAMESPACE_OID, v).hex,
+                'type': 'url', 'object': {'url': {'value': v}}}
+    if guessed == 'file-hash':
+        return _abuse_hash_descriptor(v, g_algo or 'sha256', conf,
+                                      list(labels), description)
+    return None
+
+
+class AbuseChPuller:
+    """Pulls community intel FROM abuse.ch (ThreatFox, Feodo Tracker, URLhaus).
+
+    abuse.ch exposes no STIX/TAXII feed, so this fetches each configured feed's
+    JSON API, maps the IOCs to our STIX descriptor shape, and merges them with
+    ``source='abuse_ch'`` — independent of manual intel and subject to the
+    community gate like any other community source.
+
+    Config block (``abuse_ch:`` in config.yaml):
+        enabled: false
+        auth_key: '${ABUSE_CH_AUTH_KEY:-}'   # free from auth.abuse.ch
+        feeds: [threatfox, feodo, urlhaus]
+        poll_interval: 3600
+        max_objects_per_poll: 5000
+        threatfox_days: 1                    # ThreatFox window (get_iocs days)
+        ingest_collection: comm_intel
+    """
+
+    SOURCE = 'abuse_ch'
+    STATE_ID = 'abuse_ch'
+    FEEDS = ('threatfox', 'feodo', 'urlhaus')
+    LABEL = 'abuse.ch'
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config or {}
+        self.auth_key = str(self.config.get('auth_key') or '').strip()
+        # Absent `feeds:` -> all feeds; an explicit empty list -> none (so a
+        # deployment can point the puller at nothing without deleting the block).
+        raw_feeds = (self.config['feeds'] if 'feeds' in self.config
+                     else list(self.FEEDS))
+        self.feeds = [str(f).strip().lower() for f in raw_feeds
+                      if str(f).strip().lower() in self.FEEDS]
+        self.poll_interval = int(self.config.get('poll_interval', 3600))
+        self.max_objects_per_poll = int(
+            self.config.get('max_objects_per_poll', 5000))
+        self.threatfox_days = int(self.config.get('threatfox_days', 1))
+        self.ingest_collection = _resolve_ingest_target(
+            self.config.get('ingest_collection'), DEFAULT_COMMUNITY_COLLECTION_ID)
+        self.enabled = bool(self.config.get('enabled', False))
+        self._stop = False
+        self._thread: Optional[threading.Thread] = None
+        self.last_poll_at: Optional[datetime] = None
+        self.last_poll_added = 0
+
+    def _headers(self) -> Dict[str, str]:
+        headers = {
+            'Accept': 'application/json',
+            'User-Agent': 'TAXII-Server-AbuseCh-Puller/1.0',
+        }
+        if self.auth_key:
+            headers['Auth-Key'] = self.auth_key
+        return headers
+
+    def _request_json(self, url: str, payload: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+        """GET (payload None) or POST (JSON payload) a URL; parsed body or None."""
+        data = json.dumps(payload).encode('utf-8') if payload is not None else None
+        req = urllib.request.Request(
+            url, data=data, headers=self._headers(),
+            method='POST' if data is not None else 'GET')
+        if data is not None:
+            req.add_header('Content-Type', 'application/json')
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as exc:
+            logger.error("abuse.ch HTTP %s for %s", exc.code, url)
+            return None
+        except Exception as exc:
+            logger.error("abuse.ch request failed for %s: %s", url, exc)
+            return None
+
+    @staticmethod
+    def _threatfox_labels(row: Dict[str, Any]) -> List[str]:
+        labels = ['threatfox']
+        family = row.get('malware_printable') or row.get('malware')
+        if family:
+            labels.append(str(family))
+        if row.get('threat_type'):
+            labels.append(str(row['threat_type']))
+        tags = row.get('tags') or []
+        if isinstance(tags, list):
+            labels.extend(str(t) for t in tags if t)
+        return labels
+
+    def fetch_threatfox(self) -> List[Dict[str, Any]]:
+        """ThreatFox recent IOCs (carries a real ``confidence_level``)."""
+        url = (self.config.get('threatfox_url')
+               or 'https://threatfox-api.abuse.ch/api/v1/')
+        data = self._request_json(
+            url, {'query': 'get_iocs', 'days': self.threatfox_days})
+        if not isinstance(data, dict):
+            return []
+        status = str(data.get('query_status') or '')
+        if status and status != 'ok':
+            logger.warning("ThreatFox query_status=%s", status)
+            return []
+        out: List[Dict[str, Any]] = []
+        for row in (data.get('data') or []):
+            if not isinstance(row, dict):
+                continue
+            desc = _abuse_ioc_descriptor(
+                row.get('ioc'), row.get('ioc_type'), row.get('confidence_level'),
+                self._threatfox_labels(row),
+                'Pulled from abuse.ch ThreatFox'
+                + (f" ({row.get('threat_type')})" if row.get('threat_type') else ''))
+            if desc:
+                out.append(desc)
+        return out
+
+    def fetch_feodo(self) -> List[Dict[str, Any]]:
+        """Feodo Tracker botnet C2 IP blocklist (high-signal IPv4 C2)."""
+        url = (self.config.get('feodo_url')
+               or 'https://feodotracker.abuse.ch/downloads/ipblocklist.json')
+        data = self._request_json(url)
+        if not isinstance(data, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            labels = ['feodo']
+            if row.get('malware'):
+                labels.append(str(row['malware']))
+            if row.get('status'):
+                labels.append(str(row['status']))
+            desc = _abuse_ioc_descriptor(
+                row.get('ip_address'), 'ip', 80, labels,
+                'Pulled from abuse.ch Feodo Tracker'
+                + (f" ({row.get('malware')})" if row.get('malware') else ''))
+            if desc:
+                out.append(desc)
+        return out
+
+    def fetch_urlhaus(self) -> List[Dict[str, Any]]:
+        """URLhaus recent malicious URLs (+ their host, as a domain/IP)."""
+        url = (self.config.get('urlhaus_url')
+               or 'https://urlhaus-api.abuse.ch/v1/urls/recent/')
+        data = self._request_json(url, {})
+        if not isinstance(data, dict):
+            return []
+        out: List[Dict[str, Any]] = []
+        for row in (data.get('urls') or []):
+            if not isinstance(row, dict):
+                continue
+            labels = ['urlhaus']
+            if row.get('threat'):
+                labels.append(str(row['threat']))
+            tags = row.get('tags') or []
+            if isinstance(tags, list):
+                labels.extend(str(t) for t in tags if t)
+            desc = _abuse_ioc_descriptor(
+                row.get('url'), 'url', 70, labels,
+                'Pulled from abuse.ch URLhaus'
+                + (f" ({row.get('url_status')})" if row.get('url_status') else ''))
+            if desc:
+                out.append(desc)
+            # Also file the host (domain or IP) — the shape decides which.
+            host_desc = _abuse_ioc_descriptor(
+                row.get('host'), '', 70, list(labels),
+                'Pulled from abuse.ch URLhaus (URL host)')
+            if host_desc:
+                out.append(host_desc)
+        return out
+
+    def _poll_once(self, limit: Optional[int] = None) -> int:
+        """One poll cycle across the configured feeds (merge mode)."""
+        cap = int(limit) if limit and limit > 0 else self.max_objects_per_poll
+        fetchers = {
+            'threatfox': self.fetch_threatfox,
+            'feodo': self.fetch_feodo,
+            'urlhaus': self.fetch_urlhaus,
+        }
+        stix_objects: List[Dict[str, Any]] = []
+        for feed in self.feeds:
+            if len(stix_objects) >= cap:
+                break
+            fetcher = fetchers.get(feed)
+            if fetcher is None:
+                continue
+            try:
+                items = fetcher()
+            except Exception as exc:
+                logger.error("abuse.ch feed '%s' failed: %s", feed, exc)
+                items = []
+            logger.info("abuse.ch feed '%s' returned %s IOC(s)", feed, len(items))
+            for item in items:
+                stix_objects.append(item)
+                if len(stix_objects) >= cap:
+                    break
+
+        if not stix_objects:
+            self.last_poll_at = datetime.utcnow()
+            self.last_poll_added = 0
+            save_puller_state(self.STATE_ID, 'ok', 0, 'no new indicators')
+            return 0
+
+        added = ingest_objects(stix_objects, mode='merge', source=self.SOURCE,
+                               collection=self.ingest_collection)
+        self.last_poll_at = datetime.utcnow()
+        self.last_poll_added = added
+        save_puller_state(self.STATE_ID, 'ok', added, f'{added} object(s) ingested')
+        return added
+
+    def status(self) -> Dict[str, Any]:
+        """Dashboard status for the abuse.ch puller."""
+        st = read_puller_state(self.STATE_ID) or {}
+        return {
+            'name': 'abuse.ch',
+            'id': self.STATE_ID,
+            'kind': 'abuse_ch',
+            'feeds': list(self.feeds),
+            'limit': self.max_objects_per_poll,
+            'enabled': self.enabled,
+            'running': bool(self._thread and self._thread.is_alive()),
+            'base_url': 'abuse.ch (ThreatFox / Feodo / URLhaus)',
+            'ingest_collection': self.ingest_collection,
+            'auth_key_set': bool(self.auth_key),
+            'last_sync': st.get('last_sync'),
+            'last_added': st.get('last_added', 0),
+            'last_status': st.get('last_status'),
+            'last_message': st.get('last_message'),
+        }
+
+    def pull_now(self, limit: Optional[int] = None) -> Dict[str, Any]:
+        """Run one poll cycle synchronously (dashboard 'Pull now')."""
+        if not self.feeds:
+            return {'name': self.LABEL, 'added': 0,
+                    'error': 'misconfigured (no feeds enabled)'}
+        try:
+            added = self._poll_once(limit=limit)
+        except Exception as exc:
+            save_puller_state(self.STATE_ID, 'error', 0, str(exc))
+            return {'name': self.LABEL, 'added': 0, 'error': str(exc)}
+        st = read_puller_state(self.STATE_ID) or {}
+        return {
+            'name': self.LABEL,
+            'added': added,
+            'error': None,
+            'last_sync': st.get('last_sync'),
+            'last_status': st.get('last_status'),
+        }
+
+    def start(self) -> None:
+        """Start the background poller."""
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop = False
+        self._thread = threading.Thread(
+            target=self._poll_loop, name='AbuseChPuller', daemon=True)
+        self._thread.start()
+        logger.info(
+            "abuse.ch puller started (interval=%ss, feeds=%s, auth_key=%s)",
+            self.poll_interval, ','.join(self.feeds) or 'none',
+            'set' if self.auth_key else 'MISSING')
+
+    def stop(self) -> None:
+        """Stop the background poller."""
+        self._stop = True
+        if self._thread:
+            self._thread.join(timeout=5)
+            logger.info("abuse.ch puller stopped")
+
+    def _poll_loop(self) -> None:
+        while not self._stop:
+            try:
+                count = self._poll_once()
+                if count:
+                    logger.info("abuse.ch poll ingested %s object(s)", count)
+                else:
+                    logger.info("abuse.ch poll complete (0 new objects)")
+            except Exception as exc:
+                logger.error("abuse.ch poll error: %s", exc)
+            if not self._stop:
+                time.sleep(self.poll_interval)
+
+
+# ---------------------------------------------------------------------------
+# VirusTotal — on-demand, cached enrichment (free tier; NOT a bulk gate)
+# ---------------------------------------------------------------------------
+# The free VT API is 4 req/min / 500 per day (and its ToS forbids commercial
+# bulk use), so this never runs during a poll. It answers a single value on
+# request, caches the verdict (vt_cache) and reuses it for cache_ttl seconds.
+# It is a false-positive *tie-breaker*: a value VT calls clean is a good
+# candidate for the known-legitimate filter.
+
+_VT_KIND_BY_TYPE = {
+    'ipv4-addr': 'ip', 'ipv6-addr': 'ip', 'domain-name': 'domain',
+    'url': 'url', 'file-hash': 'hash',
+}
+
+
+def _vt_verdict(malicious: int, suspicious: int) -> str:
+    if malicious:
+        return 'malicious'
+    if suspicious:
+        return 'suspicious'
+    return 'clean'
+
+
+class VirusTotalClient:
+    """On-demand VirusTotal lookups with a persistent, TTL'd cache.
+
+    Config block (``virus_total:`` in config.yaml):
+        enabled: false
+        api_key: '${VIRUSTOTAL_API_KEY:-}'
+        base_url: https://www.virustotal.com/api/v3
+        cache_ttl: 86400     # reuse a cached verdict for this many seconds
+        timeout: 20
+        min_interval: 15     # seconds between outbound calls (free tier: 4/min)
+        daily_limit: 500     # outbound calls per rolling 24h (free tier)
+    """
+
+    DEFAULT_BASE = 'https://www.virustotal.com/api/v3'
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config or {}
+        self.enabled = bool(self.config.get('enabled', False))
+        self.api_key = str(self.config.get('api_key') or '').strip()
+        self.base_url = str(
+            self.config.get('base_url') or self.DEFAULT_BASE).rstrip('/')
+        self.cache_ttl = int(self.config.get('cache_ttl', 86400))
+        self.timeout = int(self.config.get('timeout', 20))
+        self.min_interval = float(self.config.get('min_interval', 15))
+        self.daily_limit = int(self.config.get('daily_limit', 500))
+        self._lock = threading.Lock()
+        self._calls: List[datetime] = []   # outbound call timestamps (rolling 24h)
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.enabled and self.api_key)
+
+    @staticmethod
+    def _actor_safe() -> Optional[str]:
+        """Best-effort actor label; safe to call outside a request context."""
+        try:
+            return _actor()
+        except Exception:
+            return 'system'
+
+    # --- mapping helpers ---------------------------------------------------
+
+    def _vt_kind(self, value: Any, kind: Any = None) -> Optional[str]:
+        if kind:
+            k = str(kind).strip().lower()
+            if k in ('ip', 'domain', 'url', 'hash'):
+                return k
+            if k in _VT_KIND_BY_TYPE:
+                return _VT_KIND_BY_TYPE[k]
+        guessed, _algo = _guess_object_type(str(value))
+        return _VT_KIND_BY_TYPE.get(guessed)
+
+    def _endpoint(self, kind: str, value: str) -> str:
+        if kind == 'ip':
+            return f'{self.base_url}/ip_addresses/{urllib.parse.quote(value)}'
+        if kind == 'domain':
+            return f'{self.base_url}/domains/{urllib.parse.quote(value)}'
+        if kind == 'hash':
+            return f'{self.base_url}/files/{urllib.parse.quote(value)}'
+        ident = base64.urlsafe_b64encode(
+            value.encode('utf-8')).decode('ascii').rstrip('=')
+        return f'{self.base_url}/urls/{ident}'
+
+    def _gui_link(self, kind: str, value: str) -> str:
+        if kind == 'ip':
+            return f'https://www.virustotal.com/gui/ip-address/{value}'
+        if kind == 'domain':
+            return f'https://www.virustotal.com/gui/domain/{value}'
+        if kind == 'hash':
+            return f'https://www.virustotal.com/gui/file/{value}'
+        ident = base64.urlsafe_b64encode(
+            value.encode('utf-8')).decode('ascii').rstrip('=')
+        return f'https://www.virustotal.com/gui/url/{ident}'
+
+    # --- rate limiting -----------------------------------------------------
+
+    def quota_used(self) -> int:
+        """Outbound calls in the last rolling 24h (resets on restart)."""
+        cutoff = datetime.utcnow() - timedelta(days=1)
+        with self._lock:
+            self._calls = [t for t in self._calls if t >= cutoff]
+            return len(self._calls)
+
+    def _rate_ok(self) -> Tuple[bool, Optional[float]]:
+        """(allowed, wait_seconds). Records the call when allowed."""
+        now = datetime.utcnow()
+        cutoff = now - timedelta(days=1)
+        with self._lock:
+            self._calls = [t for t in self._calls if t >= cutoff]
+            if len(self._calls) >= self.daily_limit:
+                return False, None
+            if self._calls:
+                elapsed = (now - self._calls[-1]).total_seconds()
+                if elapsed < self.min_interval:
+                    return False, round(self.min_interval - elapsed, 1)
+            self._calls.append(now)
+        return True, None
+
+    # --- cache -------------------------------------------------------------
+
+    def _public(self, row: 'VtCache', cached: bool) -> Dict[str, Any]:
+        return {
+            'value': row.value,
+            'kind': row.kind,
+            'malicious': row.malicious or 0,
+            'suspicious': row.suspicious or 0,
+            'harmless': row.harmless or 0,
+            'undetected': row.undetected or 0,
+            'reputation': row.reputation,
+            'categories': [c for c in str(row.categories or '').split(',') if c],
+            'link': row.link,
+            'verdict': _vt_verdict(row.malicious or 0, row.suspicious or 0),
+            'fetched': row.fetched.isoformat() + 'Z' if row.fetched else None,
+            'fetched_by': row.fetched_by,
+            'cached': cached,
+        }
+
+    def _cache_get(self, key: str) -> Optional[Dict[str, Any]]:
+        session = create_session()
+        try:
+            row = session.query(VtCache).filter_by(value=key).first()
+            if row is None:
+                return None
+            age = (datetime.utcnow()
+                   - (row.fetched or datetime.utcnow())).total_seconds()
+            if age > self.cache_ttl:
+                return None
+            return self._public(row, cached=True)
+        finally:
+            session.close()
+
+    def _cache_put(self, key: str, kind: str, parsed: Dict[str, Any],
+                   actor: Optional[str]) -> Optional[Dict[str, Any]]:
+        session = create_session()
+        try:
+            row = session.query(VtCache).filter_by(value=key).first()
+            if row is None:
+                row = VtCache(value=key)
+                session.add(row)
+            row.kind = kind
+            row.malicious = int(parsed.get('malicious', 0) or 0)
+            row.suspicious = int(parsed.get('suspicious', 0) or 0)
+            row.harmless = int(parsed.get('harmless', 0) or 0)
+            row.undetected = int(parsed.get('undetected', 0) or 0)
+            row.reputation = parsed.get('reputation')
+            row.categories = ','.join(parsed.get('categories') or []) or None
+            row.link = parsed.get('link')
+            row.fetched = datetime.utcnow()
+            row.fetched_by = actor
+            session.commit()
+            return self._public(row, cached=False)
+        except Exception as exc:  # pragma: no cover - persistence is best-effort
+            session.rollback()
+            logger.error("Could not cache VirusTotal result: %s", exc)
+            return None
+        finally:
+            session.close()
+
+    # --- HTTP --------------------------------------------------------------
+
+    def _http_get(self, url: str) -> Tuple[int, Optional[Any]]:
+        """GET JSON from VT. Returns (status_code, body); status 0 on error.
+
+        A seam tests can stub without touching the network.
+        """
+        req = urllib.request.Request(
+            url, headers={'Accept': 'application/json',
+                          'x-apikey': self.api_key}, method='GET')
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return resp.status, json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as exc:
+            return exc.code, None
+        except Exception as exc:
+            logger.error("VirusTotal request failed: %s", exc)
+            return 0, None
+
+    # --- the lookup --------------------------------------------------------
+
+    def lookup(self, value: Any, kind: Any = None,
+               force: bool = False) -> Dict[str, Any]:
+        """Look up one value; serve a fresh cache hit, else call VT.
+
+        Returns a dict with ``verdict``/counts on success, or ``{'error': ...}``.
+        """
+        raw = str(value or '').strip()
+        if not raw:
+            return {'error': 'value is required'}
+        key = raw.lower()
+        vt_kind = self._vt_kind(raw, kind)
+        if not vt_kind:
+            return {'error': 'unsupported value type: '
+                             'need an IP, domain, URL or file hash'}
+
+        if not force:
+            hit = self._cache_get(key)
+            if hit is not None:
+                return hit
+
+        if not self.configured:
+            return {'error': 'VirusTotal is not configured '
+                             '(set virus_total.enabled and api_key)',
+                    'value': raw, 'kind': vt_kind}
+
+        allowed, wait = self._rate_ok()
+        if not allowed:
+            if wait is None:
+                msg = (f'VirusTotal daily limit reached '
+                       f'({self.daily_limit} per 24h)')
+            else:
+                msg = f'VirusTotal rate limit — try again in {wait}s'
+            return {'error': msg, 'value': raw, 'kind': vt_kind}
+
+        url = self._endpoint(vt_kind, raw)
+        status, body = self._http_get(url)
+        if status == 404:
+            parsed = {'malicious': 0, 'suspicious': 0, 'harmless': 0,
+                      'undetected': 0, 'reputation': None, 'categories': [],
+                      'link': self._gui_link(vt_kind, raw)}
+            pub = self._cache_put(key, vt_kind, parsed, self._actor_safe())
+            out = pub or {'value': raw, 'kind': vt_kind, **parsed,
+                          'verdict': 'clean'}
+            out['not_found'] = True
+            out['cached'] = False
+            return out
+        if status == 0:
+            return {'error': 'VirusTotal request failed (see server log)',
+                    'value': raw, 'kind': vt_kind}
+        if status >= 400:
+            logger.error("VirusTotal HTTP %s for %s", status, url)
+            return {'error': f'VirusTotal returned HTTP {status}',
+                    'value': raw, 'kind': vt_kind}
+
+        attrs = {}
+        if isinstance(body, dict):
+            attrs = ((body.get('data') or {}).get('attributes') or {})
+        stats = attrs.get('last_analysis_stats') or {}
+        cats = attrs.get('categories') or {}
+        parsed = {
+            'malicious': int(stats.get('malicious', 0) or 0),
+            'suspicious': int(stats.get('suspicious', 0) or 0),
+            'harmless': int(stats.get('harmless', 0) or 0),
+            'undetected': int(stats.get('undetected', 0) or 0),
+            'reputation': attrs.get('reputation'),
+            'categories': sorted({str(c) for c in cats.values()})
+            if isinstance(cats, dict) else [],
+            'link': self._gui_link(vt_kind, raw),
+        }
+        pub = self._cache_put(key, vt_kind, parsed, self._actor_safe())
+        if pub is not None:
+            return pub
+        return {'value': raw, 'kind': vt_kind, **parsed,
+                'verdict': _vt_verdict(parsed['malicious'], parsed['suspicious']),
+                'cached': False}
+
+    def status(self) -> Dict[str, Any]:
+        """Dashboard/config status for the VirusTotal integration."""
+        session = create_session()
+        try:
+            entries = session.query(VtCache).count()
+        except Exception:  # pragma: no cover
+            entries = 0
+        finally:
+            session.close()
+        return {
+            'enabled': self.enabled,
+            'configured': self.configured,
+            'base_url': self.base_url,
+            'cache_ttl': self.cache_ttl,
+            'cache_entries': entries,
+            'quota_used_24h': self.quota_used(),
+            'daily_limit': self.daily_limit,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Module-level instances & initialization
 # ---------------------------------------------------------------------------
 
@@ -6474,6 +7229,13 @@ taxii_pullers: List[TaxiiPuller] = [
     TaxiiPuller(cfg) for cfg in (CONFIG.get('taxii_pullers') or [])
     if isinstance(cfg, dict) and cfg.get('name')
 ]
+
+# abuse.ch has no TAXII feed, so it gets its own native HTTP puller
+# (ThreatFox / Feodo Tracker / URLhaus; one free Auth-Key).
+abuse_ch_poller = AbuseChPuller(CONFIG.get('abuse_ch', {}) or {})
+
+# VirusTotal on-demand enrichment (cached; free-tier rate aware).
+vt_client = VirusTotalClient(CONFIG.get('virus_total', {}) or {})
 
 # Initialize database tables at import time (endpoints and tests rely on it).
 init_db()
@@ -6513,6 +7275,8 @@ def start_background_jobs() -> None:
     for puller in taxii_pullers:
         if puller.enabled and puller.base_url and puller.collection:
             puller.start()
+    if abuse_ch_poller.enabled and abuse_ch_poller.feeds:
+        abuse_ch_poller.start()
     if self_check_poller.enabled and self_check_poller.base_url:
         self_check_poller.start()
 

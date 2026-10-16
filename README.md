@@ -7,12 +7,17 @@ collection (exactly how it consumes AlienVault OTX).
 
 The **web UI dashboard** (`http://<server>:5000/`) is **login-protected**
 (`ui.auth` in `config.yaml`). After login you can add intel manually and
-watch/control **community sources**: the optional **AlienVault OTX** puller
-plus any number of **third-party TAXII 2.1 pullers** you define under
-`taxii_pullers:` (each with a "Pull now" button, even while disabled).
+watch/control **community sources**: the optional **AlienVault OTX** puller,
+an optional **abuse.ch** puller (ThreatFox / Feodo Tracker / URLhaus — abuse.ch
+has no TAXII feed, so it is a native HTTP puller), plus any number of
+**third-party TAXII 2.1 pullers** you define under `taxii_pullers:` (each with a
+"Pull now" button, even while disabled). An optional **VirusTotal** check
+(cached, free-tier aware) helps triage false positives.
 
 An **intel filter** gates community-sourced intel before it is served to
-Vision One (see [Intel Filter](#intel-filter-filtering-between-server-and-vision-one)).
+Vision One (see [Intel Filter](#intel-filter-filtering-between-server-and-vision-one)),
+and a **known-legitimate filter** keeps real domains/IPs out of the feed
+entirely (see [The known-legitimate filter](#the-known-legitimate-filter-keeping-legit-values-out-of-the-feed)).
 
 ## Architecture
 
@@ -36,12 +41,17 @@ Vision One (see [Intel Filter](#intel-filter-filtering-between-server-and-vision
 │  │  OTX Community Puller    │   │  Third-party TAXII 2.1 Pullers   │  │
 │  │  (pull FROM OTX, merge,  │   │  (pull FROM any TAXII server,    │  │
 │  │   source='otx')          │   │   merge, source=<puller name>)   │  │
+│  ├──────────────────────────┤   ├──────────────────────────────────┤  │
+│  │  abuse.ch HTTP Puller    │   │  VirusTotal (on-demand, cached)  │  │
+│  │  (ThreatFox/Feodo/       │   │  helper for false-positive       │  │
+│  │   URLhaus, source=       │   │  triage — not a bulk gate        │  │
+│  │   'abuse_ch')            │   │                                  │  │
 │  └──────────────────────────┘   └──────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────┘
                               ▲
                               │
              ┌────────────────┴────────────────┐
-             │  AlienVault OTX / any TAXII    │
+             │  OTX / abuse.ch / any TAXII    │
              │  2.1 server (community intel)  │
              └────────────────────────────────┘
 ```
@@ -50,12 +60,14 @@ Vision One (see [Intel Filter](#intel-filter-filtering-between-server-and-vision
 
 1. **Flask REST API (TAXII 2 Server)** — Hosts TAXII 2.1 protocol endpoints and custom REST endpoints for feed management, UI login/session, community-source control, auth, subscriptions, and health.
 2. **Web UI dashboard** — Single self-contained `intel-ui.html` behind a login (`ui.auth`). Organized into five tabs: **Feed** (the current feed with per-row **source** and **gate** badges, a **collection** selector when multiple collections exist, **search / type & status filters / pagination**, a withheld-by-filter panel, a **known-legitimate filter** panel with a one-click **Exclude** on served rows, and manual entry/publish), **Intel graph** (a dashboard of the fed intel — KPI tiles plus bar charts for **by category** (IP / domain / file hash / …), **by source**, **confidence distribution**, **pulled-over-time**, **withheld-by-filter**, and **top labels** (donut, share of label occurrences); scope switch Community / Manual / All), **Community sources** (puller status + "Pull now", with the same **search + pagination**), and **Import CSV / Excel** (GT-team ad-hoc import: `.csv` or `.xlsx`), and **API keys** (generate/revoke collection-scoped TAXII credentials). Serves all intel (the gate only affects what Vision One gets).
-3. **STIX 2.1 Store** — Stores threat intelligence objects (IPs, file hashes, domains, URLs, emails, indicators, malware / threat-actor / campaign SDOs, and STIX *relationships* — a real graph, not just flat IOCs) in SQLite (or PostgreSQL). The database is the source of truth for what is served: TAXII polls read the stored rows directly (with a composite index on `(modified, stix_id)` for keyset pagination), and an in-memory copy is kept as a dashboard/coordination cache. Every object carries a `source` tag (`manual` | `otx` | a `taxii_pullers` name) and a `collection_id` (see [Multiple collections](#multiple-collections--per-client-rbac)) so manual and community intel coexist cleanly. Puller sync state (`last_sync`, `last_added`) is persisted in a `puller_state` table so delta pulls survive restarts. Dashboard mutations and logins are persisted in an `audit_events` table (see [Audit log](#audit-log)). The known-legitimate filter is persisted in a `benign_values` table (see [The known-legitimate filter](#the-known-legitimate-filter-keeping-legit-values-out-of-the-feed)).
+3. **STIX 2.1 Store** — Stores threat intelligence objects (IPs, file hashes, domains, URLs, emails, indicators, malware / threat-actor / campaign SDOs, and STIX *relationships* — a real graph, not just flat IOCs) in SQLite (or PostgreSQL). The database is the source of truth for what is served: TAXII polls read the stored rows directly (with a composite index on `(modified, stix_id)` for keyset pagination), and an in-memory copy is kept as a dashboard/coordination cache. Every object carries a `source` tag (`manual` | `otx` | `abuse_ch` | a `taxii_pullers` name) and a `collection_id` (see [Multiple collections](#multiple-collections--per-client-rbac)) so manual and community intel coexist cleanly. Puller sync state (`last_sync`, `last_added`) is persisted in a `puller_state` table so delta pulls survive restarts. Dashboard mutations and logins are persisted in an `audit_events` table (see [Audit log](#audit-log)). The known-legitimate filter is persisted in a `benign_values` table and cached VirusTotal verdicts in a `vt_cache` table (see [The known-legitimate filter](#the-known-legitimate-filter-keeping-legit-values-out-of-the-feed) and [VirusTotal](#virustotal-on-demand-cached-enrichment)).
 4. **OTX Community Puller** — Background thread that periodically pulls indicators (IPv4, domains, file hashes) from **AlienVault OTX** public pulses and merges them into the feed tagged `source='otx'`. Off by default; can also be fired on demand from the UI.
-5. **Third-party TAXII 2.1 Pullers** — One generic puller per `taxii_pullers:` entry. Polls `GET {api_root}collections/{collection}/objects/?since=` from any TAXII 2.1 server (Basic auth, `application/taxii+json;version=2.1`), maps STIX 2.1 objects into the feed in merge mode tagged with the puller's `name`. Off by default per entry.
-6. **Self-check Poller** — Background thread that periodically fetches the local `/feed` endpoint to verify the feed is reachable and well-formed. Off by default.
+5. **abuse.ch Community Puller** — Background thread that pulls community intel from **abuse.ch** — **ThreatFox** (IPs / domains / URLs / hashes, with a real `confidence_level`), **Feodo Tracker** (botnet C2 IPv4) and **URLhaus** (malicious URLs + their hosts). abuse.ch publishes no STIX/TAXII feed, so this speaks their JSON APIs directly (one free **Auth-Key** from `auth.abuse.ch` covers them). Objects are tagged `source='abuse_ch'`. Off by default.
+6. **Third-party TAXII 2.1 Pullers** — One generic puller per `taxii_pullers:` entry. Polls `GET {api_root}collections/{collection}/objects/?since=` from any TAXII 2.1 server (Basic auth, `application/taxii+json;version=2.1`), maps STIX 2.1 objects into the feed in merge mode tagged with the puller's `name`. Off by default per entry.
+7. **VirusTotal enrichment (on-demand)** — A cached, free-tier-aware lookup that answers a single value on request (the dashboard **VT** button, or `POST /ui/vt/lookup`) and stores the verdict in `vt_cache`. It is deliberately **not** a bulk gate: the free tier is ~4 req/min and 500/day, so it is used as a **false-positive tie-breaker** — a value VT reports clean is a good candidate for the known-legitimate filter.
+8. **Self-check Poller** — Background thread that periodically fetches the local `/feed` endpoint to verify the feed is reachable and well-formed. Off by default.
 
-> **Data flow:** `OTX / third-party TAXII servers ──pull──▶ this server ──intel filter──▶ Vision One`.
+> **Data flow:** `OTX / abuse.ch / third-party TAXII servers ──pull──▶ this server ──intel filter──▶ Vision One`.
 > The **intel filter** gates community-sourced objects before they are served
 > over `/taxii2/`, to cut false positives (manual intel always passes).
 > There is no Trend Micro SOL puller — this server does not pull from
@@ -173,7 +185,7 @@ taxii:
         username: 'your-taxii-username'
         password: 'your-taxii-password'
     - id: gt_intel                        # manual entry + CSV/Excel imports
-    - id: comm_intel                      # OTX + third-party TAXII pullers
+    - id: comm_intel                      # OTX + abuse.ch + third-party TAXII pullers
 
 # Web UI dashboard login (SEPARATE from the TAXII credentials above)
 ui:
@@ -189,6 +201,27 @@ otx:
   poll_interval: 300    # 5 min polling interval
   max_pulses: 25
   object_types: ['ipv4-addr', 'domain-name', 'file-hash']
+
+# abuse.ch community puller (no TAXII feed exists, so it is a native HTTP
+# puller). One free Auth-Key (from auth.abuse.ch) covers all three feeds.
+abuse_ch:
+  enabled: false
+  auth_key: '${ABUSE_CH_AUTH_KEY:-}'   # put the real value in .env
+  feeds: ['threatfox', 'feodo', 'urlhaus']
+  poll_interval: 3600
+  max_objects_per_poll: 5000
+  threatfox_days: 1                    # ThreatFox look-back window
+  ingest_collection: comm_intel
+
+# VirusTotal on-demand enrichment (cached; free-tier aware — NOT a bulk gate).
+virus_total:
+  enabled: false
+  api_key: '${VIRUSTOTAL_API_KEY:-}'   # put the real value in .env
+  base_url: 'https://www.virustotal.com/api/v3'
+  cache_ttl: 86400                     # reuse a cached verdict for N seconds
+  timeout: 20
+  min_interval: 15                     # seconds between calls (free tier: 4/min)
+  daily_limit: 500                     # calls per rolling 24h (free tier)
 
 # Third-party TAXII 2.1 pullers (empty = none). See Community Sources.
 taxii_pullers: []
@@ -355,9 +388,10 @@ directly). On the
    shows the static `intel_filter.benign_values` / `benign_domains` /
    `benign_cidrs` rules from `config.yaml` (read-only here). See
    [The known-legitimate filter](#the-known-legitimate-filter-keeping-legit-values-out-of-the-feed).
-8. **Community sources** — a table of the OTX puller plus each
-   `taxii_pullers:` entry (kind, enabled/running, last sync, last added,
-   status) with a **limit box** and a **Pull now** button. Type a number in
+8. **Community sources** — a table of the OTX puller, the abuse.ch puller
+   (with its feeds) plus each `taxii_pullers:` entry (kind, enabled/running,
+   last sync, last added, status) with a **limit box** and a **Pull now**
+   button. Type a number in
    the box to cap how many objects that one pull ingests (blank = the
    puller's configured cap). "Pull now" runs one fetch on demand
    (it works even while a puller is `enabled: false`, for a one-shot fetch),
@@ -437,14 +471,14 @@ Returns the latest STIX feed in **TAXII 2 XML** format.
 
 **Authentication:** the **data endpoints** are split by privilege —
 **reads** (`/feed`, `/objects`, `/ui/stats`, `/ui/collections`,
-`/ui/benign`, `/community/pullers`, `/taxii2/*`) accept the TAXII
+`/ui/benign`, `/ui/vt`, `/community/pullers`, `/taxii2/*`) accept the TAXII
 credentials from
 `taxii.auth` in `config.yaml` (sent as `X-Taxii-Username` /
 `X-Taxii-Password` headers or HTTP Basic) **or** a valid UI session cookie
 (from the dashboard login). **Writes** (`/feed/ingest`, `/feed/delete`,
 `/feed/purge`, `/feed/import-csv`, `/objects/<id>/revoke`,
 `/objects/<id>/exclude`, `/ui/benign`,
-`/ui/benign/<id>/delete`,
+`/ui/benign/<id>/delete`, `/ui/vt/lookup`,
 `/community/pull/<name>`) need the **dashboard session, the UI credentials,
 or an optional `taxii.admin_auth` principal** — TAXII credentials are
 read-only on purpose, so the credential handed to Vision One cannot change
@@ -658,6 +692,19 @@ Vision One never sees it. Reads need any authenticated principal; writes need a
 | `POST /ui/benign` | Body `{"value", "kind": "exact\|domain\|cidr", "note"?}`. Idempotent — an identical `(value, kind)` returns `200` with `changed:false` instead of creating a duplicate. `400` on a bad kind, empty value, malformed domain or invalid CIDR; `201` on create. |
 | `POST /ui/benign/<id>/delete` | Remove an entry; the object is served again from the next poll. `404` if unknown. |
 
+### VirusTotal endpoint
+
+The on-demand, cached enrichment (see
+[VirusTotal](#virustotal-on-demand-cached-enrichment)). A lookup spends the
+shared free-tier quota and writes the cache, so it needs a **write** role;
+status is readable by any authenticated principal. When VT is not configured the
+lookup returns `400` with `{"error": "VirusTotal is not configured …"}`.
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /ui/vt` | Status: `{enabled, configured, base_url, cache_ttl, cache_entries, quota_used_24h, daily_limit}`. |
+| `POST /ui/vt/lookup` | Body `{"value", "kind"?, "force"?}` — or `{"object_id": "<stix_id>"}` to derive the value (and kind) from a stored object. Returns the verdict `{value, kind, malicious, suspicious, harmless, undetected, reputation, categories[], link, verdict, fetched, fetched_by, cached, not_found?}`. `verdict` is `malicious` \| `suspicious` \| `clean`. A fresh cache hit is served without an HTTP call (`cached: true`); `force: true` re-checks. `400` if unconfigured, unsupported value type, or the rate/day limit is hit. |
+
 ### Object lifecycle endpoints
 
 | Endpoint | Purpose |
@@ -675,8 +722,9 @@ Vision One never sees it. Reads need any authenticated principal; writes need a
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /community/pullers` | Status of all community sources: the OTX puller plus each `taxii_pullers:` entry (`id`, `name`, `kind`, `enabled`, `running`, `limit`, `base_url`, `collection` for TAXII, `last_sync`, `last_added`, `last_status`, `last_message`). |
+| `GET /community/pullers` | Status of all community sources: the OTX puller, the abuse.ch puller (`id` `abuse_ch`, `kind` `abuse_ch`, `feeds`, `auth_key_set`) and each `taxii_pullers:` entry (`id`, `name`, `kind`, `enabled`, `running`, `limit`, `base_url`, `collection` for TAXII, `last_sync`, `last_added`, `last_status`, `last_message`). |
 | `POST /community/pull/otx` | **Write** (dashboard session / UI credentials / `taxii.admin_auth`). Run one OTX pull cycle now (the UI "Pull now"). Optional `limit` (JSON `{"limit": N}` or `?limit=N`) caps objects this cycle. Returns `{name, added, error, last_sync, last_status, limit?}`. |
+| `POST /community/pull/abuse_ch` | **Write** (as above). Run one abuse.ch pull cycle now (all configured feeds, merged). Same optional `limit`. `400` if no feeds are configured. |
 | `POST /community/pull/<name>` | **Write** (as above). Run one pull cycle now for a `taxii_pullers:` entry named `<name>`, with the same optional `limit`. `404` if unknown, `400` if misconfigured or the limit is not a positive integer. Works even when the puller is `enabled: false` (one-shot fetch). |
 
 > **Limiting a pull.** "Pull now" accepts a per-cycle **limit** — the dashboard's
@@ -704,13 +752,21 @@ Health check endpoint for monitoring.
   "poller": {
     "otx": "stopped",
     "self_check": "stopped",
-    "taxii": {"otx-taxii": "running"}
+    "taxii": {"otx-taxii": "running"},
+    "abuse_ch": "stopped"
+  },
+  "virus_total": {
+    "enabled": false,
+    "configured": false,
+    "quota_used_24h": 0,
+    "daily_limit": 500
   }
 }
 ```
 
 `poller.taxii` is a map of puller `name` → `running`/`stopped` (empty `{}`
-when no `taxii_pullers:` entries are configured).
+when no `taxii_pullers:` entries are configured). `poller.abuse_ch` reports the
+abuse.ch puller, and `virus_total` reports the enrichment quota.
 
 ## Trend Micro Vision One Integration Guide
 
@@ -861,12 +917,24 @@ own (see Step 3). They are optional helpers (all off by default):
   them in tagged `source='otx'` — so it never wipes your manual/web-UI intel,
   and a web-UI save never wipes OTX intel. To enable, set `otx.enabled: true`
   in `config.yaml` (an optional free `api_key` raises OTX rate limits).
+- **`abuse_ch`** — pulls community intel **from abuse.ch** — **ThreatFox**
+  (IPs / domains / URLs / hashes, with a real `confidence_level`), **Feodo
+  Tracker** (botnet C2 IPv4) and **URLhaus** (malicious URLs + their hosts).
+  abuse.ch has no STIX/TAXII feed, so this is a native HTTP puller (one free
+  **Auth-Key** from `auth.abuse.ch` covers the feeds). Objects are merged in
+  tagged `source='abuse_ch'`. Set `abuse_ch.enabled: true` to poll on a
+  schedule, or use the **Pull now** button for a one-shot fetch. See
+  [Community Sources](#community-sources-pulling-from-otx-abusech-or-any-taxii-21-server).
 - **`taxii_pullers:`** — one or more generic pullers that fetch STIX 2.1
   objects **from any third-party TAXII 2.1 server**, merged in tagged with
-  the puller's `name`. See [Community Sources](#community-sources-pulling-from-otx-or-any-taxii-21-server).
+  the puller's `name`. See [Community Sources](#community-sources-pulling-from-otx-abusech-or-any-taxii-21-server).
 - **`self_check`** — a self-test that polls this server's *own* `/feed`
   endpoint to confirm it stays reachable. (Previously misnamed `vision_one`;
   that name has been dropped, but old `vision_one:` configs still work.)
+
+**VirusTotal** (`virus_total:`) is not a poller — it is an *on-demand*, cached
+lookup used for false-positive triage (see
+[VirusTotal](#virustotal-on-demand-cached-enrichment)). It stays off by default.
 
 > **Note on ingest modes.** `POST /feed/ingest` takes an optional `mode`:
 > *replace* (default — wipes and rebuilds the `source='manual'` feed of the
@@ -1143,11 +1211,11 @@ Revocation is **sticky**: it survives a web-UI *replace* save (a save that
 doesn't explicitly set `revoked` won't silently reinstate it). Only an
 explicit `unrevoke` clears it.
 
-## Community Sources (pulling from OTX or any TAXII 2.1 server)
+## Community Sources (pulling from OTX, abuse.ch or any TAXII 2.1 server)
 
 This is the **ingest side** of the pipeline — how community intel gets *into*
-this server (Vision One only ever reads it out via `/taxii2/`). There are two
-kinds, both shown in the **Community sources** dashboard panel:
+this server (Vision One only ever reads it out via `/taxii2/`). All of them are
+shown in the **Community sources** dashboard panel:
 
 ### 1. AlienVault OTX (built-in)
 
@@ -1155,7 +1223,40 @@ Configured under `otx:` (see the block in `config.yaml`). `enabled: false` by
 default. Pulls public pulse indicators (IPv4 / domain / file hash) and merges
 them in tagged `source='otx'`. An optional free `api_key` raises rate limits.
 
-### 2. Third-party TAXII 2.1 servers (`taxii_pullers:`)
+### 2. abuse.ch (built-in)
+
+Configured under `abuse_ch:`. `enabled: false` by default. abuse.ch publishes
+**no STIX/TAXII feed**, so this is a native HTTP puller that speaks their JSON
+APIs directly. One free **Auth-Key** (from [auth.abuse.ch](https://auth.abuse.ch/))
+covers every feed:
+
+```yaml
+abuse_ch:
+  enabled: false
+  auth_key: '${ABUSE_CH_AUTH_KEY:-}'   # put the real value in .env
+  feeds: ['threatfox', 'feodo', 'urlhaus']
+  poll_interval: 3600
+  max_objects_per_poll: 5000
+  threatfox_days: 1                    # ThreatFox look-back window
+  ingest_collection: comm_intel
+```
+
+| Feed | What it brings | Objects |
+|---|---|---|
+| `threatfox` | IOCs tied to malware families, with a real `confidence_level` (0–100) | IPs, domains, URLs, md5/sha1/sha256 |
+| `feodo` | Feodo Tracker botnet **C2** addresses | IPv4 |
+| `urlhaus` | Recent malicious URLs **and their host** (domain or IP) | URLs, domains, IPs |
+
+Every object is tagged `source='abuse_ch'` and flows through the
+[intel filter](#intel-filter-filtering-between-server-and-vision-one) like any
+other community intel. Drop a feed from the `feeds:` list to stop ingesting it;
+an explicit empty list ingests nothing (so **Pull now** reports "misconfigured"
+without touching the network). Without an `auth_key`, ThreatFox/URLhaus may
+refuse the request (Feodo's blocklist needs none). See
+[Community Sources](#community-sources-pulling-from-otx-abusech-or-any-taxii-21-server)
+for the dashboard controls.
+
+### 3. Third-party TAXII 2.1 servers (`taxii_pullers:`)
 
 Add one entry per source under `taxii_pullers:` in `config.yaml`. Each is a
 self-contained puller that polls a remote TAXII 2.1 collection with Basic
@@ -1190,7 +1291,7 @@ through the [intel filter](#intel-filter-filtering-between-server-and-vision-one
 before reaching Vision One. **No community source pulls anything until you
 enable it** — the server ships with all pullers off.
 
-### 3. CSV import (GT-team ad-hoc intel)
+### 4. CSV import (GT-team ad-hoc intel)
 
 For one-off intel uploads that don't fit the other paths. Upload a `.csv`
 **or `.xlsx`** in the **Import CSV / Excel (GT team)** dashboard panel (or
@@ -1353,13 +1454,56 @@ intel_filter:
 
 1. A legitimate domain or IP is being **served** (Vision One may block it) →
    open the **Feed** tab and find the row.
-2. Click **Exclude** on that row — or add the value (as *exact* / *domain* /
+2. Want a second opinion before excluding it? Click **VT** on the row to ask
+   **VirusTotal** (cached; free-tier limited — see
+   [VirusTotal](#virustotal-on-demand-cached-enrichment)). A value VT reports
+   **clean** is a strong candidate for the known-legitimate filter.
+3. Click **Exclude** on that row — or add the value (as *exact* / *domain* /
    *cidr*) in the **Known-legitimate filter** panel.
-3. It is withheld from the next poll, and the entry is now visible in the panel
+4. It is withheld from the next poll, and the entry is now visible in the panel
    and the **Audit log** (`benign.create`).
-4. Prefer a durable, reviewable rule in `config.yaml` for anything your team
+5. Prefer a durable, reviewable rule in `config.yaml` for anything your team
    agrees should *always* be excluded; use the dashboard for quick, one-off
    exclusions.
+
+## VirusTotal (on-demand, cached enrichment)
+
+Optional. Off by default. Configured under `virus_total:`:
+
+```yaml
+virus_total:
+  enabled: false
+  api_key: '${VIRUSTOTAL_API_KEY:-}'   # put the real value in .env
+  base_url: 'https://www.virustotal.com/api/v3'
+  cache_ttl: 86400                     # reuse a cached verdict for N seconds
+  timeout: 20
+  min_interval: 15                     # seconds between outbound calls (free: 4/min)
+  daily_limit: 500                     # outbound calls per rolling 24h (free tier)
+```
+
+This is a **false-positive tie-breaker**, deliberately *not* a bulk
+enrichment/gate. The VirusTotal free tier allows only ~**4 requests/min** and
+**500/day**, and its ToS forbids commercial bulk use — so the server never calls
+VT during a poll. Instead:
+
+- The **Feed** tab shows a **VT** button on `ipv4-addr` / `domain-name` / `url` /
+  `file-hash` rows. Clicking it looks the value up (via `POST /ui/vt/lookup`,
+  or `{"object_id": …}`) and reports detections inline (e.g. `clean 0✗/70✓`).
+- A verdict is **cached** in the `vt_cache` table for `cache_ttl` seconds, so a
+  repeat check of the same value never spends quota. `GET /ui/vt` reports the
+  cache size and quota used in the last 24 h.
+- The server enforces a **min interval** between calls and a rolling 24 h
+  **daily limit** (both conservative by default), returning `400` with a clear
+  message when either is hit rather than silently failing.
+
+**Precedence:** VT is advisory only — it never changes what is served by itself.
+You decide whether a clean value should be **Excluded** (withheld). Only
+`domain-name` / `ipv4-addr` / `url` / file-hash values can be looked up; other
+value shapes return `400 unsupported value type`.
+
+> **Free-tier caveat.** The default `min_interval: 15` and `daily_limit: 500`
+> keep you inside the free tier. A lookup needs the **write** role (it spends the
+> shared quota); the status endpoint is readable by any authenticated principal.
 
 ## Testing
 
@@ -1384,7 +1528,10 @@ authentication (TAXII creds **and** the UI session cookie), subscription
 management, STIX 2.1 object mapping (IP / domain / file-hash / indicator
 patterns), TAXII bundle generation (including `match[type]`, `match[id]`,
 and `added_after` query filters), the OTX poller (init, URL/headers,
-indicator mapping, and manual-vs-OTX source isolation), the generic
+indicator mapping, and manual-vs-OTX source isolation), the **abuse.ch
+puller** (init/feed filtering, Auth-Key headers, ThreatFox/Feodo/URLhaus
+mapping incl. `ip:port` and hash types, merge + source tagging, the per-poll
+cap, and misconfigured handling), the generic
 **third-party TAXII 2.1 puller** (init, headers, fetch-and-merge, state
 persistence, misconfigured handling), the **community source endpoints**
 (`GET /community/pullers`, `POST /community/pull/<name>`), the **UI
@@ -1394,7 +1541,10 @@ floor, blocklist, and that manual intel is never gated), the
 **known-legitimate filter** (config `benign_values`/`benign_domains`/`benign_cidrs`
 and the dynamic ones withholding matching community objects; the one-click
 `POST /objects/<id>/exclude` and `/ui/benign` CRUD; write-role gating;
-value/kind validation; idempotency; and audit), **manual
+value/kind validation; idempotency; and audit), the **VirusTotal enrichment**
+(verdict parsing, kind inference, endpoint/link building, cache hit without an
+HTTP call, `force`, the min-interval + daily limits, and the
+`/ui/vt[/lookup]` endpoints incl. lookup by `object_id`), **manual
 revocation** (`POST /objects/<id>/revoke`, stickiness across saves,
 `revoked: true` in the TAXII bundle) and **TTL auto-revocation** (per-type
 aging sweep), and **SSO** (Microsoft Entra OIDC: PKCE authorize redirect +
@@ -1543,15 +1693,18 @@ they are explicit, not forgotten:
 > collections with per-client credentials (RBAC). See the relevant sections
 > above.
 
-- **Non-TAXII HTTP feed connectors** — Abuse.ch / ThreatFox style pullers
-  (OTX and *any* TAXII 2.1 server are already covered by the generic puller;
-  MISP in particular can be added today as a `taxii_pullers:` entry).
+- **Non-TAXII HTTP feed connectors** — abuse.ch (ThreatFox / Feodo / URLhaus)
+  shipped; further feeds (SSLBL, MalwareBazaar) and MISP (via a
+  `taxii_pullers:` entry) remain options.
 - **Web scraping** (blogs / GitHub / paste sites, e.g. Playwright) — off-mission
   for a curated feed; ToS/legal risk; high noise floor.
 - **LLM / NLP extraction** of unstructured text or PDFs into STIX — heavy
   dependency, contradicts the offline, low-attack-surface direction.
-- **Auto-enrichment** (VirusTotal / WHOIS) — needs external APIs + keys and
-  network egress; revisit only if Vision One consumers want enriched context.
+- **Ingest-time / bulk enrichment** (VirusTotal / WHOIS) — an on-demand, cached
+  VirusTotal check shipped (see
+  [VirusTotal](#virustotal-on-demand-cached-enrichment)); *bulk* enrichment
+  remains out of scope because the free tier forbids it and it dilutes the
+  curated, auditable gate.
 - **AI/ML scoring & quarantine** — the rule-based intel gate already covers
   false-positive reduction in an auditable, offline way; an ML layer is a
   large scope addition with little to gain at this scale.

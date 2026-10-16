@@ -40,7 +40,7 @@ This guide explains how to implement and deploy a TAXII 2 server that feeds STIX
 
 ### 2. Storage (SQLite / PostgreSQL via SQLAlchemy)
 - **Purpose**: Persistent storage for threat intelligence, puller state, subscriptions, API keys, dashboard users and the audit trail
-- **Data Model**: `stix_objects` (the feed), `puller_state` (poller delta + status), `subscriptions`, `api_keys` (scoped TAXII consumer keys), `ui_users` (dashboard logins + roles), `audit_events` (mutation + login trail), `benign_values` (known-legitimate filter)
+- **Data Model**: `stix_objects` (the feed), `puller_state` (poller delta + status), `subscriptions`, `api_keys` (scoped TAXII consumer keys), `ui_users` (dashboard logins + roles), `audit_events` (mutation + login trail), `benign_values` (known-legitimate filter), `vt_cache` (cached VirusTotal verdicts)
 - **See**: [Database Schema & Production Setup](#database-schema--production-setup) for the full schema, DDL and production setup.
 
 ### 3. API Endpoints
@@ -240,11 +240,11 @@ export FLASK_DEBUG=0
 
 ## Database Schema & Production Setup
 
-The server keeps everything in **seven tables**. The schema is defined by the
+The server keeps everything in **eight tables**. The schema is defined by the
 SQLAlchemy models in `server.py` (`STIXObject`, `Subscription`, `ApiKey`,
-`UIUser`, `PullerState`, `AuditEvent`, `BenignValue`) and created automatically
-on first start (`Base.metadata.create_all()` inside `init_db()`), so **no
-manual DDL is required** — but the exact DDL is below for a DBA-managed
+`UIUser`, `PullerState`, `AuditEvent`, `BenignValue`, `VtCache`) and created
+automatically on first start (`Base.metadata.create_all()` inside `init_db()`),
+so **no manual DDL is required** — but the exact DDL is below for a DBA-managed
 deployment.
 
 > The DDL below is compiled from those models by `tools/dump_schema.py`, so it
@@ -262,12 +262,13 @@ deployment.
 | Table | Purpose |
 |-------|---------|
 | `stix_objects` | The feed — one row per STIX id. IOCs are *served* as STIX 2.1 `indicator`; stored types also include the extra SCOs (`url`, `email-addr`, `ipv6-addr`, `mac-addr`, `windows-registry-key`, `autonomous-system`) and the SDO/SROs (`malware`, `threat-actor`, `campaign`, `report`, `identity`, `attack-pattern`, `vulnerability`, `relationship`). |
-| `puller_state` | Per-community-puller delta state (`last_sync` feeds the poller's `?since=`) plus the last-run status shown in the dashboard. `id` is `otx` or `taxii:<name>`. |
+| `puller_state` | Per-community-puller delta state (`last_sync` feeds the poller's `?since=`) plus the last-run status shown in the dashboard. `id` is `otx`, `abuse_ch` or `taxii:<name>`. |
 | `subscriptions` | Legacy TAXII client subscriptions used by `POST /subscriptions/<client_id>` and `POST /auth`. |
 | `api_keys` | Dashboard-generated, collection-scoped TAXII consumer keys. Only the cleartext `prefix` (indexed for O(1) lookup) and a SHA-256 of the secret are stored; the plaintext is shown **once**, at creation. Optional per-key expiry, sliding-window rate limit (`rate_limit`/`rate_window`), per-response IOC ceiling (`max_objects`) and object-type allow-list (`types`). |
 | `ui_users` | Dashboard logins with a role (`viewer` \| `editor` \| `admin`). Passwords are werkzeug-hashed (scrypt/pbkdf2) and the role is re-resolved per request, so disabling a user takes effect immediately. The static `ui.auth` break-glass admin is deliberately **not** stored here. |
 | `audit_events` | Append-only trail of dashboard mutations (ingest/import/delete/purge/revoke, community pull, key + user management) and successful logins. One row per action, never mutated; read by admins at `GET /ui/audit`. Never stores secrets (a key create records the **prefix**, not the plaintext). Bounded by `audit.retention_days` / `audit.max_events`; `0` keeps rows forever. |
 | `benign_values` | The **dynamic known-legitimate filter**: legitimate values the community gate must **withhold** so Vision One never serves (and cannot block) them. `kind` is `exact` \| `domain` \| `cidr`; a `domain` entry also covers its subdomains. Mirrored into memory at startup and on every change, so the read path (a TAXII poll) never queries the table. Managed from the dashboard (`/ui/benign`, one-click `/objects/<id>/exclude`); the static counterpart is `intel_filter.benign_values`/`benign_domains`/`benign_cidrs` in `config.yaml`. |
+| `vt_cache` | Cached **VirusTotal** verdicts for the on-demand false-positive tie-breaker: one row per value (lowercased), refreshed on each fresh lookup and reused for `virus_total.cache_ttl` seconds (free tier is ~4/min, 500/day). Stores detector counts, reputation, categories and the GUI link — never the API key. Written only by `POST /ui/vt/lookup`; see [VirusTotal](../README.md#virustotal-on-demand-cached-enrichment). |
 
 ### DDL (PostgreSQL)
 
@@ -290,7 +291,7 @@ CREATE TABLE stix_objects (
     object_refs        TEXT,                      -- report object_refs (JSON list)
     valid_from         TIMESTAMP,                 -- STIX valid_from (upstream, when known)
     collection_id      VARCHAR,                   -- which collection (multi-collection RBAC)
-    source             VARCHAR,                   -- 'manual' | 'otx' | <puller name>
+    source             VARCHAR,                   -- 'manual' | 'otx' | 'abuse_ch' | <puller name>
     first_seen         TIMESTAMP,
     last_seen          TIMESTAMP,
     revoked            BOOLEAN,
@@ -392,6 +393,23 @@ CREATE TABLE benign_values (
     PRIMARY KEY (id)
 );
 CREATE INDEX ix_benign_values_value ON benign_values (value);
+
+-- Cached VirusTotal verdicts for the on-demand, free-tier-aware enrichment.
+-- One row per value; refreshed on each fresh lookup (POST /ui/vt/lookup).
+CREATE TABLE vt_cache (
+    value       VARCHAR NOT NULL,                -- lowercased value (URL kept whole)
+    kind        VARCHAR NOT NULL,                -- ip | domain | url | hash
+    malicious   INTEGER,                         -- last_analysis_stats counts
+    suspicious  INTEGER,
+    harmless    INTEGER,
+    undetected  INTEGER,
+    reputation  INTEGER,                         -- VT reputation score
+    categories  VARCHAR,                         -- comma-joined VT categories
+    link        VARCHAR,                         -- VT GUI permalink
+    fetched     TIMESTAMP,                       -- naive UTC
+    fetched_by  VARCHAR,                         -- actor (username, or 'system')
+    PRIMARY KEY (value)
+);
 ```
 
 > **Design notes.** There are **no foreign keys** — the store is deliberately
@@ -451,8 +469,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO taxii;
 > `collection_id`, `value`, `object_refs`, `valid_from`, `api_keys.max_objects`,
 > `api_keys.types`,
 > …). Both are no-ops only when the schema is already **complete**. So a
-> DML-only role (no `CREATE`/`ALTER`) must be given the *full* seven-table schema
-> above — including `api_keys`, `ui_users`, `audit_events` and `benign_values`,
+> DML-only role (no `CREATE`/`ALTER`) must be given the *full* eight-table schema
+> above — including `api_keys`, `ui_users`, `audit_events`, `benign_values` and
+> `vt_cache`,
 > which later
 > releases added. If a
 > table or column is absent and the role cannot create/alter it, `init_db()`
@@ -462,7 +481,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO taxii;
 ### Verify
 
 ```bash
-psql "postgresql://taxii:***@db-host:5432/taxii_feed" -c '\dt'   # 7 tables + indexes
+psql "postgresql://taxii:***@db-host:5432/taxii_feed" -c '\dt'   # 8 tables + indexes
 curl -s http://host:5000/health | jq '.database'                # "connected"
 ```
 

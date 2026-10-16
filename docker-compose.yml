@@ -52,6 +52,8 @@ services:
       UI_AUTH_USER: ${UI_AUTH_USER}
       UI_AUTH_PASSWORD: ${UI_AUTH_PASSWORD}
       OTX_API_KEY: ${OTX_API_KEY:-}
+      ABUSE_CH_AUTH_KEY: ${ABUSE_CH_AUTH_KEY:-}
+      VIRUSTOTAL_API_KEY: ${VIRUSTOTAL_API_KEY:-}
       # Get Objects response shape: envelope (spec) | bundle (OTX-compatible)
       TAXII_OBJECTS_SHAPE: ${TAXII_OBJECTS_SHAPE:-envelope}
     ports:

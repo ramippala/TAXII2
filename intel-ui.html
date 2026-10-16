@@ -71,6 +71,10 @@
             background: transparent; color: var(--muted); border: 1px solid var(--border); }
   .revbtn:hover { color: var(--warn); border-color: var(--warn); }
   .revbtn:disabled { opacity: .5; cursor: default; }
+  .vtres { font-size: 11px; margin-left: 4px; color: var(--muted); white-space: nowrap; }
+  .vtres.ok { color: var(--ok); }
+  .vtres.warn { color: var(--warn); }
+  .vtres.err { color: var(--err); }
   .reason { color: var(--muted); font-size: 12px; }
   .mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13px; }
   /* brief highlight for a freshly-saved row so the user sees it landed */
@@ -353,9 +357,12 @@
       <h2>Community sources</h2>
       <div class="hint" style="margin:0 0 10px">
         Pull STIX intel from community sources into the feed. Configure them under
-        <span class="mono">otx:</span> and <span class="mono">taxii_pullers:</span> in
+        <span class="mono">otx:</span>, <span class="mono">abuse_ch:</span> and
+        <span class="mono">taxii_pullers:</span> in
         <span class="mono">config.yaml</span>. "Pull now" runs a one-shot fetch (works even when a
         puller is disabled) — new objects appear in the feed and are gated like any community intel.
+        In the feed, <b>VT</b> checks a value on VirusTotal (cached) and <b>Exclude</b> keeps a
+        legitimate value out of what Vision One is served.
       </div>
       <div class="feedtools">
         <input type="search" id="pullerSearch" placeholder="Filter by name, kind or collection…" autocomplete="off">
@@ -1062,6 +1069,18 @@ function rowElement(o) {
       ex.addEventListener("click", () => excludeObject(o.id, ex));
       cStatus.append(" ", ex);
     }
+    // On-demand VirusTotal check — the FP tie-breaker. Cached server-side, so
+    // repeat checks do not spend the free-tier quota.
+    if (VT_TYPES.includes(o.type)) {
+      const vt = document.createElement("button");
+      vt.className = "revbtn write-only";
+      vt.textContent = "VT";
+      vt.title = "Look this value up on VirusTotal (cached; free-tier limited)";
+      const res = document.createElement("span");
+      res.className = "vtres";
+      vt.addEventListener("click", () => vtCheck(o.id, vt, res));
+      cStatus.append(" ", vt, res);
+    }
   }
 
   const cId = document.createElement("td");
@@ -1458,6 +1477,50 @@ async function excludeObject(id, btn) {
     await loadBenign();
     loadFeed();
   } catch (e) {
+    showMsg("Cannot reach server: " + e.message, false);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// VirusTotal — on-demand check (the false-positive tie-breaker)
+// ---------------------------------------------------------------------------
+const VT_TYPES = ["ipv4-addr", "domain-name", "url", "file-hash"];
+
+async function vtCheck(id, btn, res) {
+  if (btn) btn.disabled = true;
+  if (res) { res.textContent = "…"; res.className = "vtres"; res.title = ""; }
+  try {
+    const r = await api("/ui/vt/lookup", {
+      method: "POST", body: JSON.stringify({ object_id: id }),
+    });
+    if (r.status !== 200) {
+      const msg = (r.body && r.body.error) || `VirusTotal failed (HTTP ${r.status})`;
+      if (res) { res.textContent = "!"; res.className = "vtres err"; res.title = msg; }
+      showMsg(msg, false);
+      return;
+    }
+    const b = r.body || {};
+    const verdict = b.verdict || "clean";
+    if (res) {
+      res.textContent = `${verdict} ${b.malicious}✗/${b.harmless}✓`;
+      res.className = "vtres " + (verdict === "malicious" ? "err"
+        : verdict === "suspicious" ? "warn" : "ok");
+      res.title = `VirusTotal ${b.kind}: ${b.malicious} malicious, `
+        + `${b.suspicious} suspicious, ${b.harmless} harmless, `
+        + `${b.undetected} undetected`
+        + (b.reputation != null ? `, reputation ${b.reputation}` : "")
+        + (b.categories && b.categories.length ? ` — ${b.categories.join(", ")}` : "")
+        + (b.cached ? " (cached)" : "") + (b.link ? `\n${b.link}` : "");
+    }
+    const hint = verdict === "clean"
+      ? " Looks clean — consider Exclude to keep it out of the feed." : "";
+    showMsg(`VirusTotal ${b.value}: ${b.malicious} malicious / `
+      + `${b.suspicious} suspicious / ${b.harmless} harmless (${verdict}).${hint}`,
+      verdict !== "malicious");
+  } catch (e) {
+    if (res) { res.textContent = "!"; res.className = "vtres err"; }
     showMsg("Cannot reach server: " + e.message, false);
   } finally {
     if (btn) btn.disabled = false;
@@ -2133,7 +2196,8 @@ async function loadPullers() {
 
 function pullerMatches(p, q) {
   if (!q) return true;
-  return ((p.name || "") + " " + (p.kind || "") + " " + (p.collection || "")).toLowerCase().includes(q);
+  return ((p.name || "") + " " + (p.kind || "") + " " + (p.collection || "")
+    + " " + ((p.feeds || []).join(" "))).toLowerCase().includes(q);
 }
 function pullerFiltered() {
   const q = $("pullerSearch").value.trim().toLowerCase();
@@ -2144,7 +2208,8 @@ function pullerRow(p) {
 
   const name = document.createElement("td");
   name.innerHTML = `<b>${xmlEsc(p.name)}</b>`
-    + (p.collection ? `<div class="reason">collection: ${xmlEsc(p.collection)}</div>` : "");
+    + (p.collection ? `<div class="reason">collection: ${xmlEsc(p.collection)}</div>` : "")
+    + (p.feeds && p.feeds.length ? `<div class="reason">feeds: ${xmlEsc(p.feeds.join(", "))}</div>` : "");
 
   const kind = document.createElement("td");
   kind.textContent = p.kind || "";

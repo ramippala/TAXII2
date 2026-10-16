@@ -340,6 +340,43 @@ otx:
   ingest_collection: comm_intel
 
 # ---------------------------------------------------------------------------
+# ABUSE.CH COMMUNITY PULLER (ThreatFox / Feodo Tracker / URLhaus)
+# abuse.ch publishes no STIX/TAXII feed, so this is a native HTTP puller
+# (not a `taxii_pullers:` entry). One free Auth-Key (from auth.abuse.ch)
+# covers all three feeds; without it ThreatFox/URLhaus may refuse the
+# request (Feodo still works). Every object is tagged source='abuse_ch' and
+# gated like any other community intel.
+# ---------------------------------------------------------------------------
+abuse_ch:
+  enabled: false               # set true to start pulling abuse.ch intel
+  # Put the real key in .env (ABUSE_CH_AUTH_KEY=...) so it stays out of VCS.
+  auth_key: '${ABUSE_CH_AUTH_KEY:-}'
+  feeds: ['threatfox', 'feodo', 'urlhaus']   # which feeds to ingest
+  poll_interval: 3600          # seconds between background poll cycles
+  max_objects_per_poll: 5000
+  threatfox_days: 1            # ThreatFox look-back window (get_iocs days)
+  ingest_collection: comm_intel
+
+# ---------------------------------------------------------------------------
+# VIRUSTOTAL — on-demand, cached enrichment (deliberately NOT a bulk gate).
+# The free API allows ~4 requests/min and 500/day and its ToS forbids
+# commercial bulk use, so this never runs during a poll: it answers a single
+# value on request (the dashboard "Check VT" button, or POST /ui/vt/lookup).
+# Results are cached (vt_cache) for cache_ttl so a repeat check never spends
+# quota. It is a false-positive tie-breaker: a value VT reports clean is a
+# good candidate for the known-legitimate filter above.
+# ---------------------------------------------------------------------------
+virus_total:
+  enabled: false
+  # Put the real key in .env (VIRUSTOTAL_API_KEY=...) so it stays out of VCS.
+  api_key: '${VIRUSTOTAL_API_KEY:-}'
+  base_url: 'https://www.virustotal.com/api/v3'
+  cache_ttl: 86400             # reuse a cached verdict for this many seconds
+  timeout: 20
+  min_interval: 15             # seconds between outbound calls (free tier: 4/min)
+  daily_limit: 500             # outbound calls per rolling 24h (free tier)
+
+# ---------------------------------------------------------------------------
 # THIRD-PARTY TAXII 2.1 PULLERS — pull objects FROM other TAXII servers.
 # Add one entry per source. `name` doubles as the object `source` tag and
 # the dashboard label. Enable via `enabled: true` OR hit "Pull now" in the

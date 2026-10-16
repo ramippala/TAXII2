@@ -59,6 +59,7 @@ def _reset_db():
         session.query(server.UIUser).delete()
         session.query(server.AuditEvent).delete()
         session.query(server.BenignValue).delete()
+        session.query(server.VtCache).delete()
         session.commit()
     finally:
         session.close()
@@ -4013,7 +4014,7 @@ class TestSchemaDdl(unittest.TestCase):
 
     EXPECTED_TABLES = {'stix_objects', 'subscriptions', 'api_keys',
                        'ui_users', 'puller_state', 'audit_events',
-                       'benign_values'}
+                       'benign_values', 'vt_cache'}
     POLL_INDEXES = {'ix_stix_objects_modified_id',
                     'ix_stix_objects_coll_modified_id'}
 
@@ -4276,6 +4277,365 @@ class TestBenignFilter(unittest.TestCase):
         actions = self._actions()
         self.assertIn('benign.create', actions)
         self.assertIn('benign.delete', actions)
+
+
+class TestAbuseChPuller(unittest.TestCase):
+    """abuse.ch native HTTP puller (ThreatFox / Feodo Tracker / URLhaus)."""
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        app.config['TAXII_AUTH'] = {'username': 'u', 'password': 'p'}
+        app.config['TAXII_ADMIN_AUTH'] = {'username': 'u', 'password': 'p'}
+        self.auth = {'X-Taxii-Username': 'u', 'X-Taxii-Password': 'p'}
+
+    # --- config / headers --------------------------------------------------
+
+    def test_init_defaults_to_all_feeds(self):
+        p = _server.AbuseChPuller({})
+        self.assertFalse(p.enabled)
+        self.assertEqual(p.SOURCE, 'abuse_ch')
+        self.assertEqual(p.STATE_ID, 'abuse_ch')
+        self.assertEqual(p.feeds, ['threatfox', 'feodo', 'urlhaus'])
+
+    def test_init_filters_unknown_feeds_and_dedupes(self):
+        p = _server.AbuseChPuller({'feeds': ['threatfox', 'bogus', 'FEODO']})
+        self.assertEqual(p.feeds, ['threatfox', 'feodo'])
+
+    def test_explicit_empty_feeds_means_none(self):
+        self.assertEqual(_server.AbuseChPuller({'feeds': []}).feeds, [])
+
+    def test_headers_include_auth_key(self):
+        self.assertEqual(
+            _server.AbuseChPuller({'auth_key': 'k'})._headers()['Auth-Key'], 'k')
+        self.assertNotIn('Auth-Key', _server.AbuseChPuller({})._headers())
+
+    # --- IOC mapping -------------------------------------------------------
+
+    def test_descriptor_ip_port(self):
+        d = _server._abuse_ioc_descriptor(
+            '1.2.3.4:8080', 'ip:port', 90, ['threatfox'], 'x')
+        self.assertEqual(d['type'], 'ipv4-addr')
+        self.assertEqual(d['object']['ipv4-addr']['value'], '1.2.3.4')
+        self.assertEqual(d['id'], 'ipv4-addr--1-2-3-4')
+        self.assertEqual(d['confidence'], 90)
+
+    def test_descriptor_domain_url_hash(self):
+        d = _server._abuse_ioc_descriptor(
+            'Evil.Example.com', 'domain', 50, ['threatfox'], 'x')
+        self.assertEqual(d['type'], 'domain-name')
+        self.assertEqual(d['object']['domain-name']['value'], 'evil.example.com')
+
+        u = _server._abuse_ioc_descriptor(
+            'http://evil.example/x', 'url', 50, [], 'x')
+        self.assertEqual(u['type'], 'url')
+
+        h = _server._abuse_ioc_descriptor('a' * 64, 'sha256_hash', 100, [], 'x')
+        self.assertEqual(h['type'], 'file-hash')
+        self.assertEqual(h['object']['hash_value']['algorithm'], 'sha256')
+
+    def test_descriptor_infers_shape_without_a_hint(self):
+        # URLhaus hosts arrive with no ioc_type; the shape decides.
+        self.assertEqual(
+            _server._abuse_ioc_descriptor('198.51.100.3', '', 70, [], 'x')['type'],
+            'ipv4-addr')
+        self.assertEqual(
+            _server._abuse_ioc_descriptor('bad.example', '', 70, [], 'x')['type'],
+            'domain-name')
+
+    def test_descriptor_rejects_garbage(self):
+        self.assertIsNone(_server._abuse_ioc_descriptor('', 'ip:port', 50, [], 'x'))
+        self.assertIsNone(
+            _server._abuse_ioc_descriptor('not-an-ip', 'ip:port', 50, [], 'x'))
+        self.assertIsNone(_server._abuse_ioc_descriptor('x', 'nonsense', 50, [], 'x'))
+
+    # --- per-feed fetchers (HTTP stubbed) ----------------------------------
+
+    def test_fetch_threatfox_maps_and_keeps_confidence(self):
+        p = _server.AbuseChPuller({})
+        p._request_json = lambda url, payload=None: {
+            'query_status': 'ok',
+            'data': [
+                {'ioc': '203.0.113.9:443', 'ioc_type': 'ip:port',
+                 'threat_type': 'botnet_cc', 'malware_printable': 'Cobalt Strike',
+                 'confidence_level': 90, 'tags': ['c2']},
+                {'ioc': 'drop.example.com', 'ioc_type': 'domain',
+                 'confidence_level': 50},
+            ],
+        }
+        out = p.fetch_threatfox()
+        self.assertEqual(len(out), 2)
+        self.assertEqual({d['type'] for d in out}, {'ipv4-addr', 'domain-name'})
+        ip = next(d for d in out if d['type'] == 'ipv4-addr')
+        self.assertEqual(ip['confidence'], 90)
+        self.assertIn('Cobalt Strike', ip['labels'])
+
+    def test_fetch_threatfox_bad_status_yields_nothing(self):
+        p = _server.AbuseChPuller({})
+        p._request_json = lambda url, payload=None: {'query_status': 'illegal_query'}
+        self.assertEqual(p.fetch_threatfox(), [])
+
+    def test_fetch_feodo_maps_ipv4(self):
+        p = _server.AbuseChPuller({})
+        p._request_json = lambda url, payload=None: [
+            {'ip_address': '198.51.100.7', 'port': 8443, 'status': 'online',
+             'malware': 'Emotet'},
+        ]
+        out = p.fetch_feodo()
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]['object']['ipv4-addr']['value'], '198.51.100.7')
+        self.assertIn('Emotet', out[0]['labels'])
+
+    def test_fetch_urlhaus_adds_url_and_host(self):
+        p = _server.AbuseChPuller({})
+        p._request_json = lambda url, payload=None: {
+            'urls': [{'url': 'http://bad.example/mal.exe', 'host': 'bad.example',
+                      'threat': 'malware_download', 'url_status': 'online',
+                      'tags': ['exe']}],
+        }
+        types = [d['type'] for d in p.fetch_urlhaus()]
+        self.assertIn('url', types)
+        self.assertIn('domain-name', types)
+
+    # --- poll cycle --------------------------------------------------------
+
+    def test_poll_once_merges_with_source_tag(self):
+        _reset_db()
+        p = _server.AbuseChPuller({'feeds': ['feodo']})
+        p.fetch_feodo = lambda: [_server._abuse_ioc_descriptor(
+            '198.51.100.9', 'ip', 80, ['feodo'], 'x')]
+        self.assertEqual(p._poll_once(), 1)
+        rows = self.client.get('/objects', headers=self.auth).get_json()['objects']
+        row = next(o for o in rows if o['value'] == '198.51.100.9')
+        self.assertEqual(row['source'], 'abuse_ch')
+
+    def test_poll_once_respects_limit(self):
+        p = _server.AbuseChPuller({'feeds': ['feodo']})
+        p.fetch_feodo = lambda: [_server._abuse_ioc_descriptor(
+            f'198.51.100.{i}', 'ip', 80, ['feodo'], 'x') for i in range(1, 10)]
+        self.assertEqual(p._poll_once(limit=3), 3)
+
+    def test_pull_now_reports_misconfigured_without_feeds(self):
+        r = _server.AbuseChPuller({'feeds': []}).pull_now()
+        self.assertEqual(r['added'], 0)
+        self.assertIn('misconfigured', r['error'])
+
+    def test_status_shape(self):
+        s = _server.AbuseChPuller({'feeds': ['feodo'], 'enabled': True}).status()
+        self.assertEqual(s['kind'], 'abuse_ch')
+        self.assertEqual(s['id'], 'abuse_ch')
+        self.assertEqual(s['feeds'], ['feodo'])
+        self.assertTrue(s['enabled'])
+
+    # --- endpoints ---------------------------------------------------------
+
+    def test_pullers_endpoint_lists_abuse_ch(self):
+        r = self.client.get('/community/pullers', headers=self.auth)
+        self.assertEqual(r.status_code, 200)
+        names = [p['name'] for p in r.get_json()['pullers']]
+        self.assertIn('abuse.ch', names)
+
+    def test_pull_endpoint_unknown_404(self):
+        self.assertEqual(
+            self.client.post('/community/pull/nope', headers=self.auth).status_code,
+            404)
+
+    def test_pull_endpoint_abuse_ch_misconfigured_400(self):
+        saved = _server.abuse_ch_poller.feeds
+        _server.abuse_ch_poller.feeds = []
+        try:
+            r = self.client.post('/community/pull/abuse_ch', headers=self.auth)
+            self.assertEqual(r.status_code, 400)
+        finally:
+            _server.abuse_ch_poller.feeds = saved
+
+    def test_health_reports_abuse_ch_and_vt(self):
+        r = self.client.get('/health')
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertIn('abuse_ch', body['poller'])
+        self.assertIn('virus_total', body)
+
+
+class TestVirusTotal(unittest.TestCase):
+    """VirusTotal on-demand, cached enrichment (the FP tie-breaker)."""
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        app.config['TAXII_AUTH'] = {'username': 'u', 'password': 'p'}
+        app.config['TAXII_ADMIN_AUTH'] = {'username': 'u', 'password': 'p'}
+        self.auth = {'X-Taxii-Username': 'u', 'X-Taxii-Password': 'p'}
+        self._saved_creds = (_server._ui_username, _server._ui_password)
+        _server._ui_username = 'root'
+        _server._ui_password = 'root-password-123'
+        self.admin = app.test_client()
+        r = self.admin.post('/ui/login', json={
+            'username': 'root', 'password': 'root-password-123'})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+
+    def tearDown(self):
+        _server._ui_username, _server._ui_password = self._saved_creds
+
+    def _client(self, **over):
+        cfg = {'enabled': True, 'api_key': 'test-key',
+               'min_interval': 0, 'daily_limit': 500}
+        cfg.update(over)
+        return _server.VirusTotalClient(cfg)
+
+    @staticmethod
+    def _stats(malicious=0, suspicious=0, harmless=0, undetected=0, **extra):
+        attrs = {'last_analysis_stats': {
+            'malicious': malicious, 'suspicious': suspicious,
+            'harmless': harmless, 'undetected': undetected}}
+        attrs.update(extra)
+        return 200, {'data': {'attributes': attrs}}
+
+    # --- mapping / rate limiting ------------------------------------------
+
+    def test_kind_inference(self):
+        c = self._client()
+        self.assertEqual(c._vt_kind('1.2.3.4'), 'ip')
+        self.assertEqual(c._vt_kind('evil.example.com'), 'domain')
+        self.assertEqual(c._vt_kind('http://evil.example/x'), 'url')
+        self.assertEqual(c._vt_kind('a' * 64), 'hash')
+        self.assertIsNone(c._vt_kind('not a value'))
+
+    def test_endpoint_and_link(self):
+        c = self._client()
+        self.assertTrue(c._endpoint('ip', '1.2.3.4').endswith('/ip_addresses/1.2.3.4'))
+        self.assertTrue(c._endpoint('domain', 'x.com').endswith('/domains/x.com'))
+        self.assertIn('/files/', c._endpoint('hash', 'a' * 64))
+        self.assertIn('/urls/', c._endpoint('url', 'http://x/'))
+        self.assertIn('ip-address', c._gui_link('ip', '1.2.3.4'))
+
+    def test_lookup_parses_and_then_serves_cache(self):
+        c = self._client()
+        calls = []
+
+        def fake_get(url):
+            calls.append(url)
+            return self._stats(malicious=2, suspicious=1, harmless=60,
+                               undetected=5, reputation=-15,
+                               categories={'engine': 'malware'})
+
+        c._http_get = fake_get
+        r = c.lookup('evil.example.com')
+        self.assertEqual(r['verdict'], 'malicious')
+        self.assertEqual(r['malicious'], 2)
+        self.assertFalse(r['cached'])
+        self.assertEqual(len(calls), 1)
+
+        r2 = c.lookup('evil.example.com')   # cache hit, no HTTP
+        self.assertTrue(r2['cached'])
+        self.assertEqual(len(calls), 1)
+
+    def test_lookup_clean_and_suspicious_verdicts(self):
+        c = self._client()
+        c._http_get = lambda url: self._stats(harmless=70, undetected=3)
+        self.assertEqual(c.lookup('good.example.com')['verdict'], 'clean')
+
+        c2 = self._client()
+        c2._http_get = lambda url: self._stats(suspicious=4, harmless=50)
+        self.assertEqual(c2.lookup('iffy.example.com')['verdict'], 'suspicious')
+
+    def test_lookup_not_found(self):
+        c = self._client()
+        c._http_get = lambda url: (404, None)
+        r = c.lookup('unknown.example.com')
+        self.assertTrue(r.get('not_found'))
+        self.assertEqual(r['verdict'], 'clean')
+
+    def test_lookup_network_error(self):
+        c = self._client()
+        c._http_get = lambda url: (0, None)
+        self.assertIn('failed', c.lookup('1.2.3.4')['error'])
+
+    def test_lookup_requires_config(self):
+        r = _server.VirusTotalClient({'enabled': False}).lookup('1.2.3.4')
+        self.assertIn('not configured', r['error'])
+
+    def test_lookup_rejects_unsupported_value(self):
+        self.assertIn('unsupported', self._client().lookup('not a value')['error'])
+
+    def test_daily_limit_enforced(self):
+        c = self._client(daily_limit=1)
+        c._http_get = lambda url: self._stats(harmless=1)
+        self.assertEqual(c.lookup('1.1.1.1')['verdict'], 'clean')
+        r = c.lookup('2.2.2.2')
+        self.assertIn('daily limit', r['error'])
+
+    def test_min_interval_enforced(self):
+        c = self._client(min_interval=999)
+        c._http_get = lambda url: self._stats(harmless=1)
+        c.lookup('3.3.3.3')
+        self.assertIn('rate limit', c.lookup('4.4.4.4')['error'])
+
+    def test_force_bypasses_cache(self):
+        c = self._client()
+        calls = []
+        c._http_get = lambda url: (calls.append(url)
+                                   or self._stats(harmless=1))
+        c.lookup('1.2.3.4')
+        c.lookup('1.2.3.4')
+        self.assertEqual(len(calls), 1)
+        c.lookup('1.2.3.4', force=True)
+        self.assertEqual(len(calls), 2)
+
+    def test_status(self):
+        s = self._client().status()
+        self.assertTrue(s['configured'])
+        self.assertEqual(s['daily_limit'], 500)
+
+    # --- endpoints ---------------------------------------------------------
+
+    def test_endpoint_requires_write_role(self):
+        self.assertEqual(
+            self.client.post('/ui/vt/lookup', json={'value': '1.2.3.4'}).status_code,
+            401)
+
+    def test_endpoint_lookup_and_status(self):
+        saved = _server.vt_client
+        fake = self._client()
+        fake._http_get = lambda url: self._stats(malicious=3, harmless=10)
+        _server.vt_client = fake
+        try:
+            r = self.admin.post('/ui/vt/lookup', json={'value': '5.5.5.5'})
+            self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+            self.assertEqual(r.get_json()['verdict'], 'malicious')
+
+            s = self.admin.get('/ui/vt')
+            self.assertEqual(s.status_code, 200)
+            self.assertTrue(s.get_json()['configured'])
+            self.assertEqual(s.get_json()['cache_entries'], 1)
+        finally:
+            _server.vt_client = saved
+
+    def test_endpoint_lookup_by_object_id(self):
+        _reset_db()
+        ingest_objects([_otx_obj('8.8.8.8')], mode='merge', source='otx')
+        saved = _server.vt_client
+        fake = self._client()
+        fake._http_get = lambda url: self._stats(harmless=5)
+        _server.vt_client = fake
+        try:
+            r = self.admin.post('/ui/vt/lookup',
+                                json={'object_id': 'ipv4-addr--8-8-8-8'})
+            self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+            self.assertEqual(r.get_json()['value'], '8.8.8.8')
+            self.assertEqual(r.get_json()['kind'], 'ip')
+        finally:
+            _server.vt_client = saved
+
+    def test_disabled_client_endpoint_returns_400(self):
+        saved = _server.vt_client
+        _server.vt_client = _server.VirusTotalClient({'enabled': False})
+        try:
+            r = self.admin.post('/ui/vt/lookup', json={'value': '1.2.3.4'})
+            self.assertEqual(r.status_code, 400)
+            self.assertIn('not configured', r.get_json()['error'])
+        finally:
+            _server.vt_client = saved
 
 
 if __name__ == '__main__':
