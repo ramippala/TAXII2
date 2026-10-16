@@ -53,6 +53,7 @@ EXPECTED_TABLES = (
     'ui_users',
     'puller_state',
     'audit_events',
+    'benign_values',
 )
 
 

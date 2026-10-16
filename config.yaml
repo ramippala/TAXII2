@@ -163,6 +163,11 @@ lifecycle:
 #
 # All four rules below are toggles. Defaults = private-IP drop ON and a
 # 30-day freshness window ON; confidence floor OFF; blocklist empty.
+#
+# FALSE POSITIVES: `benign_values` / `benign_domains` / `benign_cidrs` below
+# (and the `benign_values` table, editable from the dashboard) name LEGITIMATE
+# values to keep OUT of the feed. A community object matching one is withheld,
+# so Vision One never sees it and cannot block real traffic on it.
 # ---------------------------------------------------------------------------
 intel_filter:
   # Which source tags are "community" and therefore gated. Manual is never
@@ -190,6 +195,29 @@ intel_filter:
   blocklist: []
     # - '10.20.0.0/8'   # NOTE: single values today, not CIDR — see README
     # - 'example.com'
+
+  # --- KNOWN-LEGITIMATE FILTER (keeps legit values OUT of the feed) --------
+  # A community object whose value matches one of these is WITHHELD, so
+  # Vision One never sees it. Use this when a feed flags a real domain or IP
+  # (e.g. a login portal, a CDN, a cloud range) — serving it would get real
+  # traffic blocked. The dynamic equivalent lives in the `benign_values` table
+  # and is editable from the dashboard (Add, or one-click "Exclude" on a
+  # served row) — no restart needed.
+  #
+  # exact values (any type): IP / domain / hash / name / URL, case-insensitive.
+  benign_values: []
+    # - '8.8.8.8'
+    # - 'login.microsoftonline.com'
+  # A domain and ALL of its subdomains (benign 'microsoft.com' covers
+  # 'login.microsoftonline.com'). Leading '*.' or '.' is optional.
+  benign_domains: []
+    # - 'microsoft.com'
+    # - 'gov.sg'
+  # IP networks — CIDR is supported here (unlike `blocklist`). Use it to keep a
+  # whole cloud / Office 365 / CDN range out of the feed.
+  benign_cidrs: []
+    # - '13.107.0.0/16'   # Microsoft 365
+    # - '10.0.0.0/8'
 
 # ---------------------------------------------------------------------------
 # WEB UI LOGIN — the dashboard (http://<server>:5000/) is behind a login.

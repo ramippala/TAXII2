@@ -360,6 +360,41 @@ class AuditEvent(Base):
     )
 
 
+class BenignValue(Base):
+    """Known-legitimate value: kept OUT of the Vision One feed.
+
+    The false-positive filter. The community gate's rules catch a *kind* of
+    noise (private IPs, stale intel, low confidence), but none of them can know
+    that ``login.microsoftonline.com`` is legitimate — so a community feed that
+    flags it would otherwise be served, and Vision One would then block real
+    traffic. A benign entry names a value that is exempt-from-serving: any
+    community object whose value matches is WITHHELD from the feed.
+
+    ``kind`` decides how ``value`` matches:
+      * ``exact``  — one value (IP / domain / hash / name / URL), case-insensitive
+      * ``domain`` — the value and any subdomain (``microsoft.com`` covers
+                     ``login.microsoftonline.com``)
+      * ``cidr``   — an IP network (e.g. a cloud / Office 365 / CDN range)
+
+    The same three forms are also available statically in ``config.yaml``
+    (``intel_filter.benign_values`` / ``benign_domains`` / ``benign_cidrs``);
+    this table is the *dynamic* form, editable from the dashboard so a
+    legitimate value can be filtered out without a config edit and restart.
+
+    Manual intel (``source='manual'``) is never gated, so a benign entry does
+    not affect it — only community-sourced objects are withheld.
+    """
+
+    __tablename__ = "benign_values"
+
+    id = Column(String, primary_key=True)            # uuid4().hex
+    value = Column(String, nullable=False, index=True)
+    kind = Column(String, nullable=False, default='exact')  # exact | domain | cidr
+    note = Column(String, nullable=True)             # why (free text, optional)
+    created = Column(DateTime, default=datetime.utcnow)
+    created_by = Column(String, nullable=True)       # actor (user or 'anonymous')
+
+
 def _utc_now_iso() -> str:
     """Current UTC time as ISO-8601 'Z' (STIX 2.1 / TAXII ?since= format)."""
     return datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -702,6 +737,7 @@ AUDIT_ACTIONS = (
     'object.revoke', 'object.unrevoke', 'feed.ingest', 'feed.delete',
     'feed.purge', 'feed.import', 'community.pull', 'key.create',
     'key.revoke', 'user.create', 'user.update', 'user.delete', 'auth.login',
+    'benign.create', 'benign.delete',
 )
 
 # Field caps — audit text is operator-facing, not a data store, so oversize
@@ -2979,6 +3015,45 @@ FILTER_BLOCKLIST = {
 FILTER_FRESHNESS_DAYS = FILTER_CFG.get('freshness_days')
 _FILTER_MIN_CONFIDENCE = FILTER_CFG.get('min_confidence')
 
+# Known-legitimate filter — values to keep OUT of the Vision One feed.
+# A community object whose value matches one of these is WITHHELD, so Vision One
+# never sees it and cannot block real traffic on it.
+#   benign_values  — exact values (any type), case-insensitive
+#   benign_domains — a domain and all of its subdomains
+#   benign_cidrs   — IP networks (e.g. cloud / Office 365 / CDN ranges)
+# The dynamic counterpart lives in the `benign_values` table (dashboard).
+FILTER_BENIGN_VALUES = {
+    str(v).strip().lower()
+    for v in (FILTER_CFG.get('benign_values') or [])
+    if str(v).strip()
+}
+FILTER_BENIGN_DOMAINS = {
+    str(v).strip().lower().lstrip('*.').strip('.')
+    for v in (FILTER_CFG.get('benign_domains') or [])
+    if str(v).strip()
+}
+
+
+def _parse_benign_cidrs(values: Any) -> List[Any]:
+    """Parse ``intel_filter.benign_cidrs`` into ``ipaddress`` networks.
+
+    A malformed entry is logged and skipped rather than failing startup: a
+    typo in the benign list must not take the whole feed down.
+    """
+    nets: List[Any] = []
+    for raw in (values or []):
+        s = str(raw or '').strip()
+        if not s:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(s, strict=False))
+        except ValueError:
+            logger.warning("intel_filter.benign_cidrs: ignoring invalid network %r", s)
+    return nets
+
+
+FILTER_BENIGN_CIDRS = _parse_benign_cidrs(FILTER_CFG.get('benign_cidrs'))
+
 
 def _is_private_or_reserved_ip(value: str) -> bool:
     """True for non-routable / special-use IPv4 addresses.
@@ -3009,6 +3084,144 @@ def _is_private_or_reserved_ip(value: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Known-legitimate filter (keep legitimate values OUT of the feed)
+# ---------------------------------------------------------------------------
+# The gate rules are value-agnostic: they catch a *kind* of noise but cannot
+# know that a specific domain is legitimate. So a community feed that flags,
+# say, login.microsoftonline.com would be served — and Vision One would block
+# real traffic. A value named here is instead WITHHELD from the feed. Two
+# sources:
+#   * config.yaml `intel_filter.benign_values / benign_domains / benign_cidrs`
+#   * the `benign_values` table (dashboard; no restart needed)
+# The table is mirrored into in-memory sets so a poll never touches the DB;
+# load_benign_values() rebuilds them at startup and on every change.
+
+_BENIGN_KINDS = ('exact', 'domain', 'cidr')
+
+_benign_lock = threading.Lock()
+_BENIGN_EXACT: "set[str]" = set()
+_BENIGN_DOMAINS: "set[str]" = set()
+_BENIGN_CIDRS: List[Any] = []
+
+
+def _normalise_benign(value: Any,
+                      kind: str) -> Tuple[Optional[str], Optional[str]]:
+    """Validate + normalise a benign ``(value, kind)``.
+
+    Returns ``(normalised_value, None)`` or ``(None, error)``. The value is
+    stored in the form the matcher compares against: lowercased for exact and
+    domain, the canonical ``network/prefix`` string for CIDR.
+    """
+    s = str(value or '').strip()
+    if not s:
+        return None, 'value is required'
+    kind = str(kind or 'exact').lower()
+    if kind == 'exact':
+        return s.lower(), None
+    if kind == 'domain':
+        d = s.lower().lstrip('*.').strip('.')
+        if not d or not _DOMAIN_RE.match(d):
+            return None, f'not a valid domain: {value!r}'
+        return d, None
+    if kind == 'cidr':
+        try:
+            return str(ipaddress.ip_network(s, strict=False)), None
+        except ValueError:
+            return None, f'not a valid CIDR network: {value!r}'
+    return None, 'kind must be one of exact|domain|cidr'
+
+
+def load_benign_values() -> int:
+    """Rebuild the in-memory benign caches from the ``benign_values`` table.
+
+    Called at startup and after every create/delete, so the read path (a TAXII
+    poll) never queries the database. Returns the number of rows loaded.
+    """
+    session = create_session()
+    try:
+        rows = [(r.value, str(r.kind or 'exact'))
+                for r in session.query(BenignValue).all()]
+    finally:
+        session.close()
+    exact: "set[str]" = set()
+    domains: "set[str]" = set()
+    cidrs: List[Any] = []
+    for value, kind in rows:
+        v = str(value or '').strip()
+        if not v:
+            continue
+        if kind == 'domain':
+            domains.add(v.lower())
+        elif kind == 'cidr':
+            try:
+                cidrs.append(ipaddress.ip_network(v, strict=False))
+            except ValueError:
+                continue
+        else:
+            exact.add(v.lower())
+    with _benign_lock:
+        _BENIGN_EXACT.clear()
+        _BENIGN_EXACT.update(exact)
+        _BENIGN_DOMAINS.clear()
+        _BENIGN_DOMAINS.update(domains)
+        _BENIGN_CIDRS.clear()
+        _BENIGN_CIDRS.extend(cidrs)
+    return len(rows)
+
+
+def _is_benign_value(value: Any) -> bool:
+    """True when ``value`` is on the known-legitimate list (withhold it).
+
+    Checks the config benign lists and the dashboard entries: an exact match, a
+    domain match (the value itself or a subdomain of it), or a CIDR match when
+    the value is IP-shaped.
+    """
+    s = str(value or '').strip()
+    if not s:
+        return False
+    low = s.lower()
+    if low in FILTER_BENIGN_VALUES:
+        return True
+    with _benign_lock:
+        if low in _BENIGN_EXACT:
+            return True
+        domains = tuple(_BENIGN_DOMAINS)
+        cidrs = list(_BENIGN_CIDRS)
+    for d in tuple(FILTER_BENIGN_DOMAINS) + domains:
+        if low == d or low.endswith('.' + d):
+            return True
+    nets = list(FILTER_BENIGN_CIDRS) + cidrs
+    if nets:
+        try:
+            ip = ipaddress.ip_address(s)
+        except ValueError:
+            return False
+        if any(ip in net for net in nets):
+            return True
+    return False
+
+
+def _object_benign(obj: ThreatIntel) -> bool:
+    """True when any value of ``obj`` is known-legitimate (withhold it).
+
+    Manual intel never reaches the gate, so this is only consulted for
+    community-sourced objects.
+    """
+    values: List[Any] = [obj.ip_address, obj.domain, obj.hash_value,
+                         obj.name, obj.value]
+    # A URL is only ever a whole URL; match its host too, so a benign_domains
+    # entry covers a URL object pointing at that domain.
+    if obj.object_type == 'url' and obj.value:
+        try:
+            host = urllib.parse.urlsplit(str(obj.value)).hostname
+            if host:
+                values.append(host)
+        except ValueError:
+            pass
+    return any(v and _is_benign_value(v) for v in values)
+
+
 def community_intel_reason(obj: ThreatIntel, row: 'STIXObject') -> Optional[str]:
     """Return the reason a *community-sourced* object is withheld, or None
     to serve it.
@@ -3017,6 +3230,12 @@ def community_intel_reason(obj: ThreatIntel, row: 'STIXObject') -> Optional[str]
     ``FILTER_COMMUNITY_SOURCES`` (see ``build_stix_bundle``). Manual intel
     is never passed here.
     """
+    # 0) Known-legitimate filter: a community object whose value is on the
+    #    benign list is WITHHELD, so Vision One never sees it (and therefore
+    #    cannot block legitimate traffic on it). See _object_benign.
+    if _object_benign(obj):
+        return 'benign'
+
     # 1) Explicit blocklist (exact value match).
     for value in (obj.ip_address, obj.domain, obj.hash_value, obj.name, obj.value):
         if value and value.lower() in FILTER_BLOCKLIST:
@@ -3055,6 +3274,7 @@ def community_intel_reason(obj: ThreatIntel, row: 'STIXObject') -> Optional[str]
 
 
 _GATE_REASON_LABELS = {
+    'benign': 'Known legitimate (kept out of the feed)',
     'blocklist': 'Blocklisted',
     'private-ip': 'Private / reserved IP',
     'low-confidence': 'Low confidence',
@@ -3998,6 +4218,50 @@ def revoke_object(stix_id: str):
         session.close()
 
 
+@app.route('/objects/<stix_id>/exclude', methods=['POST'])
+def exclude_object(stix_id: str):
+    """POST /objects/<stix_id>/exclude — keep an object out of the Vision One feed.
+
+    The one-click false-positive filter: look the object up, derive its value,
+    and record a benign entry so the gate withholds it (Vision One never sees
+    it, so it cannot block legitimate traffic on it). Body is optional:
+    ``{"kind": "exact|domain|cidr", "note": "..."}``. The default is ``domain``
+    for a domain object — so a whole domain is excluded, not one host — and
+    ``exact`` otherwise.
+    """
+    if not _write_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+    session = create_session()
+    try:
+        row = session.query(STIXObject).filter_by(stix_id=stix_id).first()
+        if row is None:
+            return jsonify({'error': f'Object not found: {stix_id}'}), 404
+        obj = _row_to_threat_intel(row)
+        collection_id = row.collection_id
+    finally:
+        session.close()
+
+    value = (obj.domain or obj.ip_address or obj.value
+             or obj.hash_value or obj.name)
+    if not value:
+        return jsonify({'error': 'object has no single value to exclude'}), 400
+    kind = str(data.get('kind') or '').lower()
+    if kind not in _BENIGN_KINDS:
+        kind = 'domain' if obj.object_type == 'domain-name' else 'exact'
+    payload, err, created = _create_benign_value(value, kind, data.get('note'))
+    if err:
+        return jsonify({'error': err}), 400
+    if created:
+        load_benign_values()
+        logger.info("Benign value %s (%s) added from object %s by %s",
+                    payload['value'], payload['kind'], stix_id, _actor())
+        _audit('benign.create', target=payload['value'],
+               collection=collection_id, detail=f'kind={payload["kind"]}')
+    return jsonify({**payload, 'id': stix_id, 'changed': created}), (
+        201 if created else 200)
+
+
 @app.route('/ui', methods=['GET'])
 @app.route('/', methods=['GET'])
 def web_ui():
@@ -4825,6 +5089,144 @@ def ui_key_revoke(key_id: str):
     logger.info("API key %s revoked by %s", payload['prefix'], _actor())
     _audit('key.revoke', target=payload['prefix'])
     return jsonify({**payload, 'changed': True}), 200
+
+
+# ---------------------------------------------------------------------------
+# Known-legitimate filter (dashboard)
+# ---------------------------------------------------------------------------
+# The dynamic half of the false-positive filter (the static half is
+# intel_filter.benign_values / benign_domains / benign_cidrs in config.yaml). An
+# entry names a legitimate value the community gate WITHHOLDS, so Vision One
+# never sees it and cannot block legitimate traffic. Stored in `benign_values`
+# and mirrored into memory by load_benign_values(); the gate reads the memory
+# copy, never the table.
+
+_BENIGN_NOTE_MAX = 200
+
+
+def _benign_public(row: 'BenignValue') -> Dict[str, Any]:
+    """Dashboard view of one benign entry."""
+    return {
+        'id': row.id,
+        'value': row.value,
+        'kind': str(row.kind or 'exact'),
+        'note': row.note,
+        'created': _stix_ts(row.created),
+        'created_by': row.created_by,
+    }
+
+
+def _create_benign_value(value: Any, kind: Any, note: Any
+                         ) -> Tuple[Optional[Dict[str, Any]], Optional[str], bool]:
+    """Insert a benign entry (idempotent).
+
+    Returns ``(payload, error, created)`` where ``created`` is False when an
+    identical ``(value, kind)`` entry already existed.
+    """
+    kind = str(kind or 'exact').lower()
+    if kind not in _BENIGN_KINDS:
+        return None, 'kind must be one of exact|domain|cidr', False
+    normalised, err = _normalise_benign(value, kind)
+    if err:
+        return None, err, False
+    note_text = str(note or '').strip() or None
+    if note_text and len(note_text) > _BENIGN_NOTE_MAX:
+        note_text = note_text[:_BENIGN_NOTE_MAX]
+    session = create_session()
+    try:
+        existing = (session.query(BenignValue)
+                    .filter_by(value=normalised, kind=kind).first())
+        if existing is not None:
+            return _benign_public(existing), None, False
+        row = BenignValue(id=uuid.uuid4().hex, value=normalised, kind=kind,
+                          note=note_text, created_by=_actor())
+        session.add(row)
+        session.commit()
+        return _benign_public(row), None, True
+    except Exception as exc:
+        session.rollback()
+        logger.error("Could not create benign value: %s", exc)
+        return None, 'could not create the benign entry', False
+    finally:
+        session.close()
+
+
+@app.route('/ui/benign', methods=['GET'])
+def ui_benign():
+    """GET /ui/benign — the known-legitimate filter.
+
+    Returns the dynamic dashboard entries plus the static config-file rules
+    (read-only here — those are edited in ``config.yaml``).
+    """
+    if not _request_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    session = create_session()
+    try:
+        rows = (session.query(BenignValue)
+                .order_by(BenignValue.created.desc()).all())
+        items = [_benign_public(r) for r in rows]
+    finally:
+        session.close()
+    return jsonify({
+        'benign': items,
+        'count': len(items),
+        'kinds': list(_BENIGN_KINDS),
+        'config': {
+            'benign_values': sorted(FILTER_BENIGN_VALUES),
+            'benign_domains': sorted(FILTER_BENIGN_DOMAINS),
+            'benign_cidrs': [str(n) for n in FILTER_BENIGN_CIDRS],
+        },
+    }), 200
+
+
+@app.route('/ui/benign', methods=['POST'])
+def ui_benign_create():
+    """POST /ui/benign — keep a legitimate value out of the Vision One feed.
+
+    Body: ``{"value": str, "kind": "exact|domain|cidr", "note": str?}``.
+    """
+    if not _write_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+    payload, err, created = _create_benign_value(
+        data.get('value'), data.get('kind'), data.get('note'))
+    if err:
+        return jsonify({'error': err}), 400
+    if created:
+        load_benign_values()
+        logger.info("Benign value %s (%s) added by %s",
+                    payload['value'], payload['kind'], _actor())
+        _audit('benign.create', target=payload['value'],
+               detail=f'kind={payload["kind"]}')
+    return jsonify({**payload, 'changed': created}), (201 if created else 200)
+
+
+@app.route('/ui/benign/<benign_id>/delete', methods=['POST'])
+def ui_benign_delete(benign_id: str):
+    """POST /ui/benign/<id>/delete — resume serving a value again."""
+    if not _write_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    session = create_session()
+    try:
+        row = session.query(BenignValue).filter_by(id=benign_id).first()
+        if row is None:
+            return jsonify({
+                'error': f'Unknown benign entry: {benign_id}'
+            }), 404
+        value, kind = row.value, str(row.kind or 'exact')
+        session.delete(row)
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        logger.error("Could not delete benign value: %s", exc)
+        return jsonify({'error': 'could not delete the benign entry'}), 500
+    finally:
+        session.close()
+    load_benign_values()
+    logger.info("Benign value %s (%s) removed by %s", value, kind, _actor())
+    _audit('benign.delete', target=value, detail=f'kind={kind}')
+    return jsonify({'id': benign_id, 'value': value, 'kind': kind,
+                    'deleted': True}), 200
 
 
 @app.route('/community/pullers', methods=['GET'])
@@ -6093,6 +6495,10 @@ def start_background_jobs() -> None:
     # Restore ingested intel that persisted in the DB so the feed is complete
     # even on the first poll after a restart.
     rehydrate_memory()
+
+    # Mirror the dashboard known-legitimate filter (benign_values) into memory
+    # so the gate never queries the table on a poll.
+    load_benign_values()
 
     # Auto-revoke any indicators that expired while the server was down,
     # then start the periodic TTL sweeper.

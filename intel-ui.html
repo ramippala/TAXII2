@@ -277,15 +277,52 @@
     <div class="panel" id="withheldPanel" style="display:none">
       <h2>Withheld by filter</h2>
       <div class="hint" style="margin:0 0 10px">
-        Community-sourced objects the intel filter is keeping <b>out of Vision One</b>.
-        These are still stored and shown in the feed above; nothing is deleted. Loosen the
-        matching rule in <span class="mono">config.yaml</span> → <span class="mono">intel_filter:</span>
-        to release one, then restart the server.
+        Community-sourced objects the intel filter is keeping <b>out of Vision One</b>
+        — including known-legitimate values on the list below. These are still stored and
+        shown in the feed above; nothing is deleted.
       </div>
       <table id="withheldTable">
         <thead><tr><th>Type</th><th>Value</th><th>Reason</th><th>Source</th></tr></thead>
         <tbody id="withheldBody"></tbody>
       </table>
+    </div>
+
+    <!-- Known-legitimate filter (keep legit values OUT of the feed) -->
+    <div class="panel">
+      <h2>Known-legitimate filter</h2>
+      <div class="hint" style="margin:0 0 10px">
+        Legitimate domains and IPs to <b>keep out of the Vision One feed</b>. A community
+        object whose value matches one of these is <b>withheld</b>, so Vision One never
+        sees it — serving a real domain would get legitimate traffic blocked.
+        <b>exact</b> matches one value, <b>domain</b> also matches every subdomain,
+        <b>cidr</b> matches an IP range (handy for a whole cloud / CDN range). You can
+        also click <b>Exclude</b> on a served row in the feed above. The same rules can be
+        set statically in <span class="mono">config.yaml</span> →
+        <span class="mono">intel_filter.benign_values / benign_domains / benign_cidrs</span>.
+      </div>
+      <div class="row">
+        <label>Value
+          <input type="text" id="benignValue" placeholder="login.microsoftonline.com" spellcheck="false" autocomplete="off" style="min-width:280px">
+        </label>
+        <label>Match
+          <select id="benignKind">
+            <option value="exact">exact</option>
+            <option value="domain">domain (+ subdomains)</option>
+            <option value="cidr">CIDR range</option>
+          </select>
+        </label>
+        <label>Note
+          <input type="text" id="benignNote" maxlength="200" placeholder="why (optional)" autocomplete="off" style="min-width:160px">
+        </label>
+        <button id="btnBenignAdd" class="write-only ghost">Add</button>
+        <button id="btnBenignReload" class="ghost">Reload</button>
+      </div>
+      <div id="benignMsg" class="msg"></div>
+      <table id="benignTable" style="display:none">
+        <thead><tr><th>Value</th><th>Match</th><th>Note</th><th>Added</th><th>By</th><th></th></tr></thead>
+        <tbody id="benignBody"></tbody>
+      </table>
+      <div id="benignConfig" class="hint"></div>
     </div>
 
     <!-- Save / Purge -->
@@ -849,6 +886,7 @@ async function init() {
       await loadCollections();
       loadFeed();
       loadPullers();
+      loadBenign();
     } else {
       showLogin(SSO_ENABLED);
     }
@@ -875,6 +913,7 @@ async function doLogin() {
       await loadCollections();
       loadFeed();
       loadPullers();
+      loadBenign();
     } else {
       $("loginErr").textContent = (r.body && r.body.error) || "Invalid credentials";
     }
@@ -895,6 +934,10 @@ async function doLogout() {
   pullerPage = 1;
   $("tbody").innerHTML = "";
   $("withheldBody").innerHTML = "";
+  $("benignBody").innerHTML = "";
+  $("benignTable").style.display = "none";
+  $("benignMsg").className = "msg";
+  $("benignConfig").textContent = "";
   $("pullerBody").innerHTML = "";
   $("keyBody").innerHTML = "";
   $("keyTable").style.display = "none";
@@ -1008,6 +1051,17 @@ function rowElement(o) {
       : "Mark as false-positive / clean (served as revoked: true)";
     btn.addEventListener("click", () => toggleRevoke(tr, o.id, !o.revoked, st, btn));
     cStatus.append(st, " ", btn);
+    // One-click known-legitimate filter: only for community rows that are
+    // currently served (a withheld row is already out of the feed, and manual
+    // intel is never gated).
+    if (o.source !== "manual" && !o.gated) {
+      const ex = document.createElement("button");
+      ex.className = "revbtn write-only";
+      ex.textContent = "Exclude";
+      ex.title = "Keep this out of the Vision One feed (known-legitimate value)";
+      ex.addEventListener("click", () => excludeObject(o.id, ex));
+      cStatus.append(" ", ex);
+    }
   }
 
   const cId = document.createElement("td");
@@ -1287,6 +1341,127 @@ function renderWithheld(objects) {
     tr.append(t, v, reason, src);
     body.appendChild(tr);
   });
+}
+
+// ---------------------------------------------------------------------------
+// Known-legitimate filter (keep legit values OUT of the Vision One feed)
+// ---------------------------------------------------------------------------
+let benignRows = [];
+
+function renderBenign(body) {
+  benignRows = (body && body.benign) || [];
+  const tbody = $("benignBody");
+  tbody.innerHTML = "";
+  $("benignTable").style.display = benignRows.length ? "table" : "none";
+  benignRows.forEach(s => {
+    const tr = document.createElement("tr");
+    const v = document.createElement("td");
+    v.className = "mono"; v.textContent = s.value;
+    const k = document.createElement("td"); k.textContent = s.kind;
+    const n = document.createElement("td");
+    n.className = "reason"; n.textContent = s.note || "";
+    const c = document.createElement("td");
+    c.className = "reason";
+    c.textContent = s.created ? s.created.replace("T", " ").replace("Z", "") : "";
+    const b = document.createElement("td");
+    b.className = "reason"; b.textContent = s.created_by || "";
+    const a = document.createElement("td");
+    const del = document.createElement("button");
+    del.className = "ghost write-only"; del.textContent = "Remove";
+    del.title = "Stop excluding this value (it is served again from the next poll)";
+    del.addEventListener("click", () => deleteBenign(s.id));
+    a.appendChild(del);
+    tr.append(v, k, n, c, b, a);
+    tbody.appendChild(tr);
+  });
+  // The static config-file rules are shown read-only (edited in config.yaml).
+  const cfg = (body && body.config) || {};
+  const parts = [];
+  if ((cfg.benign_values || []).length) parts.push("benign_values: " + cfg.benign_values.join(", "));
+  if ((cfg.benign_domains || []).length) parts.push("benign_domains: " + cfg.benign_domains.join(", "));
+  if ((cfg.benign_cidrs || []).length) parts.push("benign_cidrs: " + cfg.benign_cidrs.join(", "));
+  $("benignConfig").textContent = parts.length
+    ? "Also from config.yaml (read-only here) — " + parts.join("  ·  ")
+    : "No static rules in config.yaml — every exclusion is managed here.";
+}
+
+async function loadBenign() {
+  try {
+    const r = await api("/ui/benign");
+    if (r.status !== 200) return;
+    renderBenign(r.body);
+  } catch (e) { /* non-fatal: the panel just stays empty */ }
+}
+
+function benignMsg(text, ok) {
+  const m = $("benignMsg");
+  m.className = "msg " + (ok ? "ok" : "err");
+  m.textContent = text;
+}
+
+async function addBenign() {
+  const value = $("benignValue").value.trim();
+  if (!value) { benignMsg("Enter a value to exclude.", false); return; }
+  $("btnBenignAdd").disabled = true;
+  try {
+    const r = await api("/ui/benign", {
+      method: "POST",
+      body: JSON.stringify({
+        value: value,
+        kind: $("benignKind").value,
+        note: $("benignNote").value.trim(),
+      }),
+    });
+    if (r.status !== 200 && r.status !== 201) {
+      benignMsg((r.body && r.body.error) || `Failed (HTTP ${r.status})`, false);
+      return;
+    }
+    benignMsg(r.body && r.body.changed === false
+      ? "Already excluded from the feed." : "Excluded from the feed.", true);
+    $("benignValue").value = "";
+    $("benignNote").value = "";
+    await loadBenign();
+    loadFeed();
+  } catch (e) {
+    benignMsg("Cannot reach server: " + e.message, false);
+  } finally {
+    $("btnBenignAdd").disabled = false;
+  }
+}
+
+async function deleteBenign(id) {
+  try {
+    const r = await api(`/ui/benign/${id}/delete`, { method: "POST" });
+    if (r.status !== 200) {
+      benignMsg((r.body && r.body.error) || `Failed (HTTP ${r.status})`, false);
+      return;
+    }
+    benignMsg("No longer excluded — served again from the next poll.", true);
+    await loadBenign();
+    loadFeed();
+  } catch (e) {
+    benignMsg("Cannot reach server: " + e.message, false);
+  }
+}
+
+async function excludeObject(id, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api(`/objects/${encodeURIComponent(id)}/exclude`, {
+      method: "POST", body: "{}",
+    });
+    if (r.status !== 200 && r.status !== 201) {
+      showMsg((r.body && r.body.error) || `Exclude failed (HTTP ${r.status})`, false);
+      return;
+    }
+    showMsg(`Kept ${(r.body && r.body.value) || id} out of the feed from the next poll.`, true);
+    await loadBenign();
+    loadFeed();
+  } catch (e) {
+    showMsg("Cannot reach server: " + e.message, false);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 let newSeq = 0;
@@ -2240,6 +2415,8 @@ $("btnSso").addEventListener("click", () => { location.href = "/ui/sso"; });
 $("btnLogout").addEventListener("click", doLogout);
 $("btnLoad").addEventListener("click", loadFeed);
 $("btnAdd").addEventListener("click", addRow);
+$("btnBenignAdd").addEventListener("click", addBenign);
+$("btnBenignReload").addEventListener("click", loadBenign);
 $("btnSave").addEventListener("click", save);
 $("btnPurgeSelected").addEventListener("click", purgeSelected);
 $("btnPurge").addEventListener("click", purge);

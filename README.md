@@ -49,8 +49,8 @@ Vision One (see [Intel Filter](#intel-filter-filtering-between-server-and-vision
 ### Components
 
 1. **Flask REST API (TAXII 2 Server)** — Hosts TAXII 2.1 protocol endpoints and custom REST endpoints for feed management, UI login/session, community-source control, auth, subscriptions, and health.
-2. **Web UI dashboard** — Single self-contained `intel-ui.html` behind a login (`ui.auth`). Organized into five tabs: **Feed** (the current feed with per-row **source** and **gate** badges, a **collection** selector when multiple collections exist, **search / type & status filters / pagination**, withheld-by-filter panel, and manual entry/publish), **Intel graph** (a dashboard of the fed intel — KPI tiles plus bar charts for **by category** (IP / domain / file hash / …), **by source**, **confidence distribution**, **pulled-over-time**, **withheld-by-filter**, and **top labels** (donut, share of label occurrences); scope switch Community / Manual / All), **Community sources** (puller status + "Pull now", with the same **search + pagination**), and **Import CSV / Excel** (GT-team ad-hoc import: `.csv` or `.xlsx`), and **API keys** (generate/revoke collection-scoped TAXII credentials). Serves all intel (the gate only affects what Vision One gets).
-3. **STIX 2.1 Store** — Stores threat intelligence objects (IPs, file hashes, domains, URLs, emails, indicators, malware / threat-actor / campaign SDOs, and STIX *relationships* — a real graph, not just flat IOCs) in SQLite (or PostgreSQL). The database is the source of truth for what is served: TAXII polls read the stored rows directly (with a composite index on `(modified, stix_id)` for keyset pagination), and an in-memory copy is kept as a dashboard/coordination cache. Every object carries a `source` tag (`manual` | `otx` | a `taxii_pullers` name) and a `collection_id` (see [Multiple collections](#multiple-collections--per-client-rbac)) so manual and community intel coexist cleanly. Puller sync state (`last_sync`, `last_added`) is persisted in a `puller_state` table so delta pulls survive restarts. Dashboard mutations and logins are persisted in an `audit_events` table (see [Audit log](#audit-log)).
+2. **Web UI dashboard** — Single self-contained `intel-ui.html` behind a login (`ui.auth`). Organized into five tabs: **Feed** (the current feed with per-row **source** and **gate** badges, a **collection** selector when multiple collections exist, **search / type & status filters / pagination**, a withheld-by-filter panel, a **known-legitimate filter** panel with a one-click **Exclude** on served rows, and manual entry/publish), **Intel graph** (a dashboard of the fed intel — KPI tiles plus bar charts for **by category** (IP / domain / file hash / …), **by source**, **confidence distribution**, **pulled-over-time**, **withheld-by-filter**, and **top labels** (donut, share of label occurrences); scope switch Community / Manual / All), **Community sources** (puller status + "Pull now", with the same **search + pagination**), and **Import CSV / Excel** (GT-team ad-hoc import: `.csv` or `.xlsx`), and **API keys** (generate/revoke collection-scoped TAXII credentials). Serves all intel (the gate only affects what Vision One gets).
+3. **STIX 2.1 Store** — Stores threat intelligence objects (IPs, file hashes, domains, URLs, emails, indicators, malware / threat-actor / campaign SDOs, and STIX *relationships* — a real graph, not just flat IOCs) in SQLite (or PostgreSQL). The database is the source of truth for what is served: TAXII polls read the stored rows directly (with a composite index on `(modified, stix_id)` for keyset pagination), and an in-memory copy is kept as a dashboard/coordination cache. Every object carries a `source` tag (`manual` | `otx` | a `taxii_pullers` name) and a `collection_id` (see [Multiple collections](#multiple-collections--per-client-rbac)) so manual and community intel coexist cleanly. Puller sync state (`last_sync`, `last_added`) is persisted in a `puller_state` table so delta pulls survive restarts. Dashboard mutations and logins are persisted in an `audit_events` table (see [Audit log](#audit-log)). The known-legitimate filter is persisted in a `benign_values` table (see [The known-legitimate filter](#the-known-legitimate-filter-keeping-legit-values-out-of-the-feed)).
 4. **OTX Community Puller** — Background thread that periodically pulls indicators (IPv4, domains, file hashes) from **AlienVault OTX** public pulses and merges them into the feed tagged `source='otx'`. Off by default; can also be fired on demand from the UI.
 5. **Third-party TAXII 2.1 Pullers** — One generic puller per `taxii_pullers:` entry. Polls `GET {api_root}collections/{collection}/objects/?since=` from any TAXII 2.1 server (Basic auth, `application/taxii+json;version=2.1`), maps STIX 2.1 objects into the feed in merge mode tagged with the puller's `name`. Off by default per entry.
 6. **Self-check Poller** — Background thread that periodically fetches the local `/feed` endpoint to verify the feed is reachable and well-formed. Off by default.
@@ -342,10 +342,20 @@ directly). On the
 6. **Withheld by filter** — a panel listing every community object the
    [intel filter](#intel-filter-filtering-between-server-and-vision-one) is
    keeping out of Vision One, with the exact **reason** (Private / reserved
-   IP, Stale, Low confidence, or Blocklisted). These objects are still stored
-   — nothing is deleted; loosening the matching rule in `config.yaml`
-   (`intel_filter:`) and restarting releases them.
-7. **Community sources** — a table of the OTX puller plus each
+   IP, Stale, Low confidence, Blocklisted, or Known legitimate). These objects
+   are still stored — nothing is deleted. A row withheld as *Known legitimate*
+   is one you put on the filter below; **Remove** it there to serve it again.
+7. **Known-legitimate filter** — add, list and remove the legitimate domains
+   and IPs that must be **kept out of the Vision One feed**. A community object
+   whose value matches an entry is **withheld**, so Vision One never sees it —
+   serving a real domain would get legitimate traffic blocked. Enter a value and
+   pick a match kind: **exact** (one value), **domain** (the domain and all
+   subdomains) or **cidr** (an IP range). You can also click the one-click
+   **Exclude** button on any served community row in the feed. The panel also
+   shows the static `intel_filter.benign_values` / `benign_domains` /
+   `benign_cidrs` rules from `config.yaml` (read-only here). See
+   [The known-legitimate filter](#the-known-legitimate-filter-keeping-legit-values-out-of-the-feed).
+8. **Community sources** — a table of the OTX puller plus each
    `taxii_pullers:` entry (kind, enabled/running, last sync, last added,
    status) with a **limit box** and a **Pull now** button. Type a number in
    the box to cap how many objects that one pull ingests (blank = the
@@ -353,11 +363,11 @@ directly). On the
    (it works even while a puller is `enabled: false`, for a one-shot fetch),
    then refreshes the feed table. See
    [Community Sources](#community-sources-pulling-from-otx-or-any-taxii-21-server).
-8. **Import CSV (GT team)** — upload a `.csv` with any headers (fuzzy-mapped
+9. **Import CSV (GT team)** — upload a `.csv` with any headers (fuzzy-mapped
    to IPv4 / domain / file hash / indicator); appends to the manual feed. See
    [CSV import](#3-csv-import-gt-team-ad-hoc-intel).
 
-> Items **7 (Community sources)** and **8 (Import CSV)** live on their own
+> Items **8 (Community sources)** and **9 (Import CSV)** live on their own
 > tabs, not the Feed tab. The **Community sources** tab has the same
 > client-side **search** (name / kind / collection) and **pagination** as the
 > feed table, so a long list of pullers stays navigable.
@@ -427,11 +437,14 @@ Returns the latest STIX feed in **TAXII 2 XML** format.
 
 **Authentication:** the **data endpoints** are split by privilege —
 **reads** (`/feed`, `/objects`, `/ui/stats`, `/ui/collections`,
-`/community/pullers`, `/taxii2/*`) accept the TAXII credentials from
+`/ui/benign`, `/community/pullers`, `/taxii2/*`) accept the TAXII
+credentials from
 `taxii.auth` in `config.yaml` (sent as `X-Taxii-Username` /
 `X-Taxii-Password` headers or HTTP Basic) **or** a valid UI session cookie
 (from the dashboard login). **Writes** (`/feed/ingest`, `/feed/delete`,
 `/feed/purge`, `/feed/import-csv`, `/objects/<id>/revoke`,
+`/objects/<id>/exclude`, `/ui/benign`,
+`/ui/benign/<id>/delete`,
 `/community/pull/<name>`) need the **dashboard session, the UI credentials,
 or an optional `taxii.admin_auth` principal** — TAXII credentials are
 read-only on purpose, so the credential handed to Vision One cannot change
@@ -631,11 +644,26 @@ These drive the dashboard login. They are independent of `taxii.auth`.
 | `POST /ui/login` | Body `{"username","password"}` checked against `ui.auth`. On success sets the http-only `taxii2_ui_session` cookie (signed with `security.secret_key`, lifetime `ui.session_ttl`); `401` on bad credentials. |
 | `POST /ui/logout` | Deletes the session cookie. |
 
+### Known-legitimate filter endpoints
+
+The dynamic half of the known-legitimate filter (see
+[The known-legitimate filter](#the-known-legitimate-filter-keeping-legit-values-out-of-the-feed)).
+An entry names a legitimate value that the community gate **withholds**, so
+Vision One never sees it. Reads need any authenticated principal; writes need a
+**write** role (`editor`/`admin`) — TAXII credentials get `401`.
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /ui/benign` | `{"benign": [{id,value,kind,note,created,created_by}], "count", "kinds", "config": {benign_values,benign_domains,benign_cidrs}}`. `config` reflects the read-only `intel_filter:` rules from `config.yaml`. |
+| `POST /ui/benign` | Body `{"value", "kind": "exact\|domain\|cidr", "note"?}`. Idempotent — an identical `(value, kind)` returns `200` with `changed:false` instead of creating a duplicate. `400` on a bad kind, empty value, malformed domain or invalid CIDR; `201` on create. |
+| `POST /ui/benign/<id>/delete` | Remove an entry; the object is served again from the next poll. `404` if unknown. |
+
 ### Object lifecycle endpoints
 
 | Endpoint | Purpose |
 |----------|---------|
 | `POST /objects/<stix_id>/revoke` | **Write** (dashboard session / UI credentials / `taxii.admin_auth`; TAXII credentials get `401`). Body `{"action":"revoke"}` (default) or `{"action":"unrevoke"}`. Sets/clears the STIX `revoked` flag. A revoked object stays stored and is served to Vision One with `revoked: true` so it can be purged. `404` if the id is unknown, `400` on a bad action. |
+| `POST /objects/<stix_id>/exclude` | **Write** (as above). One-click known-legitimate filter: looks the object up, derives its value and records a benign entry, so the gate **withholds** it (Vision One never sees it). Optional body `{"kind": "exact\|domain\|cidr", "note"?}`; the default is `domain` for a domain object (exclude a whole domain) and `exact` otherwise. `404` if the id is unknown, `400` on a bad value/kind. |
 
 ### CSV import endpoint
 
@@ -1026,10 +1054,10 @@ without grepping the server log — and the rows outlive a restart.
 
 **Recorded actions:** `feed.ingest`, `feed.import`, `feed.delete`,
 `feed.purge`, `object.revoke`, `object.unrevoke`, `community.pull`,
-`key.create`, `key.revoke`, `user.create`, `user.update`, `user.delete` and
-`auth.login`. Failed logins and failed (4xx/5xx) requests are **not** recorded,
-and secrets never are: a `key.create` row stores the key **prefix**, never the
-plaintext.
+`key.create`, `key.revoke`, `user.create`, `user.update`, `user.delete`,
+`benign.create`, `benign.delete` and `auth.login`. Failed logins and
+failed (4xx/5xx) requests are **not** recorded, and secrets never are: a
+`key.create` row stores the key **prefix**, never the plaintext.
 
 Each row carries `created`, `actor` (username, or `anonymous`), `role`, `via`
 (`session` \| `ui_auth` \| `sso` \| `admin_auth`), `ip`, `action`, `target`
@@ -1247,11 +1275,17 @@ Key properties:
   (auditable). The filter only decides what is *served*; nothing is deleted,
   so it is fully reversible (flip a toggle, restart, and the object is served
   again).
+- **Known-legitimate filter.** `intel_filter.benign_values` /
+  `benign_domains` / `benign_cidrs` (config) and the `benign_values` table
+  (dashboard, no restart) name legitimate values that are **withheld** — so
+  Vision One never sees them and cannot block real traffic on them. See
+  [The known-legitimate filter](#the-known-legitimate-filter-keeping-legit-values-out-of-the-feed).
 
-### The four rules (all config toggles in `intel_filter:`)
+### The filter rules (all config toggles in `intel_filter:`)
 
 | Rule | Config key | Default | Withholds a community object when… |
 |------|-----------|---------|------------------------------------|
+| Known legitimate | `benign_values` / `benign_domains` / `benign_cidrs` | `[]` (off) | The value matches an entry (exact / domain+subdomains / CIDR). See [below](#the-known-legitimate-filter-keeping-legit-values-out-of-the-feed). |
 | Private/reserved IPs | `drop_private_ips` | `true` | The IP is non-routable / special-use: `10/8`, `172.16/12`, `192.168/16`, `127/8`, `169.254/16`, `0/8`, `240/4`, IPv4-mapped v6, CGNAT, IANA reserved. These dominate OTX honeypot feeds. |
 | Freshness window | `freshness_days` | `30` | `last_seen`/`modified` is older than N days (stale). Set `null` to disable. |
 | Confidence floor | `min_confidence` | `null` (off) | Confidence is below the floor. OTX community objects default to `70`. |
@@ -1260,6 +1294,37 @@ Key properties:
 A community object is withheld if it trips **any** active rule. When an
 object is withheld, the server logs e.g. `Intel gate withheld N community
 object(s) from the TAXII feed`.
+
+### The known-legitimate filter (keeping legit values out of the feed)
+
+The other rules are value-agnostic — they catch a *kind* of noise but cannot
+know that a specific domain is legitimate. So a community feed will occasionally
+flag a domain or IP that is real infrastructure (a login portal, a CDN, a cloud
+range). Serving it would make Vision One **block** that legitimate traffic. The
+**known-legitimate filter** names those values: a matching community object is
+**withheld** from the feed, so Vision One never sees it.
+
+It comes in two forms, and they combine:
+
+| Static (config.yaml) | Dynamic (dashboard) | Matches |
+|----------------------|---------------------|---------|
+| `benign_values: []` | Add value, kind **exact** | One value — IP / domain / hash / name / URL, case-insensitive. |
+| `benign_domains: []` | Add value, kind **domain** | The domain **and every subdomain**: `microsoft.com` covers `login.microsoftonline.com`. |
+| `benign_cidrs: []` | Add value, kind **cidr** | An IP **network** — CIDR is supported. Use it for a whole cloud / Office 365 / CDN range. |
+
+The **dynamic** half lives in the `benign_values` table and is managed from the
+dashboard with **no config edit and no restart** — either the **Known-legitimate
+filter** panel on the Feed tab, or the one-click **Exclude** button on a served
+community row (which adds exactly that value). The value is stored, the
+in-memory gate cache is refreshed immediately, and the object is withheld from
+the next poll. Every add/remove is audited (`benign.create` / `benign.delete`).
+
+Only **community** objects are gated, so a benign entry never affects manually-fed
+intel (`source='manual'`), which is always served.
+
+A malformed config entry (e.g. a bad CIDR in `benign_cidrs`) is logged and
+skipped rather than failing startup — a typo in the list must not take the
+feed down.
 
 ### Example config
 
@@ -1271,13 +1336,30 @@ intel_filter:
   freshness_days: 30             # drop community intel older than 30 days
   min_confidence: null           # set e.g. 80 to enforce a confidence floor
   blocklist: []                  # e.g. ['example.com', '198.51.100.20']
+  # Known-legitimate filter — keep real values OUT of the feed.
+  benign_values: []              # e.g. ['8.8.8.8', 'login.microsoftonline.com']
+  benign_domains: []             # e.g. ['microsoft.com', 'gov.sg']  (+ subdomains)
+  benign_cidrs: []               # e.g. ['13.107.0.0/16']  (CIDR is supported here)
 ```
 
 > **Blocklist note:** the blocklist matches **single exact values** (not CIDR
 > ranges) — `10.20.30.40` matches that IP, but `10.20.0.0/16` does *not*
 > expand to a range. The `drop_private_ips` rule already covers the whole
 > private space; use the blocklist for specific *public* values you always
-> want to exclude.
+> want to exclude. Use `benign_cidrs` when you need a **range** on the
+> known-legitimate side.
+
+#### Triage loop for a false positive
+
+1. A legitimate domain or IP is being **served** (Vision One may block it) →
+   open the **Feed** tab and find the row.
+2. Click **Exclude** on that row — or add the value (as *exact* / *domain* /
+   *cidr*) in the **Known-legitimate filter** panel.
+3. It is withheld from the next poll, and the entry is now visible in the panel
+   and the **Audit log** (`benign.create`).
+4. Prefer a durable, reviewable rule in `config.yaml` for anything your team
+   agrees should *always* be excluded; use the dashboard for quick, one-off
+   exclusions.
 
 ## Testing
 
@@ -1308,7 +1390,11 @@ persistence, misconfigured handling), the **community source endpoints**
 (`GET /community/pullers`, `POST /community/pull/<name>`), the **UI
 login/logout/session** flow (cookie set, wrong-password 401, session grants
 data access), the **intel gate** (private-IP drop, freshness, confidence
-floor, blocklist, and that manual intel is never gated), **manual
+floor, blocklist, and that manual intel is never gated), the
+**known-legitimate filter** (config `benign_values`/`benign_domains`/`benign_cidrs`
+and the dynamic ones withholding matching community objects; the one-click
+`POST /objects/<id>/exclude` and `/ui/benign` CRUD; write-role gating;
+value/kind validation; idempotency; and audit), **manual
 revocation** (`POST /objects/<id>/revoke`, stickiness across saves,
 `revoked: true` in the TAXII bundle) and **TTL auto-revocation** (per-type
 aging sweep), and **SSO** (Microsoft Entra OIDC: PKCE authorize redirect +
@@ -1426,8 +1512,14 @@ Rules:
 - The **intel filter** is withholding it. Check the server log for
   `Intel gate withheld N community object(s)`. Then review `intel_filter`:
   a private IP trips `drop_private_ips`, an old object trips
-  `freshness_days`, a low-confidence one trips `min_confidence`, and a
-  listed value trips `blocklist`.
+  `freshness_days`, a low-confidence one trips `min_confidence`, a
+  listed value trips `blocklist`, and a legit value trips the
+  known-legitimate filter.
+- If it's a **legitimate domain or IP you don't want served** (Vision One would
+  block it), exclude it without a restart: click **Exclude** on the row in the
+  feed, or add the value in the **Known-legitimate filter** panel (`exact` /
+  `domain` / `cidr`). It is withheld from the next poll — see
+  [The known-legitimate filter](#the-known-legitimate-filter-keeping-legit-values-out-of-the-feed).
 - The object may be **revoked** (TTL auto-revocation or a manual revoke).
   `GET /objects` shows a `revoked` badge; the TAXII bundle serves it with
   `revoked: true` so Vision One drops it. Unrevoke to reinstate.

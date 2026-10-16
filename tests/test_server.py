@@ -58,9 +58,13 @@ def _reset_db():
         session.query(server.ApiKey).delete()
         session.query(server.UIUser).delete()
         session.query(server.AuditEvent).delete()
+        session.query(server.BenignValue).delete()
         session.commit()
     finally:
         session.close()
+    # Drop rows AND the in-memory benign cache so a test can't inherit an entry
+    # a previous test created.
+    server.load_benign_values()
 
 
 def _manual_obj(value="192.168.1.100"):
@@ -4008,7 +4012,8 @@ class TestSchemaDdl(unittest.TestCase):
     """
 
     EXPECTED_TABLES = {'stix_objects', 'subscriptions', 'api_keys',
-                       'ui_users', 'puller_state', 'audit_events'}
+                       'ui_users', 'puller_state', 'audit_events',
+                       'benign_values'}
     POLL_INDEXES = {'ix_stix_objects_modified_id',
                     'ix_stix_objects_coll_modified_id'}
 
@@ -4044,6 +4049,233 @@ class TestSchemaDdl(unittest.TestCase):
 
     def test_check_mode_passes_on_current_models(self):
         self.assertEqual(self._dump_schema()._check(_server.Base.metadata), 0)
+
+
+class TestBenignFilter(unittest.TestCase):
+    """Known-legitimate filter — keeps legit values OUT of the Vision One feed.
+
+    A value named in ``intel_filter.benign_values`` / ``benign_domains`` /
+    ``benign_cidrs`` (config.yaml) or in the ``benign_values`` table (dashboard,
+    via ``/ui/benign`` or the one-click ``/objects/<id>/exclude``) is WITHHELD
+    from the feed — Vision One never sees it, so it cannot block real traffic on
+    it. Manual intel is never gated.
+    """
+
+    ADMIN = ('root', 'root-password-123')
+    PW = 'password-12345'
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        app.config['TAXII_AUTH'] = {'username': 'u', 'password': 'p'}
+        app.config['TAXII_ADMIN_AUTH'] = {'username': 'u', 'password': 'p'}
+        self.auth = {'X-Taxii-Username': 'u', 'X-Taxii-Password': 'p'}
+
+        # Admin session — the write principal for the dashboard endpoints.
+        self._saved_creds = (_server._ui_username, _server._ui_password)
+        _server._ui_username, _server._ui_password = self.ADMIN
+        self.admin = app.test_client()
+        r = self.admin.post('/ui/login', json={
+            'username': self.ADMIN[0], 'password': self.ADMIN[1]})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+
+        # Snapshot the static benign lists a test may monkeypatch.
+        self._saved_lists = (
+            _server.FILTER_BENIGN_VALUES,
+            _server.FILTER_BENIGN_DOMAINS,
+            _server.FILTER_BENIGN_CIDRS,
+        )
+
+    def tearDown(self):
+        _server._ui_username, _server._ui_password = self._saved_creds
+        (_server.FILTER_BENIGN_VALUES,
+         _server.FILTER_BENIGN_DOMAINS,
+         _server.FILTER_BENIGN_CIDRS) = self._saved_lists
+
+    # --- helpers -----------------------------------------------------------
+
+    def _community_ip(self, value):
+        ingest_objects([
+            {'id': f'ipv4-addr--{value.replace(".", "-")}', 'type': 'ipv4-addr',
+             'object': {'ipv4-addr': {'value': value}},
+             'labels': ['otx'], 'confidence': 70}
+        ], mode='merge', source='otx')
+
+    def _community_domain(self, value):
+        ingest_objects([
+            {'id': f'domain-name--{value.replace(".", "-")}', 'type': 'domain-name',
+             'object': {'domain-name': {'value': value}},
+             'labels': ['otx'], 'confidence': 70}
+        ], mode='merge', source='otx')
+
+    def _taxii_values(self):
+        r = self.client.get(
+            '/taxii2/collections/threat_intel/objects/', headers=self.auth)
+        self.assertEqual(r.status_code, 200)
+        content = r.get_json()['content']['content']['objects']
+        return {served_value(o) for o in content if served_value(o)}
+
+    def _object_row(self, value):
+        return next(
+            o for o in self.client.get('/objects', headers=self.auth)
+            .get_json()['objects'] if o['value'] == value)
+
+    def _actions(self):
+        session = _server.create_session()
+        try:
+            return [e.action for e in session.query(_server.AuditEvent).all()]
+        finally:
+            session.close()
+
+    # --- static benign lists (config.yaml) ---------------------------------
+
+    def test_config_benign_value_withholds(self):
+        _server.FILTER_BENIGN_VALUES = {'8.8.8.8'}
+        self._community_ip('8.8.8.8')          # public -> would be served
+        self.assertNotIn('8.8.8.8', self._taxii_values())
+
+    def test_config_benign_domain_covers_subdomains(self):
+        _server.FILTER_BENIGN_DOMAINS = {'example.com'}
+        self._community_domain('login.example.com')
+        self.assertNotIn('login.example.com', self._taxii_values())
+
+    def test_config_benign_cidr_withholds(self):
+        _server.FILTER_BENIGN_CIDRS = _server._parse_benign_cidrs(['13.107.0.0/16'])
+        self._community_ip('13.107.5.5')
+        self.assertNotIn('13.107.5.5', self._taxii_values())
+
+    def test_unrelated_value_is_still_served(self):
+        """A benign entry must not withhold anything but its own value."""
+        _server.FILTER_BENIGN_VALUES = {'8.8.8.8'}
+        self._community_ip('8.8.8.8')
+        self._community_ip('9.9.9.9')
+        served = self._taxii_values()
+        self.assertNotIn('8.8.8.8', served)
+        self.assertIn('9.9.9.9', served)
+
+    def test_manual_intel_is_never_filtered(self):
+        _server.FILTER_BENIGN_DOMAINS = {'example.com'}
+        ingest_objects([
+            {'id': 'domain-name--login-example-com', 'type': 'domain-name',
+             'object': {'domain-name': {'value': 'login.example.com'}},
+             'labels': ['manual'], 'confidence': 90}
+        ], mode='replace', source='manual')
+        self.assertIn('login.example.com', self._taxii_values())
+
+    # --- dynamic benign entries (dashboard) --------------------------------
+
+    def test_create_benign_withholds_a_served_object(self):
+        self._community_ip('8.8.8.8')
+        self.assertIn('8.8.8.8', self._taxii_values())
+        r = self.admin.post('/ui/benign', json={
+            'value': '8.8.8.8', 'kind': 'exact', 'note': 'public DNS'})
+        self.assertEqual(r.status_code, 201)
+        body = r.get_json()
+        self.assertTrue(body['changed'])
+        self.assertEqual(body['value'], '8.8.8.8')
+        self.assertEqual(body['kind'], 'exact')
+        self.assertNotIn('8.8.8.8', self._taxii_values())
+
+        # Removing it serves the object again.
+        self.assertEqual(
+            self.admin.post(f"/ui/benign/{body['id']}/delete").status_code, 200)
+        self.assertIn('8.8.8.8', self._taxii_values())
+
+    def test_exclude_object_route_defaults_to_exact_for_ip(self):
+        self._community_ip('8.8.4.4')
+        r = self.admin.post('/objects/ipv4-addr--8-8-4-4/exclude', json={})
+        self.assertEqual(r.status_code, 201, r.get_data(as_text=True))
+        body = r.get_json()
+        self.assertEqual(body['kind'], 'exact')
+        self.assertEqual(body['value'], '8.8.4.4')
+        self.assertNotIn('8.8.4.4', self._taxii_values())
+
+    def test_exclude_object_route_defaults_to_domain_for_domain(self):
+        self._community_domain('www.example.com')
+        self.assertIn('www.example.com', self._taxii_values())
+        r = self.admin.post(
+            '/objects/domain-name--www-example-com/exclude', json={})
+        self.assertEqual(r.status_code, 201, r.get_data(as_text=True))
+        self.assertEqual(r.get_json()['kind'], 'domain')
+        self.assertNotIn('www.example.com', self._taxii_values())
+
+    def test_exclude_object_unknown_404(self):
+        r = self.admin.post('/objects/ipv4-addr--0-0-0-0/exclude', json={})
+        self.assertEqual(r.status_code, 404)
+
+    def test_objects_endpoint_reports_the_benign_gate(self):
+        self._community_ip('8.8.8.8')
+        before = self._object_row('8.8.8.8')
+        self.assertFalse(before['gated'])
+        self.assertIsNone(before['gate_reason'])
+
+        self.admin.post('/objects/ipv4-addr--8-8-8-8/exclude', json={})
+        after = self._object_row('8.8.8.8')
+        self.assertTrue(after['gated'])
+        self.assertEqual(after['gate_reason'], 'benign')
+        self.assertEqual(after['gate_reason_label'],
+                         'Known legitimate (kept out of the feed)')
+
+    def test_create_is_idempotent(self):
+        first = self.admin.post('/ui/benign', json={
+            'value': 'a.example.com', 'kind': 'domain'})
+        self.assertEqual(first.status_code, 201)
+        second = self.admin.post('/ui/benign', json={
+            'value': 'a.example.com', 'kind': 'domain'})
+        self.assertEqual(second.status_code, 200)
+        self.assertFalse(second.get_json()['changed'])
+        self.assertEqual(self.admin.get('/ui/benign').get_json()['count'], 1)
+
+    def test_list_includes_config_rules_and_delete_unknown_404(self):
+        self.admin.post('/ui/benign', json={'value': '8.8.8.8', 'kind': 'exact'})
+        body = self.admin.get('/ui/benign').get_json()
+        self.assertEqual(body['count'], 1)
+        self.assertIn('exact', body['kinds'])
+        self.assertIn('config', body)
+        self.assertIn('benign_values', body['config'])
+        self.assertEqual(
+            self.admin.post('/ui/benign/nope/delete').status_code, 404)
+
+    # --- validation --------------------------------------------------------
+
+    def test_create_rejects_bad_kind_and_values(self):
+        for payload in (
+            {'value': 'x.example.com', 'kind': 'nope'},
+            {'value': '', 'kind': 'exact'},
+            {'value': 'not a domain', 'kind': 'domain'},
+            {'value': '999.999.1.1/24', 'kind': 'cidr'},
+        ):
+            r = self.admin.post('/ui/benign', json=payload)
+            self.assertEqual(r.status_code, 400, payload)
+
+    # --- access control ----------------------------------------------------
+
+    def test_writes_require_a_write_role(self):
+        self.admin.post('/ui/users', json={
+            'username': 'vi', 'password': self.PW, 'role': 'viewer'})
+        viewer = app.test_client()
+        self.assertEqual(viewer.post('/ui/login', json={
+            'username': 'vi', 'password': self.PW}).status_code, 200)
+
+        # A viewer may read the list but not change it.
+        self.assertEqual(viewer.get('/ui/benign').status_code, 200)
+        self.assertEqual(viewer.post('/ui/benign', json={
+            'value': 'x.example.com', 'kind': 'domain'}).status_code, 401)
+        self.assertEqual(
+            viewer.post('/objects/ipv4-addr--1-2-3-4/exclude', json={}).status_code,
+            401)
+        self.assertEqual(app.test_client().post(
+            '/ui/benign', json={'value': 'x'}).status_code, 401)
+
+    # --- audit -------------------------------------------------------------
+
+    def test_benign_changes_are_audited(self):
+        created = self.admin.post('/ui/benign', json={
+            'value': '8.8.8.8', 'kind': 'exact'}).get_json()
+        self.admin.post(f"/ui/benign/{created['id']}/delete")
+        actions = self._actions()
+        self.assertIn('benign.create', actions)
+        self.assertIn('benign.delete', actions)
 
 
 if __name__ == '__main__':
