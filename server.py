@@ -58,6 +58,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     and_,
+    case,
     create_engine,
     func,
     or_,
@@ -3373,6 +3374,10 @@ SCORING_THRESHOLD = int(SCORING_CFG.get('threshold', 75))
 SCORING_QUARANTINE_COLLECTION = str(
     SCORING_CFG.get('quarantine_collection') or 'quarantine')
 SCORING_LARGE_PULSE_MIN = int(SCORING_CFG.get('large_pulse_min', 10))
+# ThreatFox confidence 100 is treated as delivery-ready by policy: its score is
+# floored at this value (so it reaches the served collection), and VT then adds
+# on top toward 100. Configurable so it can be retuned or lowered.
+THREATFOX_100_FLOOR = int(SCORING_CFG.get('threatfox_conf_100_score', 80))
 
 # Weights for each local signal. Deliberately transparent and tunable: the
 # dry-run harness (python server.py --score-sample) exists to tune these
@@ -3711,6 +3716,14 @@ def score_from_summary(entry: Optional[Dict[str, Any]],
         add('feodo_c2', weights['feodo_c2'])
     if entry.get('urlhaus'):
         add('urlhaus', weights['urlhaus'])
+    # ThreatFox confidence == 100: floor the score at THREATFOX_100_FLOOR (80),
+    # which promotes it into the served/eligible set by policy. It is a floor,
+    # not a cap — stronger corroboration still scores higher — and it is applied
+    # BEFORE VT so the verifier can add the remaining points toward 100.
+    if int(entry.get('threatfox_conf') or 0) >= 100:
+        current = sum(parts.values())
+        if current < THREATFOX_100_FLOOR:
+            parts['threatfox_conf_100_floor'] = THREATFOX_100_FLOOR - current
     # VirusTotal verdict — the independent verification layer. A clean result
     # is the one signal allowed to subtract, which is what lets VT rescue a
     # value that two feeds reported but no vendor flags.
@@ -3812,18 +3825,43 @@ def vt_verify_pass(limit: Optional[int] = None) -> Dict[str, Any]:
     band_min = int(cfg.get('min_score', 40))
     band_max = int(cfg.get('max_score', 85))
     per_run = int(limit if limit and limit > 0 else cfg.get('per_run', 10))
+    # Which feeds may be verified. OTX is excluded by default (large, and its
+    # corpus overlaps VT poorly); the abuse.ch feeds are the target, in the
+    # listed priority order — ThreatFox first because its volume is low.
+    sources = [str(s) for s in (cfg.get('sources')
+                                or ['threatfox', 'feodo', 'urlhaus'])
+               if str(s)]
     session = create_session()
     try:
-        # Closest to the threshold first: that is where a verdict changes the
-        # decision, so it is the most informative use of a scarce API call.
-        candidates = (session.query(STIXObject)
-                      .filter(STIXObject.source.isnot(None),
-                              STIXObject.source != 'manual',
-                              STIXObject.score.isnot(None),
-                              STIXObject.score >= band_min,
-                              STIXObject.score <= band_max)
-                      .order_by(func.abs(STIXObject.score - SCORING_THRESHOLD))
-                      .limit(max(per_run * 4, per_run)).all())
+        # Filter by the OBSERVATION source, not the row's `source` column: every
+        # abuse.ch row is tagged source='abuse_ch' at ingest, while the feed
+        # identity (threatfox/feodo/urlhaus) lives on its observations. Joining
+        # here is what excludes OTX and lets ThreatFox be prioritised.
+        value_col = func.lower(func.coalesce(
+            STIXObject.ip_address, STIXObject.domain,
+            STIXObject.hash_value, STIXObject.value))
+        source_rank = case({s: i for i, s in enumerate(sources)},
+                           value=IocObservation.source, else_=len(sources))
+        rows = (session.query(STIXObject)
+                .join(IocObservation,
+                      and_(IocObservation.value == value_col,
+                           IocObservation.source.in_(sources)))
+                .filter(STIXObject.score.isnot(None),
+                        STIXObject.score >= band_min,
+                        STIXObject.score <= band_max)
+                .order_by(source_rank,
+                          func.abs(STIXObject.score - SCORING_THRESHOLD))
+                .limit(max(per_run * 6, per_run)).all())
+        # A value with several qualifying observations produces one row per
+        # observation; the ordering already puts the highest-priority feed
+        # first, so keep the first occurrence.
+        candidates: List[Any] = []
+        seen_ids = set()
+        for row in rows:
+            if row.stix_id in seen_ids:
+                continue
+            seen_ids.add(row.stix_id)
+            candidates.append(row)
         values: List[str] = []
         for row in candidates:
             v = _normalise_obs_value(row.ip_address or row.domain
@@ -5385,6 +5423,116 @@ def ui_collections():
         'primary': TAXII_COLLECTION_ID,
         'manual': DEFAULT_MANUAL_COLLECTION_ID,
         'community': DEFAULT_COMMUNITY_COLLECTION_ID,
+    }), 200
+
+
+@app.route('/ui/eligible', methods=['GET'])
+def ui_eligible():
+    """GET /ui/eligible — what the TAXII feed will actually deliver.
+
+    This is the consumer-facing view: objects in the SERVED collections (the
+    aggregate's members, never quarantine) that are active, not withheld by the
+    intel gate, and at/above the score threshold (manual intel carries no score
+    and is always eligible). Counts for the excluded categories are returned
+    too, so "why isn't this in the feed?" is answerable without guessing.
+
+    Note the score is NOT re-checked at TAXII read time — routing decides the
+    collection at ingest. This endpoint therefore reflects the effective feed
+    and separately reports rows that are in a served collection but would not
+    pass the CURRENT threshold (legacy rows scored under older weights).
+    """
+    if not _request_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    served = [c for c in _collection_ids_for(TAXII_COLLECTION_ID)
+              if c != SCORING_QUARANTINE_COLLECTION]
+    if not served:
+        served = [c.id for c in TAXII_COLLECTIONS
+                  if not c.members and c.id != SCORING_QUARANTINE_COLLECTION]
+    session = create_session()
+    try:
+        rows = (session.query(STIXObject)
+                .filter(STIXObject.collection_id.in_(served))
+                .order_by(STIXObject.modified.desc())
+                .limit(_MAX_OBJECTS_JSON + 1).all())
+        truncated = len(rows) > _MAX_OBJECTS_JSON
+        rows = rows[:_MAX_OBJECTS_JSON]
+        eligible: List[Tuple[Any, Any, str]] = []
+        withheld = below = revoked = served_total = 0
+        for row in rows:
+            obj = _row_to_threat_intel(row)
+            verdict = gate_verdict(obj, row)
+            if verdict['gated']:
+                withheld += 1
+                continue
+            if row.revoked:
+                revoked += 1
+                continue
+            # Everything from here on is in a served collection and would
+            # actually be delivered by the TAXII feed (it does not re-check
+            # the score at read time).
+            served_total += 1
+            manual = (row.source or 'manual') == 'manual'
+            if not manual and row.score is not None and row.score < SCORING_THRESHOLD:
+                below += 1
+                continue
+            value = (obj.ip_address or obj.domain or obj.hash_value
+                     or obj.value or obj.name
+                     or (f'{obj.source_ref} → {obj.relationship_type} → '
+                         f'{obj.target_ref}'
+                         if obj.object_type == 'relationship' else None))
+            eligible.append((row, obj, str(value or '')))
+
+        # VirusTotal state for the eligible values: whether each is verified
+        # and what the verdict was. The verifier stores one observation per
+        # value, so this is a single lookup per distinct value.
+        vt_map: Dict[str, Dict[str, Any]] = {}
+        values = sorted({_normalise_obs_value(v) for _, _, v in eligible if v})
+        for start in range(0, len(values), 500):
+            chunk = values[start:start + 500]
+            for obs in session.query(IocObservation).filter(
+                    IocObservation.source == 'virustotal',
+                    IocObservation.value.in_(chunk)):
+                try:
+                    detail = json.loads(obs.detail or '{}')
+                except (TypeError, ValueError):
+                    detail = {}
+                vt_map[obs.value] = {
+                    'verdict': detail.get('verdict'),
+                    'malicious': int(detail.get('malicious') or 0),
+                    'suspicious': int(detail.get('suspicious') or 0),
+                    'harmless': int(detail.get('harmless') or 0),
+                    'checked_at': _stix_ts(obs.last_seen),
+                }
+
+        objects: List[Dict[str, Any]] = []
+        for row, obj, value in eligible:
+            objects.append({
+                'id': row.stix_id,
+                'type': row.object_type,
+                'value': value,
+                'labels': obj.labels or [],
+                'confidence': row.confidence,
+                'score': row.score,
+                'source': row.source or 'manual',
+                'collection': row.collection_id,
+                'modified': _stix_ts(row.modified),
+                'vt': vt_map.get(_normalise_obs_value(value)),
+            })
+    finally:
+        session.close()
+    return jsonify({
+        'threshold': SCORING_THRESHOLD,
+        'collections': served,
+        'count': len(objects),
+        # Everything TAXII would deliver from those collections (includes
+        # legacy rows below the CURRENT threshold — see below_threshold_count).
+        'served_count': served_total,
+        'withheld_count': withheld,
+        'below_threshold_count': below,
+        'revoked_count': revoked,
+        'vt_verified_count': sum(1 for o in objects if o.get('vt')),
+        'truncated': truncated,
+        'objects': objects,
     }), 200
 
 

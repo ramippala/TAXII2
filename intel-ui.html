@@ -174,6 +174,65 @@
   .modal .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
   @keyframes modalFade { from { opacity: 0; } to { opacity: 1; } }
   @keyframes modalPop { from { transform: scale(.96) translateY(6px); opacity: 0; } to { transform: none; opacity: 1; } }
+  /* ---- Eligible for delivery (rich view) ---- */
+  .elig-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+               gap: 12px; margin: 4px 0 18px; }
+  .kpi { position: relative; overflow: hidden; background: var(--panel2);
+         border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .kpi::after { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+                background: var(--border); }
+  .kpi .val { font-size: 26px; font-weight: 650; line-height: 1.1;
+              font-variant-numeric: tabular-nums; }
+  .kpi .lbl { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .kpi .ic { position: absolute; right: 12px; top: 10px; font-size: 15px; opacity: .95; }
+  .kpi.neutral::after { background: #3987e5; }
+  .kpi.good::after   { background: #0ca30c; } .kpi.good .val,   .kpi.good .ic   { color: #0ca30c; }
+  .kpi.warn::after   { background: #fab219; } .kpi.warn .val,   .kpi.warn .ic   { color: #fab219; }
+  .kpi.serious::after{ background: #ec835a; } .kpi.serious .val,.kpi.serious .ic{ color: #ec835a; }
+  .kpi.crit::after   { background: #d03b3b; } .kpi.crit .val,   .kpi.crit .ic   { color: #d03b3b; }
+
+  /* Score distribution: one ordinal blue ramp, direct labels on every bar. */
+  .dist { display: flex; align-items: flex-end; gap: 14px; height: 104px;
+          padding: 0 4px; margin: 4px 0 2px; }
+  .dist .col { flex: 1; min-width: 0; display: flex; flex-direction: column;
+               align-items: center; justify-content: flex-end; gap: 4px; }
+  .dist .bar { width: 100%; max-width: 66px; min-height: 2px;
+               border-radius: 4px 4px 0 0; }
+  .dist .bar:hover { filter: brightness(1.18); }
+  .dist .n { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .dist .cap { font-size: 11px; color: var(--muted); white-space: nowrap; }
+
+  .elig-toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
+                  margin-bottom: 12px; }
+  .elig-toolbar input[type=search] { flex: 1; min-width: 240px; }
+  .elig-meta { color: var(--muted); font-size: 12px; margin-left: auto;
+               font-variant-numeric: tabular-nums; }
+  .elig-table td { font-size: 13px; }
+  .elig-table tbody tr:hover { background: rgba(47,129,247,.06); }
+  .elig-empty { color: var(--muted); font-size: 13px; padding: 18px 0; text-align: center; }
+
+  .badge { display: inline-block; border-radius: 999px; padding: 1px 8px;
+           font-size: 12px; border: 1px solid var(--border); white-space: nowrap; }
+  .badge.t-ipv4-addr   { color:#3987e5; border-color:rgba(57,135,229,.45); background:rgba(57,135,229,.10); }
+  .badge.t-domain-name { color:#d95926; border-color:rgba(217,89,38,.45);  background:rgba(217,89,38,.10); }
+  .badge.t-file-hash   { color:#199e70; border-color:rgba(25,158,112,.45); background:rgba(25,158,112,.10); }
+  .badge.src.manual    { color: var(--ok); border-color: #2b4a35; }
+  .badge.vt            { font-size: 11px; }
+  .badge.vt-ok         { color:#0ca30c; border-color:#2b4a35; background:rgba(12,163,12,.10); }
+  .badge.vt-susp       { color:#fab219; border-color:#5a4715; background:rgba(250,178,25,.10); }
+  .badge.vt-bad        { color:#d03b3b; border-color:#6b2b2b; background:rgba(208,59,59,.10); }
+  .badge.vt-none       { color: var(--muted); }
+  .score { display: inline-flex; align-items: center; gap: 6px; font-weight: 600;
+           font-variant-numeric: tabular-nums; }
+  .score::before { content: ""; width: 8px; height: 8px; border-radius: 2px;
+                   background: var(--muted); }
+  .score.s75::before { background:#86b6ef; } .score.s80::before { background:#5598e7; }
+  .score.s85::before { background:#3987e5; } .score.s90::before { background:#2a78d6; }
+  .score.s95::before { background:#256abf; } .score.na::before  { background: var(--border); }
+  .lblchip { display: inline-block; max-width: 170px; overflow: hidden; text-overflow: ellipsis;
+             white-space: nowrap; vertical-align: middle; margin: 0 4px 2px 0;
+             border-radius: 4px; padding: 0 6px; font-size: 11px;
+             color: var(--muted); background: var(--panel2); border: 1px solid var(--border); }
 </style>
 </head>
 <body>
@@ -216,6 +275,7 @@
     <!-- Page tabs -->
     <div class="tabs" id="tabs">
       <button class="tab active" data-page="feed">Feed</button>
+      <button class="tab" data-page="eligible">Eligible</button>
       <button class="tab" data-page="graph">Intel graph</button>
       <button class="tab" data-page="sources">Community sources</button>
       <button class="tab" data-page="import">Import CSV / Excel</button>
@@ -345,6 +405,79 @@
         (community intel from pullers included).
       </div>
       <div id="msg" class="msg"></div>
+    </div>
+
+    </section>
+
+    <!-- ============ PAGE: ELIGIBLE (served feed) ============ -->
+    <section data-page="eligible">
+
+    <div class="panel">
+      <div class="row" style="justify-content:space-between;align-items:flex-start">
+        <div>
+          <h2 style="margin-bottom:6px">Eligible for delivery</h2>
+          <div class="hint" style="max-width:920px">
+            Objects that <b>meet the current delivery threshold</b> and pass the
+            intel gate — the set intended for Vision One, or any other XDR / SIEM.
+            Quarantined, gate-withheld and revoked objects are excluded.
+            <b>Score</b> is the computed cross-source score; manual intel has none
+            and is always eligible. The TAXII feed does not re-check the score at
+            read time, so rows in a served collection below today's threshold
+            (legacy data scored under older settings) are counted but not listed.
+          </div>
+        </div>
+        <button id="btnEligReload" class="ghost">Reload</button>
+      </div>
+      <div class="elig-kpis" id="eligKpis"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Score distribution <span style="text-transform:none;letter-spacing:0;font-weight:400"
+          class="mono" id="eligDistThreshold"></span></h2>
+      <div class="dist" id="eligDist"></div>
+      <div class="hint" id="eligDistCaption" style="margin-top:8px"></div>
+    </div>
+
+    <div class="panel">
+      <div class="elig-toolbar">
+        <input type="search" id="eligSearch" placeholder="Search value, label, type or source…" autocomplete="off">
+        <select id="eligSource"><option value="">All sources</option></select>
+        <select id="eligSort">
+          <option value="score-desc">Score: high → low</option>
+          <option value="score-asc">Score: low → high</option>
+          <option value="mod-desc">Modified: newest</option>
+          <option value="mod-asc">Modified: oldest</option>
+        </select>
+        <select id="eligVt">
+          <option value="">All VT states</option>
+          <option value="verified">VT verified</option>
+          <option value="unverified">Not verified</option>
+          <option value="malicious">VT: malicious</option>
+        </select>
+        <select id="eligPageSize">
+          <option value="15">15 / page</option>
+          <option value="25" selected>25 / page</option>
+          <option value="50">50 / page</option>
+        </select>
+        <span class="elig-meta" id="eligCount"></span>
+      </div>
+      <div style="overflow-x:auto">
+        <table class="elig-table" id="eligTable">
+          <thead>
+            <tr><th>Type</th><th>Source</th><th>Value</th><th>Labels</th>
+                <th>Score</th><th>VT</th><th>Collection</th><th>Modified</th></tr>
+          </thead>
+          <tbody id="eligBody"></tbody>
+        </table>
+      </div>
+      <div class="elig-empty" id="eligEmpty" style="display:none">No eligible objects match.</div>
+      <div class="pager" id="eligPager" style="display:none">
+        <button id="epFirst" class="ghost" title="First page">«</button>
+        <button id="epPrev" class="ghost" title="Previous page">‹</button>
+        <span class="mono" id="epInfo"></span>
+        <button id="epNext" class="ghost" title="Next page">›</button>
+        <button id="epLast" class="ghost" title="Last page">»</button>
+      </div>
     </div>
 
     </section>
@@ -851,7 +984,7 @@ function applyRole() {
 }
 
 // --- Dashboard page tabs (Feed / Intel graph / Community sources / Import) ---
-const PAGE_NAMES = ["feed", "graph", "sources", "import", "keys", "users", "audit"];
+const PAGE_NAMES = ["feed", "eligible", "graph", "sources", "import", "keys", "users", "audit"];
 function currentPageFromHash() {
   const h = (location.hash || "").replace(/^#/, "");
   return PAGE_NAMES.includes(h) ? h : "feed";
@@ -867,6 +1000,7 @@ function showPage(name) {
   if (location.hash !== "#" + name && window.history && history.replaceState) {
     history.replaceState(null, "", "#" + name);
   }
+  if (name === "eligible") loadEligible();  // served feed: fetch on entry
   if (name === "graph") loadStats();  // aggregated view: fetch on entry
   if (name === "keys") loadKeys();    // keys: fetch on entry
   if (name === "users") loadUsers();  // users: fetch on entry
@@ -2180,6 +2314,275 @@ function renderAudit() {
 
 function setAuditPage(p) { auditPage = p; renderAudit(); }
 
+// ---------------------------------------------------------------------------
+// Eligible for delivery — the effective consumer feed
+// ---------------------------------------------------------------------------
+// Backed by /ui/eligible: served collections after the intel gate, at or above
+// the current score threshold. Read-only; nothing here edits the feed.
+let eligData = [];
+let eligThreshold = 75;
+let eligCounts = { served: 0, below: 0, withheld: 0, revoked: 0, vtVerified: 0 };
+let eligPage = 1;
+let eligPageSize = 25;
+
+async function loadEligible() {
+  try {
+    const r = await api("/ui/eligible");
+    if (r.status !== 200) {
+      eligData = [];
+      $("eligKpis").innerHTML = "";
+      $("eligDist").innerHTML = "";
+      $("eligDistCaption").textContent =
+        `Could not load eligible feed (HTTP ${r.status}).`;
+      renderEligibleTable();
+      return;
+    }
+    const b = r.body || {};
+    eligData = b.objects || [];
+    eligThreshold = (b.threshold === null || b.threshold === undefined) ? 75 : b.threshold;
+    eligCounts = {
+      served: b.served_count || 0,
+      below: b.below_threshold_count || 0,
+      withheld: b.withheld_count || 0,
+      revoked: b.revoked_count || 0,
+      vtVerified: b.vt_verified_count || 0,
+    };
+    $("eligDistThreshold").textContent = `· threshold ${eligThreshold}`;
+    renderEligKpis();
+    populateEligSources();
+    eligPage = 1;
+    renderEligibleTable();
+  } catch (e) {
+    eligData = [];
+    $("eligDistCaption").textContent = "Could not load eligible feed: " + e.message;
+    renderEligibleTable();
+  }
+}
+
+function renderEligKpis() {
+  const tiles = [
+    { cls: "good",    ic: "✓", val: eligData.length, lbl: "eligible for delivery",
+      title: "At or above the threshold, gate-passing and active" },
+    { cls: "neutral", ic: "⊞", val: eligCounts.served, lbl: "in served collections",
+      title: "Everything TAXII would deliver, including below-threshold legacy rows" },
+    { cls: "warn",    ic: "!", val: eligCounts.below, lbl: "below threshold",
+      title: "In a served collection but scored under older settings" },
+    { cls: "serious", ic: "⊘", val: eligCounts.withheld, lbl: "withheld by filter",
+      title: "Known-legitimate / freshness / blocklist" },
+    { cls: "crit",    ic: "×", val: eligCounts.revoked, lbl: "revoked",
+      title: "Marked revoked; consumers drop them" },
+    { cls: "neutral", ic: "✓", val: eligCounts.vtVerified, lbl: "VT verified",
+      title: "Independently verified by VirusTotal (malicious/suspicious/clean)" },
+  ];
+  const root = $("eligKpis");
+  root.innerHTML = "";
+  tiles.forEach(t => {
+    const d = document.createElement("div");
+    d.className = "kpi " + t.cls;
+    d.title = t.title;
+    const ic = document.createElement("div"); ic.className = "ic"; ic.textContent = t.ic;
+    const val = document.createElement("div"); val.className = "val"; val.textContent = String(t.val);
+    const lbl = document.createElement("div"); lbl.className = "lbl"; lbl.textContent = t.lbl;
+    d.append(ic, val, lbl);
+    root.appendChild(d);
+  });
+}
+
+function populateEligSources() {
+  const sel = $("eligSource");
+  const current = sel.value;
+  const sources = Array.from(new Set(eligData.map(o => o.source).filter(Boolean))).sort();
+  sel.innerHTML = '<option value="">All sources</option>';
+  sources.forEach(s => {
+    const o = document.createElement("option");
+    o.value = s; o.textContent = s; sel.appendChild(o);
+  });
+  if (sources.includes(current)) sel.value = current;
+}
+
+function eligFiltered() {
+  const q = ($("eligSearch").value || "").trim().toLowerCase();
+  const src = $("eligSource").value;
+  const vt = $("eligVt").value;
+  let rows = eligData.filter(o => {
+    if (src && o.source !== src) return false;
+    if (vt === "verified" && !o.vt) return false;
+    if (vt === "unverified" && o.vt) return false;
+    if (vt === "malicious" && (!o.vt || o.vt.verdict !== "malicious")) return false;
+    if (!q) return true;
+    return [o.type, o.source, o.value, (o.labels || []).join(" ")]
+      .join(" ").toLowerCase().includes(q);
+  });
+  const sort = $("eligSort").value;
+  const scoreOf = o => (o.score === null || o.score === undefined) ? -1 : o.score;
+  const timeOf = o => (o.modified || "");
+  if (sort === "score-asc") rows.sort((a, b) => scoreOf(a) - scoreOf(b));
+  else if (sort === "mod-desc") rows.sort((a, b) => timeOf(b).localeCompare(timeOf(a)));
+  else if (sort === "mod-asc") rows.sort((a, b) => timeOf(a).localeCompare(timeOf(b)));
+  else rows.sort((a, b) => scoreOf(b) - scoreOf(a));
+  return rows;
+}
+
+function renderEligibleTable() {
+  const rows = eligFiltered();
+  const total = rows.length;
+  const pages = Math.max(1, Math.ceil(total / eligPageSize));
+  eligPage = Math.min(Math.max(1, eligPage), pages);
+  const start = (eligPage - 1) * eligPageSize;
+  const slice = rows.slice(start, start + eligPageSize);
+
+  $("eligCount").textContent = total
+    ? `${start + 1}–${Math.min(start + eligPageSize, total)} of ${total}`
+    : "0 objects";
+
+  const body = $("eligBody");
+  body.innerHTML = "";
+  slice.forEach(o => body.appendChild(eligRow(o)));
+  $("eligEmpty").style.display = total ? "none" : "block";
+
+  const pager = $("eligPager");
+  pager.style.display = total ? "flex" : "none";
+  $("epInfo").textContent = `Page ${eligPage} / ${pages} · ${total} object(s)`;
+  $("epFirst").disabled = eligPage <= 1;
+  $("epPrev").disabled = eligPage <= 1;
+  $("epNext").disabled = eligPage >= pages;
+  $("epLast").disabled = eligPage >= pages;
+
+  renderEligDist(rows);
+}
+
+function eligRow(o) {
+  const tr = document.createElement("tr");
+  const add = (el) => { const td = document.createElement("td"); td.appendChild(el); tr.appendChild(td); };
+
+  const type = document.createElement("span");
+  const known = ["ipv4-addr", "domain-name", "file-hash"];
+  type.className = "badge" + (known.includes(o.type) ? " t-" + o.type : "");
+  type.textContent = o.type || "?";
+  add(type);
+
+  const src = document.createElement("span");
+  src.className = "badge src" + (o.source === "manual" ? " manual" : "");
+  src.textContent = o.source || "?";
+  add(src);
+
+  const val = document.createElement("span");
+  val.className = "mono";
+  val.style.cssText = "display:inline-block;max-width:300px;overflow:hidden;"
+    + "text-overflow:ellipsis;white-space:nowrap;vertical-align:middle";
+  val.textContent = o.value || "";
+  val.title = o.value || "";
+  add(val);
+
+  const lblCell = document.createElement("td");
+  const labels = o.labels || [];
+  labels.slice(0, 3).forEach(l => {
+    const s = document.createElement("span");
+    s.className = "lblchip"; s.textContent = l; s.title = l;
+    lblCell.appendChild(s);
+  });
+  if (labels.length > 3) {
+    const more = document.createElement("span");
+    more.className = "lblchip"; more.textContent = `+${labels.length - 3}`;
+    lblCell.appendChild(more);
+  }
+  tr.appendChild(lblCell);
+
+  const scoreCell = document.createElement("td");
+  const s = document.createElement("span");
+  s.className = "score " + eligScoreClass(o.score);
+  s.textContent = (o.score === null || o.score === undefined) ? "—" : String(o.score);
+  s.title = (o.score === null || o.score === undefined)
+    ? "Not scored (manual intel, or scoring was off at ingest)"
+    : `Computed score ${o.score} (threshold ${eligThreshold})`;
+  scoreCell.appendChild(s);
+  tr.appendChild(scoreCell);
+
+  // VirusTotal verification state: verified (with verdict + count) or not.
+  const vtCell = document.createElement("td");
+  if (o.vt) {
+    const verdict = o.vt.verdict || "verified";
+    const badge = document.createElement("span");
+    badge.className = "badge vt " + (
+      verdict === "malicious" ? "vt-bad"
+      : verdict === "suspicious" ? "vt-susp" : "vt-ok");
+    const n = verdict === "malicious" ? o.vt.malicious
+            : verdict === "suspicious" ? o.vt.suspicious : o.vt.harmless;
+    badge.textContent = verdict + (n ? " · " + n : "");
+    badge.title = `VT verified — malicious ${o.vt.malicious}, suspicious `
+      + `${o.vt.suspicious}, harmless ${o.vt.harmless}`;
+    vtCell.appendChild(badge);
+  } else {
+    const none = document.createElement("span");
+    none.className = "badge vt vt-none";
+    none.textContent = "—";
+    none.title = "Not VT-verified";
+    vtCell.appendChild(none);
+  }
+  tr.appendChild(vtCell);
+
+  const coll = document.createElement("span");
+  coll.textContent = o.collection || "";
+  add(coll);
+
+  const mod = document.createElement("span");
+  mod.className = "mono";
+  mod.style.cssText = "font-size:12px;color:var(--muted)";
+  mod.textContent = fmtKeyTs(o.modified);
+  add(mod);
+  return tr;
+}
+
+function eligScoreClass(score) {
+  if (score === null || score === undefined) return "na";
+  if (score >= 95) return "s95";
+  if (score >= 90) return "s90";
+  if (score >= 85) return "s85";
+  if (score >= 80) return "s80";
+  return "s75";
+}
+
+// Ordinal blue ramp, validated against the dark surface. One series, so the
+// title names it and every bar is directly labelled — no legend needed.
+const ELIG_BUCKETS = [
+  { label: "75–79", lo: 75, hi: 79, color: "#86b6ef" },
+  { label: "80–84", lo: 80, hi: 84, color: "#5598e7" },
+  { label: "85–89", lo: 85, hi: 89, color: "#3987e5" },
+  { label: "90–94", lo: 90, hi: 94, color: "#2a78d6" },
+  { label: "95–100", lo: 95, hi: 100, color: "#256abf" },
+];
+
+function renderEligDist(rows) {
+  const counts = ELIG_BUCKETS.map(() => 0);
+  let unscored = 0;
+  rows.forEach(o => {
+    if (o.score === null || o.score === undefined) { unscored += 1; return; }
+    const i = ELIG_BUCKETS.findIndex(b => o.score >= b.lo && o.score <= b.hi);
+    if (i >= 0) counts[i] += 1;
+  });
+  const max = Math.max(1, ...counts);
+  const root = $("eligDist");
+  root.innerHTML = "";
+  ELIG_BUCKETS.forEach((b, i) => {
+    const col = document.createElement("div"); col.className = "col";
+    const n = document.createElement("div"); n.className = "n"; n.textContent = String(counts[i]);
+    const bar = document.createElement("div"); bar.className = "bar";
+    bar.style.height = Math.round((counts[i] / max) * 64) + "px";
+    bar.style.background = b.color;
+    bar.title = `${b.label}: ${counts[i]} object(s)`;
+    const cap = document.createElement("div"); cap.className = "cap"; cap.textContent = b.label;
+    col.append(n, bar, cap);
+    root.appendChild(col);
+  });
+  const manualNote = unscored
+    ? ` ${unscored} manual/unscored object(s) not plotted.` : "";
+  $("eligDistCaption").textContent =
+    "Scored eligible objects in the current view. Colour is an ordinal score "
+    + "ramp; the number on each bar is the count." + manualNote;
+}
+
+function setEligPage(p) { eligPage = p; renderEligibleTable(); }
+
 // Generates a ready-to-edit template covering every supported header style.
 // Pure client-side (Blob) — works offline, no server asset.
 function downloadCsvSample() {
@@ -2533,6 +2936,25 @@ $("btnKeyReload").addEventListener("click", loadKeys);
 // Dashboard users page: create / reload (per-row actions are wired on render).
 $("btnUserCreate").addEventListener("click", createUser);
 $("btnUserReload").addEventListener("click", loadUsers);
+
+// Eligible-for-delivery page: reload, filters, sort, page size and pager.
+$("btnEligReload").addEventListener("click", loadEligible);
+$("eligSearch").addEventListener("input", () => { eligPage = 1; renderEligibleTable(); });
+$("eligSource").addEventListener("change", () => { eligPage = 1; renderEligibleTable(); });
+$("eligSort").addEventListener("change", () => { eligPage = 1; renderEligibleTable(); });
+$("eligVt").addEventListener("change", () => { eligPage = 1; renderEligibleTable(); });
+$("eligPageSize").addEventListener("change", () => {
+  eligPageSize = parseInt($("eligPageSize").value || "25", 10) || 25;
+  eligPage = 1;
+  renderEligibleTable();
+});
+$("epFirst").addEventListener("click", () => setEligPage(1));
+$("epPrev").addEventListener("click", () => setEligPage(eligPage - 1));
+$("epNext").addEventListener("click", () => setEligPage(eligPage + 1));
+$("epLast").addEventListener("click", () => {
+  const pages = Math.max(1, Math.ceil(eligFiltered().length / eligPageSize));
+  setEligPage(pages);
+});
 
 // Audit log page: search + action filter + reload + pagination (client-side).
 $("auditSearch").addEventListener("input", () => {

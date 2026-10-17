@@ -4130,13 +4130,20 @@ class TestScoringPipeline(unittest.TestCase):
                 return dict(result)
         return _FakeVT()
 
-    def _seed_row(self, value, score, collection, source='abuse_ch'):
+    def _seed_row(self, value, score, collection, source='threatfox'):
         obj = {'id': f'ipv4-addr--{value.replace(".", "-")}',
                'type': 'ipv4-addr',
                'object': {'ipv4-addr': {'value': value}}}
         _server.ingest_objects([obj], mode='merge', source=source,
                                collection=collection,
                                scores={obj['id']: (score, {'base': 30})})
+        # The verifier selects by OBSERVATION source (the row's source is
+        # 'abuse_ch' for every abuse feed), so record one.
+        _server.record_observations([{
+            'value': value, 'object_type': 'ipv4-addr', 'source': source,
+            'observation_key': f'{source}:{value}', 'raw_confidence': None,
+            'detail': {},
+        }])
         return obj['id']
 
     def test_vt_verification_rescores_and_promotes(self):
@@ -4177,6 +4184,43 @@ class TestScoringPipeline(unittest.TestCase):
             _server.vt_client = saved
         self.assertFalse(report['enabled'])
         self.assertEqual(fake.calls, [])
+
+    def test_threatfox_conf_100_is_floored_to_the_promotion_score(self):
+        """Confidence 100 is delivery-ready by policy: floor at 80."""
+        summary = self._summary(sources={'threatfox'}, threatfox_conf=100)
+        score, parts = _server.score_from_summary(summary)
+        self.assertEqual(score, _server.THREATFOX_100_FLOOR)
+        self.assertIn('threatfox_conf_100_floor', parts)
+
+    def test_threatfox_conf_100_then_vt_adds_toward_100(self):
+        summary = self._summary(sources={'threatfox'}, threatfox_conf=100,
+                                vt_checked=True, vt_malicious=10)
+        score, _parts = _server.score_from_summary(summary)
+        self.assertEqual(score, 100)
+
+    def test_vt_verifier_only_considers_configured_sources(self):
+        """OTX is excluded; ThreatFox is verified."""
+        self._seed_row('45.13.22.9', 60, 'quarantine', source='otx')
+        self._seed_row('91.214.124.7', 60, 'quarantine', source='threatfox')
+        fake = self._fake_vt({'value': 'x', 'kind': 'ip', 'malicious': 10,
+                              'suspicious': 0, 'harmless': 0,
+                              'verdict': 'malicious'})
+        saved_vt = getattr(_server, 'vt_client', None)
+        saved_cfg = _server.SCORING_CFG
+        _server.vt_client = fake
+        _server.SCORING_CFG = {
+            **saved_cfg,
+            'vt_verify': {'enabled': True, 'min_score': 40, 'max_score': 90,
+                          'per_run': 10, 'sources': ['threatfox']},
+        }
+        try:
+            report = _server.vt_verify_pass(limit=5)
+        finally:
+            _server.vt_client = saved_vt
+            _server.SCORING_CFG = saved_cfg
+        self.assertEqual(report['checked'], 1)
+        self.assertIn('91.214.124.7', fake.calls)
+        self.assertNotIn('45.13.22.9', fake.calls)
 
     # --- routing -----------------------------------------------------------
 
@@ -4333,6 +4377,72 @@ class TestScoringPipeline(unittest.TestCase):
         text = _server._format_score_report(report)
         self.assertIn('quarantined', text)
         self.assertIn('re-scored from stored signals', text)
+
+
+class TestEligibleEndpoint(unittest.TestCase):
+    """GET /ui/eligible reflects the effective consumer feed."""
+
+    def setUp(self):
+        self.client = app.test_client()
+        _reset_db()
+        app.config['TAXII_AUTH'] = {'username': 'u', 'password': 'p'}
+        self.auth = {'X-Taxii-Username': 'u', 'X-Taxii-Password': 'p'}
+        self._saved_threshold = _server.SCORING_THRESHOLD
+        _server.SCORING_THRESHOLD = 75
+
+    def tearDown(self):
+        _server.SCORING_THRESHOLD = self._saved_threshold
+        app.config.pop('TAXII_AUTH', None)
+
+    def _ingest(self, value, source, collection, score=None, revoked=False):
+        obj = {'id': f'ipv4-addr--{value.replace(".", "-")}',
+               'type': 'ipv4-addr',
+               'object': {'ipv4-addr': {'value': value}},
+               'labels': ['t'], 'confidence': 70}
+        if revoked:
+            obj['revoked'] = True
+        scores = ({obj['id']: (score, {'base': 30})}
+                  if score is not None else None)
+        _server.ingest_objects([obj], mode='merge', source=source,
+                               collection=collection, scores=scores)
+
+    def test_eligible_excludes_below_threshold_and_revoked(self):
+        self._ingest('45.13.22.9', 'manual', 'gt_intel')
+        self._ingest('91.214.124.7', 'otx', 'comm_intel', score=80)
+        self._ingest('185.220.101.1', 'otx', 'comm_intel', score=40)
+        self._ingest('103.174.114.109', 'otx', 'comm_intel', score=80,
+                     revoked=True)
+        # VT verdict on one eligible value.
+        _server.record_observations([{
+            'value': '91.214.124.7', 'object_type': 'ipv4-addr',
+            'source': 'virustotal', 'observation_key': 'vt:91.214.124.7',
+            'raw_confidence': None,
+            'detail': {'malicious': 9, 'suspicious': 0, 'harmless': 2,
+                       'verdict': 'malicious'},
+        }])
+        r = self.client.get('/ui/eligible', headers=self.auth)
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        values = {o['value'] for o in body['objects']}
+        self.assertIn('45.13.22.9', values)        # manual, always eligible
+        self.assertIn('91.214.124.7', values)      # above threshold
+        self.assertNotIn('185.220.101.1', values)  # below threshold
+        self.assertNotIn('103.174.114.109', values)  # revoked
+        self.assertEqual(body['below_threshold_count'], 1)
+        self.assertEqual(body['revoked_count'], 1)
+        self.assertEqual(body['count'], 2)
+        # served_count also includes the below-threshold row still in the
+        # served collection (TAXII does not re-check the score at read time).
+        self.assertEqual(body['served_count'], 3)
+        # VT state is exposed per object and aggregated.
+        by_value = {o['value']: o for o in body['objects']}
+        self.assertEqual(by_value['91.214.124.7']['vt']['verdict'], 'malicious')
+        self.assertEqual(by_value['91.214.124.7']['vt']['malicious'], 9)
+        self.assertIsNone(by_value['45.13.22.9']['vt'])
+        self.assertEqual(body['vt_verified_count'], 1)
+
+    def test_eligible_requires_auth(self):
+        self.assertEqual(self.client.get('/ui/eligible').status_code, 401)
 
 
 class _FakeJwkClient:

@@ -205,6 +205,11 @@ scoring:
   threshold: 75
   quarantine_collection: 'quarantine'
 
+  # ThreatFox confidence_level == 100 is delivery-ready by policy: floor its
+  # score here (which promotes it into the eligible/served set), then let VT
+  # add the remaining points toward 100. A floor, not a cap.
+  threatfox_conf_100_score: 80
+
   # Pulse metadata / age. A pulse failing these is skipped before its
   # indicators are even fetched (which also saves the API call).
   max_pulse_age_days: null      # drop pulses older than this (null = no limit)
@@ -252,6 +257,10 @@ scoring:
     max_score: 85              # above this, already clearly served
     per_run: 10                # values checked per pass
     interval: 900              # seconds between background passes
+    # Only these feeds are VT-verified, in priority order. OTX is deliberately
+    # excluded (large corpus, poor overlap); ThreatFox goes first because its
+    # volume is low and its confidence signal is strongest.
+    sources: ['threatfox', 'feodo', 'urlhaus']
 
 intel_filter:
   # Which source tags are "community" and therefore gated. Manual is never
