@@ -123,6 +123,15 @@ taxii:
     - id: comm_intel
       title: 'Community intel'
       description: 'Community intel pulled from OTX and third-party TAXII servers.'
+    # Low-scoring community intel held back by the scoring pipeline (see the
+    # `scoring:` section below). Deliberately NOT a member of the threat_intel
+    # union, so it is captured and reviewable in the dashboard (pick it in the
+    # collection selector) but never served to a TAXII consumer. Keep it
+    # configured whenever scoring.enabled is true, or quarantined objects land
+    # in a collection that does not exist.
+    - id: quarantine
+      title: 'Quarantine (below score threshold)'
+      description: 'Community intel that did not reach the scoring threshold.'
 
   # Optional third principal: a script/automation credential allowed to do
   # feed-wide writes without reusing the dashboard login. Unset by default —
@@ -169,6 +178,65 @@ lifecycle:
 # values to keep OUT of the feed. A community object matching one is withheld,
 # so Vision One never sees it and cannot block real traffic on it.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# SCORING PIPELINE (Phase 1 — offline). OFF by default: while `enabled: false`
+# every poller behaves exactly as before, so this is safe to leave in place and
+# turn on deliberately.
+#
+# When on, community intel is scored 0-100 and ROUTED by collection:
+#   score >= threshold -> the poller's ingest_collection (served to consumers)
+#   score <  threshold -> `quarantine` (captured, reviewable, never served)
+#
+# Known-legitimate values are NOT handled here: the `intel_filter.benign_*`
+# filter above already withholds them at read time, from a dashboard-editable
+# list. Scoring only decides which collection an indicator is filed into.
+#
+# Phase 1 uses only local signals — no network egress, no API keys — so it adds
+# no new failure modes. Phase 3 enrichment (VirusTotal / AbuseIPDB / RDAP) is
+# designed to feed the same score later.
+#
+# The score with its per-signal breakdown is stored on every object, so a
+# quarantine decision can always be explained after the fact.
+# ---------------------------------------------------------------------------
+scoring:
+  enabled: true                 # TEST RUN
+  # 50 for this test: Feodo C2 scores 60 and high-confidence ThreatFox 50, so
+  # they are served; mid-confidence ThreatFox (40) is held in quarantine.
+  # Raise to 75 for "corroboration or nothing", lower for a fuller feed.
+  threshold: 50
+  quarantine_collection: 'quarantine'
+
+  # Pulse metadata / age. A pulse failing these is skipped before its
+  # indicators are even fetched (which also saves the API call).
+  max_pulse_age_days: null      # drop pulses older than this (null = no limit)
+  require_adversary: false      # drop pulses that name no threat actor
+  large_pulse_min: 10           # indicator_count at/above this counts as "large"
+
+  # Weights for each local signal. Tune with the dry-run harness rather than by
+  # guesswork:  python server.py --score-sample 100
+  # (`base` is a floor so nothing scores a spurious zero. The source's own
+  # `confidence` is deliberately not used — every automated path writes a
+  # constant for it, so it discriminates nothing.)
+  weights:
+    base: 30
+    pulse_recent_7d: 15         # OTX pulse modified within a week
+    pulse_recent_30d: 8         # ...within a month
+    pulse_has_adversary: 10
+    pulse_has_tags: 5
+    pulse_large: 5
+    # Cross-source corroboration — the strongest signal. Counted from the
+    # ioc_observations table, so it sees every feed that reported the value
+    # (otx / threatfox / feodo / urlhaus / ...), not just the merged row.
+    corroborated_2: 10          # same value from >= 2 distinct sources
+    corroborated_3: 20          # ... >= 3
+    corroborated_4: 30          # ... >= 4
+    # Per-source signals.
+    otx_multi_pulse: 10         # same value in >= 2 distinct OTX pulses
+    threatfox_conf_high: 20     # ThreatFox confidence_level >= 75
+    threatfox_conf_mid: 10      # ... >= 50
+    feodo_c2: 30                # in Feodo's curated botnet-C2 list
+    urlhaus: 15                 # present in URLhaus
+
 intel_filter:
   # Which source tags are "community" and therefore gated. Manual is never
   # gated no matter what.
@@ -348,12 +416,15 @@ otx:
 # gated like any other community intel.
 # ---------------------------------------------------------------------------
 abuse_ch:
-  enabled: false               # set true to start pulling abuse.ch intel
+  enabled: true                # TEST RUN: small pull, re-evaluate after
   # Put the real key in .env (ABUSE_CH_AUTH_KEY=...) so it stays out of VCS.
   auth_key: '${ABUSE_CH_AUTH_KEY:-}'
-  feeds: ['threatfox', 'feodo', 'urlhaus']   # which feeds to ingest
+  # Feodo first (only a handful of IOCs today) so the global per-poll cap does
+  # not starve it — ThreatFox alone returns ~2,000 and would consume the cap
+  # before the later feeds ran. URLhaus is left off for this small test.
+  feeds: ['feodo', 'threatfox']
   poll_interval: 3600          # seconds between background poll cycles
-  max_objects_per_poll: 5000
+  max_objects_per_poll: 50     # small test pull
   threatfox_days: 1            # ThreatFox look-back window (get_iocs days)
   ingest_collection: comm_intel
 

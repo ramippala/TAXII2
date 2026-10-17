@@ -9,6 +9,7 @@ import sys
 import os
 import base64
 import io
+import json
 import re
 import tempfile
 import time
@@ -57,6 +58,7 @@ def _reset_db():
         session.query(server.STIXObject).delete()
         session.query(server.ApiKey).delete()
         session.query(server.UIUser).delete()
+        session.query(server.IocObservation).delete()
         session.query(server.AuditEvent).delete()
         session.query(server.BenignValue).delete()
         session.query(server.VtCache).delete()
@@ -3991,6 +3993,253 @@ class TestUiPageWiring(unittest.TestCase):
         self.assertEqual(names, tabs, 'PAGE_NAMES lists a page that has no tab')
 
 
+class TestScoringPipeline(unittest.TestCase):
+    """Phase 1 scoring: benign allowlist, pulse filter, score, and routing."""
+
+    def setUp(self):
+        _reset_db()
+        self._saved = (_server.SCORING_ENABLED, _server.SCORING_THRESHOLD,
+                       dict(_server.SCORE_WEIGHTS), dict(_server.SCORING_CFG))
+        _server.SCORING_ENABLED = True
+
+    def tearDown(self):
+        (_server.SCORING_ENABLED, _server.SCORING_THRESHOLD,
+         _server.SCORE_WEIGHTS, _server.SCORING_CFG) = self._saved
+
+    def _cfg(self, **kwargs):
+        _server.SCORING_CFG = {**self._saved[3], **kwargs}
+
+    @staticmethod
+    def _ip(value):
+        return {'id': f'ipv4-addr--{value.replace(".", "-")}',
+                'type': 'ipv4-addr',
+                'object': {'ipv4-addr': {'value': value}}}
+
+    # --- Layer 2: pulse metadata -------------------------------------------
+
+    def test_pulse_age_filter_only_applies_when_configured(self):
+        old = {'modified': (datetime.utcnow() - timedelta(days=90)).isoformat()}
+        fresh = {'modified': (datetime.utcnow() - timedelta(days=2)).isoformat()}
+        self._cfg(max_pulse_age_days=None)
+        self.assertIsNone(_server.pulse_filter_reason(old))
+        self._cfg(max_pulse_age_days=30)
+        self.assertIsNotNone(_server.pulse_filter_reason(old))
+        self.assertIsNone(_server.pulse_filter_reason(fresh))
+
+    def test_require_adversary_filter(self):
+        self._cfg(require_adversary=True)
+        self.assertIsNotNone(_server.pulse_filter_reason({'name': 'x'}))
+        self.assertIsNone(
+            _server.pulse_filter_reason({'name': 'x', 'adversary': 'APT-1'}))
+
+    # --- scoring -----------------------------------------------------------
+
+    def _summary(self, sources=(), **kw):
+        entry = _server._new_obs_summary()
+        entry['sources'] = set(sources)
+        entry.update(kw)
+        return entry
+
+    def test_score_accumulates_signals_and_clamps(self):
+        summary = self._summary(
+            sources={'otx', 'threatfox', 'feodo'},
+            otx_pulses={'p1'}, otx_adversary=True, otx_tags=True,
+            otx_latest=datetime.utcnow(), otx_indicator_count=50,
+            threatfox_conf=90, feodo=True)
+        score, parts = _server.score_from_summary(summary)
+        self.assertIn('corroborated_3', parts)
+        self.assertIn('threatfox_conf_high', parts)
+        self.assertIn('feodo_c2', parts)
+        self.assertLessEqual(score, 100)
+        # The breakdown records the raw contributions; the score is their sum
+        # clamped to 100, so a saturated score sums above it.
+        self.assertEqual(score, min(100, sum(parts.values())))
+
+    def test_score_never_exceeds_100(self):
+        _server.SCORE_WEIGHTS = {k: 100 for k in _server.SCORE_WEIGHTS}
+        score, _ = _server.score_from_summary(
+            self._summary(sources={'otx', 'threatfox', 'feodo', 'urlhaus'},
+                          otx_pulses={'a', 'b'}, otx_adversary=True,
+                          otx_tags=True, otx_latest=datetime.utcnow(),
+                          otx_indicator_count=99, threatfox_conf=99,
+                          feodo=True, urlhaus=True),
+            extra={'layer3': 100})
+        self.assertEqual(score, 100)
+
+    def test_corroboration_tiers(self):
+        base = _server.SCORE_WEIGHTS['base']
+        tiers = ((1, None), (2, 'corroborated_2'),
+                 (3, 'corroborated_3'), (4, 'corroborated_4'))
+        for count, key in tiers:
+            score, _ = _server.score_from_summary(
+                self._summary(sources={f's{i}' for i in range(count)}))
+            expected = base + (_server.SCORE_WEIGHTS[key] if key else 0)
+            self.assertEqual(score, expected, f'{count} source(s)')
+
+    def test_extra_is_the_enrichment_seam(self):
+        """Phase 2b/3 enrichment feeds the same score with no changes here."""
+        score, parts = _server.score_from_summary(
+            None, extra={'vt_detections': 25})
+        self.assertEqual(parts['vt_detections'], 25)
+        self.assertEqual(score, _server.SCORE_WEIGHTS['base'] + 25)
+
+    # --- routing -----------------------------------------------------------
+
+    def _ctx(self, source='otx', pulse=None, raw_confidence=None, key=None):
+        return {'source': source, 'obs_key': key or source,
+                'pulse': pulse, 'raw_confidence': raw_confidence}
+
+    def test_routing_is_a_passthrough_when_scoring_is_off(self):
+        _server.SCORING_ENABLED = False
+        benign = self._ip('9.9.9.9')
+        accepted, quarantined, report, scores, _obs = _server.route_by_score(
+            [(benign, self._ctx())])
+        self.assertEqual([d['id'] for d in accepted], [benign['id']])
+        self.assertEqual(quarantined, [])
+        self.assertEqual(scores, {})
+        self.assertFalse(report['enabled'])
+
+    def test_routing_splits_on_the_threshold(self):
+        _server.SCORING_THRESHOLD = 50
+        pulse = {'id': 'p1', 'modified': datetime.utcnow().isoformat(),
+                 'adversary': 'APT-X', 'tags': ['t'], 'indicator_count': 50}
+        strong, weak = self._ip('45.13.22.9'), self._ip('91.214.124.7')
+        accepted, quarantined, _report, scores, _obs = _server.route_by_score(
+            [(strong, self._ctx(pulse=pulse, key='pulse:p1')),
+             (weak, self._ctx(pulse=None, key='pulse:p2'))])
+        self.assertEqual([d['id'] for d in accepted], [strong['id']])
+        self.assertEqual([d['id'] for d in quarantined], [weak['id']])
+        self.assertIn(strong['id'], scores)
+        self.assertIn(weak['id'], scores)
+
+    def test_benign_values_are_left_to_the_read_time_filter(self):
+        """Known-legitimate handling lives in the gate, not in scoring.
+
+        Routing must not silently drop a value that the read-time
+        known-legitimate filter owns, or the two would diverge.
+        """
+        _server.SCORING_THRESHOLD = 50
+        resolver = self._ip('8.8.8.8')
+        accepted, quarantined, _report, scores, _obs = _server.route_by_score(
+            [(resolver, self._ctx())])
+        self.assertIn(resolver['id'], scores)
+        self.assertEqual([d['id'] for d in accepted + quarantined],
+                         [resolver['id']])
+
+    def test_same_value_in_several_pulses_counts_as_multi_pulse(self):
+        """Repeated pulses are within-source corroboration, not cross-source.
+
+        Cross-source corroboration counts distinct SOURCES; several pulses of
+        the same feed is a different (weaker) signal, scored separately.
+        """
+        _server.SCORING_THRESHOLD = 40
+        obj = self._ip('45.13.22.9')
+        pulses = [{'id': f'p{i}'} for i in range(3)]
+        accepted, quarantined, _report, scores, _obs = _server.route_by_score(
+            [(dict(obj), self._ctx(pulse=p, key=f'pulse:{p["id"]}'))
+             for p in pulses])
+        self.assertEqual(scores[obj['id']][0],
+                         _server.SCORE_WEIGHTS['base']
+                         + _server.SCORE_WEIGHTS['otx_multi_pulse'])
+
+    def test_cross_source_corroboration_raises_the_score(self):
+        """The point of Phase 2a: independent sources compound."""
+        _server.SCORING_THRESHOLD = 50
+        obj = self._ip('45.13.22.9')
+        # One source only: base.
+        _a, _q, _r, one, _o = _server.route_by_score(
+            [(dict(obj), self._ctx(source='otx'))])
+        # Three independent sources observing the same value.
+        accepted, _q, _r, three, obs = _server.route_by_score([
+            (dict(obj), self._ctx(source='otx')),
+            (dict(obj), self._ctx(source='threatfox', raw_confidence=90,
+                                  key='threatfox:1')),
+            (dict(obj), self._ctx(source='feodo', key='feodo:1')),
+        ])
+        self.assertGreater(three[obj['id']][0], one[obj['id']][0])
+        self.assertIn('corroborated_3', three[obj['id']][1])
+        self.assertEqual(len(obs), 3)
+        # All three sightings pass; they share one value (and one stix id).
+        self.assertEqual({d['id'] for d in accepted}, {obj['id']})
+
+    def test_feodo_and_threatfox_confidence_contribute(self):
+        obj = self._ip('45.13.22.9')
+        _a, _q, _r, scores, _o = _server.route_by_score([
+            (dict(obj), self._ctx(source='threatfox', raw_confidence=90,
+                                  key='threatfox:1')),
+            (dict(obj), self._ctx(source='feodo', key='feodo:1')),
+        ])
+        parts = scores[obj['id']][1]
+        self.assertIn('threatfox_conf_high', parts)
+        self.assertIn('feodo_c2', parts)
+
+    def test_observations_are_deduplicated(self):
+        """Re-polling the same pulse must not inflate corroboration."""
+        obs = {'value': '1.2.3.4', 'object_type': 'ipv4-addr',
+               'source': 'otx', 'observation_key': 'pulse:p1',
+               'raw_confidence': None, 'detail': {'pulse': 'p1'}}
+        self.assertEqual(_server.record_observations([dict(obs)]), 1)
+        self.assertEqual(_server.record_observations([dict(obs)]), 0)
+        session = _server.create_session()
+        try:
+            self.assertEqual(
+                session.query(_server.IocObservation).filter_by(
+                    value='1.2.3.4').count(), 1)
+        finally:
+            session.close()
+
+    # --- persistence -------------------------------------------------------
+
+    def test_scores_are_persisted_and_unscored_rows_stay_null(self):
+        scored, unscored = _manual_obj('10.1.2.3'), _manual_obj('10.1.2.4')
+        _server.ingest_objects([scored], mode='merge', source='otx',
+                               collection='comm_intel',
+                               scores={scored['id']: (88, {'base': 30})})
+        _server.ingest_objects([unscored], mode='merge', source='otx',
+                               collection='comm_intel')
+        session = _server.create_session()
+        try:
+            row = session.query(_server.STIXObject).filter_by(
+                stix_id=scored['id']).one()
+            self.assertEqual(row.score, 88)
+            self.assertEqual(json.loads(row.score_breakdown), {'base': 30})
+            self.assertIsNotNone(row.scored_at)
+            other = session.query(_server.STIXObject).filter_by(
+                stix_id=unscored['id']).one()
+            # NULL, not 0: "never scored" must stay distinguishable from "scored
+            # as badly as possible".
+            self.assertIsNone(other.score)
+            self.assertIsNone(other.scored_at)
+        finally:
+            session.close()
+
+    # --- the property that makes quarantine meaningful ---------------------
+
+    def test_quarantine_collection_is_not_in_the_served_union(self):
+        aggregate = _server.TAXII_COLLECTION_MAP.get(_server.TAXII_COLLECTION_ID)
+        if aggregate is None or not aggregate.members:
+            self.skipTest('no aggregate collection in this environment')
+        self.assertNotIn(_server.SCORING_QUARANTINE_COLLECTION,
+                         aggregate.members,
+                         'quarantined intel would be served to consumers')
+
+    # --- the dry-run harness ----------------------------------------------
+
+    def test_score_sample_reports_outcomes(self):
+        objs = [self._ip('8.8.8.8'), self._ip('45.13.22.9')]
+        _server.ingest_objects(objs, mode='merge', source='otx',
+                               collection='comm_intel')
+        report = _server.score_sample(10)
+        self.assertEqual(report['sampled'], 2)
+        # Both score at the floor, below the default threshold, so both are
+        # held back. Benignness is the read-time filter's job, not this one.
+        self.assertEqual(report['accepted'], 0)
+        self.assertEqual(report['quarantined'], 2)
+        text = _server._format_score_report(report)
+        self.assertIn('quarantined', text)
+        self.assertIn('re-scored from stored signals', text)
+
+
 class _FakeJwkClient:
     """Stand-in for jwt.PyJWKClient: returns the local public key for any token."""
 
@@ -4014,7 +4263,7 @@ class TestSchemaDdl(unittest.TestCase):
 
     EXPECTED_TABLES = {'stix_objects', 'subscriptions', 'api_keys',
                        'ui_users', 'puller_state', 'audit_events',
-                       'benign_values', 'vt_cache'}
+                       'benign_values', 'vt_cache', 'ioc_observations'}
     POLL_INDEXES = {'ix_stix_objects_modified_id',
                     'ix_stix_objects_coll_modified_id'}
 

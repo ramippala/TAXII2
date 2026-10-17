@@ -19,8 +19,8 @@ Architecture:
 """
 
 import base64
+import argparse
 import csv
-import hashlib
 import hashlib
 import hmac
 import html
@@ -56,8 +56,10 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     and_,
     create_engine,
+    func,
     or_,
     text,
 )
@@ -215,6 +217,13 @@ class STIXObject(Base):
     revoked_at = Column(DateTime, nullable=True)   # when it was revoked (UTC)
     created = Column(DateTime, default=datetime.utcnow)
     modified = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # Scoring pipeline (see "Scoring pipeline — Phase 1"). NULL = never scored
+    # (e.g. manual intel, or the feature was off when it was ingested) — which
+    # is deliberately distinct from a score of 0, so "unscored" can be treated
+    # as its own policy rather than silently reading as "worst possible".
+    score = Column(Integer, nullable=True)
+    score_breakdown = Column(Text, nullable=True)   # JSON: {signal: points}
+    scored_at = Column(DateTime, nullable=True)
 
     # TAXII Get Objects filters on `modified` and keyset-paginates on
     # (modified, stix_id) — without these every poll is a full scan + sort.
@@ -285,6 +294,39 @@ class ApiKey(Base):
     # types" — init_db backfills existing keys with the full list so their
     # behaviour is unchanged. Enforced only on the /taxii2/ read path.
     types = Column(Text, nullable=True)
+
+
+class IocObservation(Base):
+    """One sighting of a value by one source.
+
+    The merged ``stix_objects`` row is keyed by an id derived from the value,
+    so when OTX and ThreatFox both report the same IOC they collapse into ONE
+    row and the second source is lost. This table keeps every sighting, which
+    is what makes a cross-source score possible: corroboration is "how many
+    independent sources observed this", and that fact exists only here.
+
+    ``observation_key`` dedupes within a source (e.g. the OTX pulse id), so
+    re-polling the same pulse refreshes ``last_seen`` instead of inflating the
+    count. ``detail`` carries source-specific signals (pulse adversary/tags,
+    ThreatFox malware family, ...) as JSON.
+    """
+
+    __tablename__ = "ioc_observations"
+
+    id = Column(String, primary_key=True)
+    value = Column(String, nullable=False, index=True)   # normalised (lowercased)
+    object_type = Column(String, nullable=False)
+    source = Column(String, nullable=False, index=True)  # otx | threatfox | feodo | ...
+    observation_key = Column(String, nullable=False)     # dedupe within a source
+    observed_at = Column(DateTime, default=datetime.utcnow)
+    last_seen = Column(DateTime, default=datetime.utcnow)
+    raw_confidence = Column(Integer, nullable=True)      # source's own 0-100
+    detail = Column(Text, nullable=True)                 # JSON
+
+    __table_args__ = (
+        UniqueConstraint('value', 'source', 'observation_key',
+                         name='uq_ioc_observation'),
+    )
 
 
 class UIUser(Base):
@@ -567,6 +609,9 @@ def init_db() -> None:
             ('object_refs', 'TEXT'),        # report object_refs (JSON list)
             ('valid_from', 'TIMESTAMP'),    # STIX valid_from (upstream; TIMESTAMP
                                             # works on both SQLite and Postgres)
+            ('score', 'INTEGER'),           # scoring pipeline (Phase 1)
+            ('score_breakdown', 'TEXT'),
+            ('scored_at', 'TIMESTAMP'),
         ):
             if col not in cols:
                 with engine.begin() as conn:
@@ -944,6 +989,10 @@ class ThreatIntel:
     # `added_after` delta sync.
     created: Optional[datetime] = None
     modified: Optional[datetime] = None
+    # Scoring pipeline: the computed 0-100 score and its per-signal breakdown.
+    # None means "never scored", which the dashboard shows distinctly from 0.
+    score: Optional[int] = None
+    score_breakdown: Optional[str] = None   # JSON object, as stored
 
     def to_stix_object(self) -> Dict[str, Any]:
         """Convert to a STIX 2.1-flavoured object dict (see generate_taxii_bundle)."""
@@ -1021,6 +1070,8 @@ def _row_to_threat_intel(row: STIXObject) -> ThreatIntel:
         revoked=bool(row.revoked),
         created=row.created,
         modified=row.modified,
+        score=row.score,
+        score_breakdown=row.score_breakdown,
     )
 
 
@@ -2367,7 +2418,9 @@ def _extract_object_fields(
 
 def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                    source: str = 'manual',
-                   collection: Optional[str] = None) -> int:
+                   collection: Optional[str] = None,
+                   scores: Optional[Dict[str, Tuple[int, Dict[str, int]]]] = None
+                   ) -> int:
     """Store STIX objects into the feed (memory + DB).
 
     ``mode``:
@@ -2468,6 +2521,17 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                 else:
                     revoked = bool(_raw_revoked)
 
+                # Scoring pipeline: the caller (a poller, via route_by_score)
+                # hands us the computed score keyed by stix id. Absent = this
+                # object was not scored, which stays NULL rather than 0 — see
+                # the STIXObject.score comment.
+                scored = (scores or {}).get(stix_id)
+                score_value: Optional[int] = None
+                score_json: Optional[str] = None
+                if scored is not None:
+                    score_value = int(scored[0])
+                    score_json = json.dumps(scored[1], sort_keys=True)
+
                 memory_store[stix_id] = ThreatIntel(
                     stix_id=stix_id,
                     object_type=obj_type,
@@ -2493,6 +2557,8 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                     created=(existing_row.created if existing_row is not None
                              else now),
                     modified=now,
+                    score=score_value,
+                    score_breakdown=score_json,
                 )
 
                 row = existing.get(stix_id)
@@ -2514,6 +2580,12 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                     row.collection_id = collection
                     row.last_seen = now
                     row.revoked = revoked  # sticky (see above); keeps first revoked_at
+                    # A re-score supersedes the stored one; when this object was
+                    # not scored on this pass, keep whatever is already there.
+                    if scored is not None:
+                        row.score = score_value
+                        row.score_breakdown = score_json
+                        row.scored_at = now
                 else:
                     row = STIXObject(
                         id=stix_id,
@@ -2538,6 +2610,9 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
                         last_seen=now,
                         revoked=revoked,
                         revoked_at=now if revoked else None,
+                        score=score_value,
+                        score_breakdown=score_json,
+                        scored_at=now if scored is not None else None,
                     )
                     existing[stix_id] = row
                     session.add(row)
@@ -2854,6 +2929,20 @@ def _ioc_pattern(obj: ThreatIntel) -> Optional[str]:
     return None
 
 
+def _served_confidence(obj: ThreatIntel) -> int:
+    """The confidence a consumer sees.
+
+    Uses the pipeline's computed ``score`` when it exists, falling back to the
+    source's own ``confidence`` claim otherwise (manual intel, or scoring was
+    off at ingest). The two are different things — ``confidence`` is what the
+    feed said, ``score`` is our cross-source judgement — and conflating them is
+    exactly what let OTX's flat 70 leak into the feed.
+    """
+    if obj.score is not None:
+        return max(0, min(100, int(obj.score)))
+    return int(obj.confidence or 0)
+
+
 def _ioc_stix_object(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
     """A spec-valid STIX 2.1 *indicator* for an IOC object.
 
@@ -2879,7 +2968,7 @@ def _ioc_stix_object(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
             'modified': modified,
             'value': value,
             'labels': obj.labels or [],
-            'confidence': obj.confidence or 0,
+            'confidence': _served_confidence(obj),
         }
     out: Dict[str, Any] = {
         'spec_version': '2.1',
@@ -2889,7 +2978,7 @@ def _ioc_stix_object(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
         'modified': modified,
         'revoked': bool(obj.revoked),
         'labels': obj.labels or [],
-        'confidence': obj.confidence or 0,
+        'confidence': _served_confidence(obj),
         'pattern': pattern,
         'pattern_type': 'stix',
         'pattern_version': '2.1',
@@ -2960,7 +3049,7 @@ def threat_intel_to_stix21(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
             'id': _stix_uuid_id(obj.object_type, obj.stix_id,
                                 f'{obj.object_type}:{obj.name or obj.stix_id}'),
             'labels': obj.labels or [],
-            'confidence': obj.confidence or 0,
+            'confidence': _served_confidence(obj),
         }
         if obj.object_type == 'malware':
             base['name'] = obj.name or 'Unnamed malware'
@@ -2998,7 +3087,7 @@ def threat_intel_to_stix21(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
             'object_refs': refs,
             'published': common['created'],
             'labels': obj.labels or [],
-            'confidence': obj.confidence or 0,
+            'confidence': _served_confidence(obj),
         }
 
     # STIX relationship (the graph edge).
@@ -3013,7 +3102,7 @@ def threat_intel_to_stix21(obj: ThreatIntel) -> Optional[Dict[str, Any]]:
             'source_ref': obj.source_ref,
             'target_ref': obj.target_ref,
             'labels': obj.labels or [],
-            'confidence': obj.confidence or 0,
+            'confidence': _served_confidence(obj),
         }
 
     # Any other stored type is not servable.
@@ -3250,6 +3339,434 @@ def _object_benign(obj: ThreatIntel) -> bool:
         except ValueError:
             pass
     return any(v and _is_benign_value(v) for v in values)
+# Scoring pipeline — Phase 1 (offline)
+# ---------------------------------------------------------------------------
+# Sits between a community poller and ingest, deciding which collection an
+# indicator lands in: a high score goes to the served community collection, the
+# rest to a quarantine collection the consumer never sees.
+#
+# Phase 1 uses ONLY local signals — no network egress, no API keys — so it adds
+# no new failure modes and is fully testable offline. Layer 3 (VirusTotal /
+# AbuseIPDB / RDAP) is designed to feed the same score later via the `extra`
+# argument of score_from_summary(); nothing here needs to change for that.
+#
+# Every weight is configurable and the per-signal breakdown is persisted with
+# the object, so "why was this quarantined?" is always answerable afterwards.
+
+SCORING_CFG = CONFIG.get('scoring', {}) or {}
+SCORING_ENABLED = bool(SCORING_CFG.get('enabled', False))
+SCORING_THRESHOLD = int(SCORING_CFG.get('threshold', 75))
+SCORING_QUARANTINE_COLLECTION = str(
+    SCORING_CFG.get('quarantine_collection') or 'quarantine')
+SCORING_LARGE_PULSE_MIN = int(SCORING_CFG.get('large_pulse_min', 10))
+
+# Weights for each local signal. Deliberately transparent and tunable: the
+# dry-run harness (python server.py --score-sample) exists to tune these
+# against real data rather than guess.
+DEFAULT_SCORE_WEIGHTS: Dict[str, int] = {
+    'base': 30,                 # floor, so nothing scores a spurious zero
+    'pulse_recent_7d': 15,      # pulse modified within a week
+    'pulse_recent_30d': 8,      # ...within a month
+    'pulse_has_adversary': 10,  # pulse names a threat actor
+    'pulse_has_tags': 5,
+    'pulse_large': 5,           # >= scoring.large_pulse_min indicators
+    'corroborated_2': 10,       # same value from >= 2 distinct sources
+    'corroborated_3': 20,       # ... >= 3
+    'corroborated_4': 30,       # ... >= 4 (the strongest signal available)
+    # Per-source signals, from the ioc_observations table (Phase 2a).
+    'otx_multi_pulse': 10,      # same value in >= 2 distinct OTX pulses
+    'threatfox_conf_high': 20,  # ThreatFox confidence_level >= 75
+    'threatfox_conf_mid': 10,   # ... >= 50
+    'feodo_c2': 30,             # present in Feodo's curated botnet-C2 list
+    'urlhaus': 15,              # present in URLhaus
+}
+SCORE_WEIGHTS: Dict[str, int] = {
+    **DEFAULT_SCORE_WEIGHTS,
+    **{k: int(v) for k, v in (SCORING_CFG.get('weights') or {}).items()
+       if k in DEFAULT_SCORE_WEIGHTS},
+}
+
+# The source's own `confidence` is deliberately NOT an input. Every automated
+# path writes a constant for it (70 for OTX, 50 elsewhere), so it carries no
+# per-indicator signal — including it would shift every score by the same
+# amount and discriminate nothing.
+
+
+if SCORING_ENABLED:
+    # Two misconfigurations here are silent and costly, so they are checked at
+    # import rather than discovered later from a feed that looks wrong.
+    if SCORING_QUARANTINE_COLLECTION not in TAXII_COLLECTION_MAP:
+        logger.error(
+            "scoring.enabled is true but %r is not a configured collection — "
+            "quarantined objects would be filed under an id nothing can list. "
+            "Add it to taxii.collections.",
+            SCORING_QUARANTINE_COLLECTION,
+        )
+    elif any(SCORING_QUARANTINE_COLLECTION in c.members
+             for c in TAXII_COLLECTIONS):
+        logger.error(
+            "Quarantine collection %r is a member of an aggregate, so "
+            "quarantined intel WOULD be served to consumers. Remove it from "
+            "that collection's `members`.",
+            SCORING_QUARANTINE_COLLECTION,
+        )
+
+
+def _pulse_age_days(pulse: Dict[str, Any]) -> Optional[float]:
+    """Age of an OTX pulse in days (from ``modified``, else ``created``)."""
+    for key in ('modified', 'created'):
+        stamp = _parse_iso_naive(pulse.get(key)) if pulse.get(key) else None
+        if stamp is not None:
+            return (datetime.utcnow() - stamp).total_seconds() / 86400.0
+    return None
+
+
+
+
+def pulse_filter_reason(pulse: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Layer 2: why this pulse fails the metadata/age filter, or None."""
+    if not pulse:
+        return None
+    max_age = SCORING_CFG.get('max_pulse_age_days')
+    if max_age:
+        age = _pulse_age_days(pulse)
+        if age is not None and age > float(max_age):
+            return f'pulse is {age:.0f}d old (limit {int(max_age)}d)'
+    if SCORING_CFG.get('require_adversary') and not str(
+            pulse.get('adversary') or '').strip():
+        return 'pulse names no adversary'
+    return None
+
+
+
+
+# --- observations (Phase 2a: cross-source corroboration) -------------------
+# The score needs to know WHICH sources observed a value, but the merged
+# stix_objects row keeps only one. These helpers persist every sighting and
+# turn them into the per-signal summary the score is computed from.
+
+def _normalise_obs_value(value: Any) -> str:
+    return str(value or '').strip().lower()
+
+
+def _pulse_detail(pulse: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The OTX pulse fields worth persisting for scoring/audit."""
+    if not pulse:
+        return {}
+    return {
+        'pulse': str(pulse.get('id') or pulse.get('name') or ''),
+        'adversary': str(pulse.get('adversary') or ''),
+        'tags': list(pulse.get('tags') or []),
+        'indicator_count': int(pulse.get('indicator_count') or 0),
+        'modified': str(pulse.get('modified') or ''),
+    }
+
+
+def build_observation(descriptor: Dict[str, Any],
+                      context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """One observation record for an ingest candidate, or None."""
+    context = context or {}
+    value, obj_type = _indicator_value(descriptor)
+    value = _normalise_obs_value(value)
+    source = str(context.get('source') or 'unknown')
+    if not value or not source:
+        return None
+    obs_key = str(context.get('obs_key') or source)
+    raw = context.get('raw_confidence')
+    try:
+        raw_conf = int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        raw_conf = None
+    detail = context.get('detail')
+    if not isinstance(detail, dict):
+        detail = _pulse_detail(context.get('pulse'))
+    return {
+        'value': value,
+        'object_type': obj_type,
+        'source': source,
+        'observation_key': obs_key,
+        'raw_confidence': raw_conf,
+        'detail': detail,
+    }
+
+
+def record_observations(observations: List[Dict[str, Any]]) -> int:
+    """Upsert observations, deduped on (value, source, observation_key).
+
+    Refreshing an existing observation updates ``last_seen`` rather than
+    inserting a duplicate, so cross-source counts stay meaningful when a feed
+    is polled repeatedly.
+    """
+    if not observations:
+        return 0
+    session = create_session()
+    inserted = 0
+    try:
+        values = sorted({o['value'] for o in observations})
+        existing: Dict[Tuple[str, str, str], Any] = {}
+        for start in range(0, len(values), 500):
+            chunk = values[start:start + 500]
+            for row in session.query(IocObservation).filter(
+                    IocObservation.value.in_(chunk)):
+                existing[(row.value, row.source, row.observation_key)] = row
+        now = datetime.utcnow()
+        for obs in observations:
+            key = (obs['value'], obs['source'], obs['observation_key'])
+            row = existing.get(key)
+            if row is not None:
+                row.last_seen = now
+                if obs.get('raw_confidence') is not None:
+                    row.raw_confidence = obs['raw_confidence']
+                continue
+            row = IocObservation(
+                id=uuid.uuid4().hex,
+                value=obs['value'],
+                object_type=obs['object_type'],
+                source=obs['source'],
+                observation_key=obs['observation_key'],
+                observed_at=now,
+                last_seen=now,
+                raw_confidence=obs.get('raw_confidence'),
+                detail=json.dumps(obs.get('detail') or {}, sort_keys=True),
+            )
+            session.add(row)
+            existing[key] = row
+            inserted += 1
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        logger.error("Could not record IOC observations: %s", exc)
+        return 0
+    finally:
+        session.close()
+    return inserted
+
+
+def _new_obs_summary() -> Dict[str, Any]:
+    return {'sources': set(), 'otx_pulses': set(), 'otx_adversary': False,
+            'otx_tags': False, 'otx_latest': None, 'otx_indicator_count': 0,
+            'threatfox_conf': 0, 'feodo': False, 'urlhaus': False,
+            'latest': None}
+
+
+def _merge_observation(summary: Dict[str, Dict[str, Any]],
+                       obs: Dict[str, Any]) -> None:
+    """Fold one observation into ``summary[value]``."""
+    value = obs['value']
+    entry = summary.setdefault(value, _new_obs_summary())
+    source = str(obs.get('source') or '')
+    entry['sources'].add(source)
+    detail = obs.get('detail')
+    if isinstance(detail, str):
+        try:
+            detail = json.loads(detail)
+        except (TypeError, ValueError):
+            detail = {}
+    detail = detail if isinstance(detail, dict) else {}
+    if source == 'otx':
+        if detail.get('pulse'):
+            entry['otx_pulses'].add(str(detail['pulse']))
+        if detail.get('adversary'):
+            entry['otx_adversary'] = True
+        if detail.get('tags'):
+            entry['otx_tags'] = True
+        try:
+            entry['otx_indicator_count'] = max(
+                int(entry.get('otx_indicator_count') or 0),
+                int(detail.get('indicator_count') or 0))
+        except (TypeError, ValueError):
+            pass
+        stamp = _parse_iso_naive(detail.get('modified')) if detail.get('modified') else None
+        if stamp and (entry['otx_latest'] is None or stamp > entry['otx_latest']):
+            entry['otx_latest'] = stamp
+    elif source == 'threatfox':
+        try:
+            if obs.get('raw_confidence') is not None:
+                entry['threatfox_conf'] = max(entry['threatfox_conf'],
+                                              int(obs['raw_confidence']))
+        except (TypeError, ValueError):
+            pass
+    elif source == 'feodo':
+        entry['feodo'] = True
+    elif source == 'urlhaus':
+        entry['urlhaus'] = True
+    seen = obs.get('last_seen') or obs.get('observed_at')
+    if isinstance(seen, datetime) and (entry['latest'] is None or seen > entry['latest']):
+        entry['latest'] = seen
+
+
+def observation_summaries(values: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Load stored observations for ``values`` into per-value summaries."""
+    wanted = sorted({_normalise_obs_value(v) for v in values if v})
+    if not wanted:
+        return {}
+    summary: Dict[str, Dict[str, Any]] = {}
+    session = create_session()
+    try:
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start:start + 500]
+            rows = session.query(IocObservation).filter(
+                IocObservation.value.in_(chunk)).all()
+            for row in rows:
+                _merge_observation(summary, {
+                    'value': row.value, 'source': row.source,
+                    'raw_confidence': row.raw_confidence,
+                    'detail': row.detail, 'last_seen': row.last_seen,
+                })
+    except Exception as exc:            # never break a poll on a scoring read
+        logger.error("Observation lookup failed: %s", exc)
+    finally:
+        session.close()
+    return summary
+
+
+def score_from_summary(entry: Optional[Dict[str, Any]],
+                       extra: Optional[Dict[str, int]] = None
+                       ) -> Tuple[int, Dict[str, int]]:
+    """Compute the 0-100 score from a value's observation summary.
+
+    Every component is named in the breakdown, so a served or quarantined
+    decision can be explained signal-by-signal after the fact.
+
+    ``extra`` is the enrichment seam: a later stage passes e.g.
+    ``{'vt_detections': 20, 'rdap_new_domain': 10}`` and it sums in exactly
+    like a local signal, with the same auditable breakdown.
+    """
+    weights = SCORE_WEIGHTS
+    parts: Dict[str, int] = {}
+
+    def add(key: str, points: int) -> None:
+        if points:
+            parts[key] = int(points)
+
+    add('base', weights['base'])
+    entry = entry or _new_obs_summary()
+    sources = entry.get('sources') or set()
+    if len(sources) >= 4:
+        add('corroborated_4', weights['corroborated_4'])
+    elif len(sources) == 3:
+        add('corroborated_3', weights['corroborated_3'])
+    elif len(sources) == 2:
+        add('corroborated_2', weights['corroborated_2'])
+
+    if entry.get('otx_pulses'):
+        if len(entry['otx_pulses']) >= 2:
+            add('otx_multi_pulse', weights['otx_multi_pulse'])
+        latest = entry.get('otx_latest')
+        if latest is not None:
+            age = (datetime.utcnow() - latest).total_seconds() / 86400.0
+            if age <= 7:
+                add('pulse_recent_7d', weights['pulse_recent_7d'])
+            elif age <= 30:
+                add('pulse_recent_30d', weights['pulse_recent_30d'])
+        if entry.get('otx_adversary'):
+            add('pulse_has_adversary', weights['pulse_has_adversary'])
+        if entry.get('otx_tags'):
+            add('pulse_has_tags', weights['pulse_has_tags'])
+        if int(entry.get('otx_indicator_count') or 0) >= SCORING_LARGE_PULSE_MIN:
+            add('pulse_large', weights['pulse_large'])
+
+    conf = int(entry.get('threatfox_conf') or 0)
+    if conf >= 75:
+        add('threatfox_conf_high', weights['threatfox_conf_high'])
+    elif conf >= 50:
+        add('threatfox_conf_mid', weights['threatfox_conf_mid'])
+    if entry.get('feodo'):
+        add('feodo_c2', weights['feodo_c2'])
+    if entry.get('urlhaus'):
+        add('urlhaus', weights['urlhaus'])
+    for key, points in (extra or {}).items():
+        add(key, int(points))
+
+    return max(0, min(100, sum(parts.values()))), parts
+
+
+def _indicator_value(descriptor: Dict[str, Any]) -> Tuple[str, str]:
+    """``(value, object_type)`` for an ingest descriptor, best effort.
+
+    Reads the same shapes the ingest path accepts (flat, or type-nested).
+    """
+    obj_type = str(descriptor.get('type') or '')
+    body = descriptor.get('object') or {}
+    nested = body.get(obj_type) if isinstance(body, dict) else None
+    inner = nested if isinstance(nested, dict) else body
+    if not isinstance(inner, dict):
+        inner = {}
+    if obj_type == 'file-hash':
+        hashes = inner.get('hash_value')
+        if isinstance(hashes, dict):
+            return str(hashes.get('value') or ''), obj_type
+        return str(hashes or descriptor.get('hash_value') or ''), obj_type
+    return str(inner.get('value') or inner.get('key') or inner.get('number')
+               or descriptor.get('value') or ''), obj_type
+
+
+
+def route_by_score(candidates: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]]
+                   ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]],
+                              Dict[str, Any],
+                              Dict[str, Tuple[int, Dict[str, int]]],
+                              List[Dict[str, Any]]]:
+    """Score a poll's candidates from their stored + in-batch observations.
+
+    ``candidates`` is ``[(ingest_descriptor, context), ...]``. ``context`` is a
+    dict describing the sighting::
+
+        {'source': 'otx'|'threatfox'|'feodo'|'urlhaus'|...,
+         'obs_key': '<dedupe key within that source>',
+         'pulse': <OTX pulse or None>,
+         'raw_confidence': <source's own 0-100 or None>,
+         'detail': <optional dict overriding the derived detail>}
+
+    The score is computed from :class:`IocObservation` summaries (existing
+    rows merged with this batch), so corroboration counts **distinct sources**
+    rather than the single merged ``stix_objects`` row. Returns
+    ``(accepted, quarantined, report, scores, observations)``; the caller
+    persists ``scores`` with the ingest and ``observations`` afterwards.
+
+    Benignness is deliberately NOT decided here: the known-legitimate filter
+    (``_is_benign_value`` / ``_object_benign``) already withholds those values
+    at read time, with a dashboard-editable list. Duplicating that decision at
+    ingest would create a second source of truth.
+    """
+    report: Dict[str, Any] = {
+        'enabled': SCORING_ENABLED,
+        'threshold': SCORING_THRESHOLD,
+        'candidates': len(candidates),
+        'accepted': 0,
+        'quarantined': 0,
+    }
+    observations = [o for o in (build_observation(d, c) for d, c in candidates)
+                    if o]
+    if not SCORING_ENABLED:
+        # Feature off: unchanged behaviour, everything is accepted. The
+        # observations are still returned so history accumulates for the day
+        # scoring is switched on.
+        return [c[0] for c in candidates], [], report, {}, observations
+
+    summaries = observation_summaries([o['value'] for o in observations])
+    # Fold this batch in so sightings inside one poll corroborate immediately.
+    now = datetime.utcnow()
+    for obs in observations:
+        _merge_observation(summaries, {**obs, 'last_seen': now})
+
+    accepted: List[Dict[str, Any]] = []
+    quarantined: List[Dict[str, Any]] = []
+    scores: Dict[str, Tuple[int, Dict[str, int]]] = {}
+    for descriptor, _context in candidates:
+        value = _normalise_obs_value(_indicator_value(descriptor)[0])
+        score, breakdown = score_from_summary(summaries.get(value))
+        stix_id = str(descriptor.get('id') or '')
+        if stix_id:
+            scores[stix_id] = (score, breakdown)
+        if score >= SCORING_THRESHOLD:
+            accepted.append(descriptor)
+        else:
+            quarantined.append(descriptor)
+
+    report['accepted'] = len(accepted)
+    report['quarantined'] = len(quarantined)
+    return accepted, quarantined, report, scores, observations
 
 
 def community_intel_reason(obj: ThreatIntel, row: 'STIXObject') -> Optional[str]:
@@ -4073,6 +4590,11 @@ def list_objects():
             ),
             'labels': obj.labels or [],
             'confidence': row.confidence,
+            # Scoring pipeline: the computed score, or None when the object was
+            # never scored (manual intel, or scoring was off at ingest time).
+            # Shown as "—" rather than 0 in the dashboard, so "unscored" is not
+            # mistaken for "scored as badly as possible".
+            'score': row.score,
             'source': verdict['source'],
             'gated': verdict['gated'],
             'gate_reason': verdict['reason'],
@@ -6053,34 +6575,76 @@ class OtxPoller:
             return 0
 
         cap = int(limit) if limit and limit > 0 else self.max_indicators_per_poll
-        stix_objects: List[Dict[str, Any]] = []
+        # (descriptor, pulse) pairs: the pulse is carried alongside so the
+        # scoring pipeline can use its metadata (age, adversary, size).
+        candidates: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        pulses_skipped = 0
         for pulse in self.fetch_recent_pulses():
-            if len(stix_objects) >= cap:
+            if len(candidates) >= cap:
                 break
             pulse_id = pulse.get('id') or ''
             if not pulse_id:
                 continue
             if int(pulse.get('indicator_count') or 0) < self.min_indicator_count:
                 continue
+            # Layer 2 (pulse metadata / age) before fetching the indicators —
+            # deciding here also saves the per-pulse API call.
+            if pulse_filter_reason(pulse):
+                pulses_skipped += 1
+                continue
 
             for item in self.fetch_pulse_indicators(pulse_id):
                 stix = self.otx_indicator_to_stix(item, pulse.get('name') or '', 0)
                 if stix:
-                    stix_objects.append(stix)
-                    if len(stix_objects) >= cap:
+                    candidates.append((stix, {
+                        'source': 'otx',
+                        'obs_key': f'pulse:{pulse_id}',
+                        'pulse': pulse,
+                        'raw_confidence': None,   # OTX has no per-IOC confidence
+                    }))
+                    if len(candidates) >= cap:
                         break
 
-        if not stix_objects:
+        accepted, quarantined, report, scores, observations = route_by_score(
+            candidates)
+        if report.get('enabled'):
+            logger.info(
+                "OTX scoring: %d candidate(s) -> %d accepted, %d quarantined; "
+                "%d pulse(s) skipped by the metadata filter",
+                report['candidates'], report['accepted'], report['quarantined'],
+                pulses_skipped,
+            )
+
+        added = 0
+        if accepted:
+            added = ingest_objects(accepted, mode='merge', source=self.SOURCE,
+                                   collection=self.ingest_collection,
+                                   scores=scores)
+        if quarantined:
+            # Held in a collection the aggregate does not include, so it is
+            # captured and reviewable in the dashboard but never served.
+            ingest_objects(quarantined, mode='merge', source=self.SOURCE,
+                           collection=SCORING_QUARANTINE_COLLECTION,
+                           scores=scores)
+        # Persist the sightings, including for quarantined objects: they are
+        # what makes future cross-source corroboration possible.
+        record_observations(observations)
+
+        if not accepted and not quarantined:
             self.last_poll_at = datetime.utcnow()
             self.last_poll_added = 0
             save_puller_state('otx', 'ok', 0, 'no new indicators')
             return 0
 
-        added = ingest_objects(stix_objects, mode='merge', source=self.SOURCE,
-                               collection=self.ingest_collection)
         self.last_poll_at = datetime.utcnow()
         self.last_poll_added = added
-        save_puller_state('otx', 'ok', added, f'{added} object(s) ingested')
+        if report.get('enabled') and report['quarantined']:
+            save_puller_state(
+                'otx', 'ok', added,
+                f'{added} served, {report["quarantined"]} quarantined '
+                f'(score < {SCORING_THRESHOLD})')
+        else:
+            save_puller_state('otx', 'ok', added, f'{added} object(s) ingested')
         return added
 
     def status(self) -> Dict[str, Any]:
@@ -6463,13 +7027,47 @@ class TaxiiPuller:
             desc for desc in (_stix21_object_to_our(o) for o in raw_objects)
             if desc is not None
         ]
-        if not stix_objects:
+        # Scoring pipeline. A generic TAXII source has no pulse metadata, so
+        # only the observation-derived signals apply; the upstream STIX
+        # `confidence`, when present, is recorded as its raw_confidence.
+        candidates = [(desc, {
+            'source': self.name,
+            'obs_key': 'remote:' + str(desc.get('id')
+                                       or _indicator_value(desc)[0]),
+            'raw_confidence': desc.get('confidence'),
+            'pulse': None,
+        }) for desc in stix_objects]
+        accepted, quarantined, report, scores, observations = route_by_score(
+            candidates)
+        if report.get('enabled'):
+            logger.info(
+                "TAXII pull '%s' scoring: %d candidate(s) -> %d accepted, "
+                "%d quarantined",
+                self.name, report['candidates'], report['accepted'],
+                report['quarantined'],
+            )
+        if not accepted and not quarantined:
             save_puller_state(self.state_id, 'ok', 0, 'no new objects')
             return 0, None
 
-        added = ingest_objects(stix_objects, mode='merge', source=self.name,
-                               collection=self.ingest_collection)
-        save_puller_state(self.state_id, 'ok', added, f'{added} object(s) ingested')
+        added = 0
+        if accepted:
+            added = ingest_objects(accepted, mode='merge', source=self.name,
+                                   collection=self.ingest_collection,
+                                   scores=scores)
+        record_observations(observations)
+        if quarantined:
+            ingest_objects(quarantined, mode='merge', source=self.name,
+                           collection=SCORING_QUARANTINE_COLLECTION,
+                           scores=scores)
+        if report.get('enabled') and report['quarantined']:
+            save_puller_state(
+                self.state_id, 'ok', added,
+                f'{added} served, {report["quarantined"]} quarantined '
+                f'(score < {SCORING_THRESHOLD})')
+        else:
+            save_puller_state(self.state_id, 'ok', added,
+                              f'{added} object(s) ingested')
         return added, None
 
     def pull_now(self, limit: Optional[int] = None) -> Dict[str, Any]:
@@ -6804,9 +7402,9 @@ class AbuseChPuller:
             'feodo': self.fetch_feodo,
             'urlhaus': self.fetch_urlhaus,
         }
-        stix_objects: List[Dict[str, Any]] = []
+        candidates: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
         for feed in self.feeds:
-            if len(stix_objects) >= cap:
+            if len(candidates) >= cap:
                 break
             fetcher = fetchers.get(feed)
             if fetcher is None:
@@ -6818,21 +7416,56 @@ class AbuseChPuller:
                 items = []
             logger.info("abuse.ch feed '%s' returned %s IOC(s)", feed, len(items))
             for item in items:
-                stix_objects.append(item)
-                if len(stix_objects) >= cap:
+                # The feed name IS the source for corroboration: ThreatFox,
+                # Feodo and URLhaus are independent sightings of the same
+                # value, which is exactly what the score should reward.
+                candidates.append((item, {
+                    'source': feed,
+                    'obs_key': feed + ':' + str(
+                        item.get('id') or _indicator_value(item)[0]),
+                    'raw_confidence': item.get('confidence'),
+                    'pulse': None,
+                }))
+                if len(candidates) >= cap:
                     break
 
-        if not stix_objects:
+        if not candidates:
             self.last_poll_at = datetime.utcnow()
             self.last_poll_added = 0
             save_puller_state(self.STATE_ID, 'ok', 0, 'no new indicators')
             return 0
 
-        added = ingest_objects(stix_objects, mode='merge', source=self.SOURCE,
-                               collection=self.ingest_collection)
+        # Same scoring/routing as the other community pullers. abuse.ch states
+        # a real per-IOC confidence for ThreatFox, which is recorded as the
+        # observation's raw_confidence and feeds the score.
+        accepted, quarantined, report, scores, observations = route_by_score(
+            candidates)
+        if report.get('enabled'):
+            logger.info(
+                "abuse.ch scoring: %d candidate(s) -> %d accepted, "
+                "%d quarantined",
+                report['candidates'], report['accepted'],
+                report['quarantined'])
+        added = 0
+        if accepted:
+            added = ingest_objects(accepted, mode='merge', source=self.SOURCE,
+                                   collection=self.ingest_collection,
+                                   scores=scores)
+        if quarantined:
+            ingest_objects(quarantined, mode='merge', source=self.SOURCE,
+                           collection=SCORING_QUARANTINE_COLLECTION,
+                           scores=scores)
+        record_observations(observations)
         self.last_poll_at = datetime.utcnow()
         self.last_poll_added = added
-        save_puller_state(self.STATE_ID, 'ok', added, f'{added} object(s) ingested')
+        if report.get('enabled') and report['quarantined']:
+            save_puller_state(
+                self.STATE_ID, 'ok', added,
+                f'{added} served, {report["quarantined"]} quarantined '
+                f'(score < {SCORING_THRESHOLD})')
+        else:
+            save_puller_state(self.STATE_ID, 'ok', added,
+                              f'{added} object(s) ingested')
         return added
 
     def status(self) -> Dict[str, Any]:
@@ -7309,6 +7942,113 @@ def _serve(host: str, port: int, debug: bool, server_cfg: Dict[str, Any]) -> Non
     serve(app, host=host, port=port, threads=threads, ident='TAXII/2.1')
 
 
+def score_sample(limit: int = 100,
+                 collection: Optional[str] = None) -> Dict[str, Any]:
+    """Re-score a sample of stored intel and report what the pipeline would do.
+
+    A backtest, not a live run: reads the database, makes no network calls and
+    writes nothing. Answers "what would enabling this do to the feed I already
+    have?" — which is a far more useful corpus than one fresh poll, since it
+    contains the false positives that prompted the work.
+
+    Returns a report dict; see :func:`_format_score_report` for the summary.
+    """
+    session = create_session()
+    try:
+        query = session.query(STIXObject)
+        if collection:
+            query = query.filter(STIXObject.collection_id == collection)
+        # Manual intel is never scored (a human entered it), so it is excluded
+        # rather than inflating the accept rate.
+        query = query.filter(func.coalesce(STIXObject.source, 'manual') != 'manual')
+        rows = query.order_by(STIXObject.modified.desc()).limit(int(limit)).all()
+        # Plain Python here: func.coalesce is a SQL construct and cannot be
+        # applied to already-materialised row values.
+        values = [str(row.ip_address or row.domain or row.hash_value
+                      or row.value or '') for row in rows]
+        # Detach what we need before the session closes.
+        sample = [(row.stix_id, row.object_type, value, row.source,
+                   row.score_breakdown)
+                  for row, value in zip(rows, values)]
+    finally:
+        session.close()
+
+    # The real score now comes from observations (which know every source that
+    # saw a value). Objects with no observations fall back to their stored
+    # signal keys, then to the floor.
+    summaries = observation_summaries([v for _, _, v, _, _ in sample if v])
+
+    entries: List[Dict[str, Any]] = []
+    rescored = 0
+    for stix_id, obj_type, value, source, stored in sample:
+        breakdown: Dict[str, int] = {}
+        summary = summaries.get(_normalise_obs_value(value))
+        if summary:
+            # Exact: recomputed from the current observations and weights.
+            _score, breakdown = score_from_summary(summary)
+            rescored += 1
+        elif stored:
+            # Legacy object (scored before observations existed): the stored
+            # breakdown keys are weight-independent, so re-scoring is exact.
+            try:
+                keys = json.loads(stored)
+            except (TypeError, ValueError):
+                keys = None
+            if isinstance(keys, dict):
+                breakdown = {k: SCORE_WEIGHTS.get(k, 0) for k in keys}
+                rescored += 1
+        if not breakdown:
+            breakdown = score_from_summary(None)[1]
+        score = max(0, min(100, sum(breakdown.values())))
+        entries.append({
+            'id': stix_id, 'value': value, 'type': obj_type, 'source': source,
+            'outcome': 'accepted' if score >= SCORING_THRESHOLD else 'quarantined',
+            'reason': None, 'score': score, 'breakdown': breakdown,
+        })
+
+    scored = [e['score'] for e in entries if e['score'] is not None]
+    histogram = {f'{lo}-{lo + 19}': 0 for lo in range(0, 100, 20)}
+    for score in scored:
+        histogram[f'{min(score // 20 * 20, 80)}-{min(score // 20 * 20, 80) + 19}'] += 1
+    return {
+        'enabled': SCORING_ENABLED,
+        'threshold': SCORING_THRESHOLD,
+        'sampled': len(entries),
+        'accepted': sum(1 for e in entries if e['outcome'] == 'accepted'),
+        'quarantined': sum(1 for e in entries if e['outcome'] == 'quarantined'),
+        'histogram': histogram,
+        'avg_score': round(sum(scored) / len(scored), 1) if scored else None,
+        'rescored_from_stored': rescored,
+        'entries': entries,
+    }
+
+
+def _format_score_report(report: Dict[str, Any]) -> str:
+    lines = [
+        f"Scoring pipeline: {'ENABLED' if report['enabled'] else 'DISABLED'}"
+        f"  (threshold {report['threshold']})",
+        f"Sampled {report['sampled']} stored community object(s)",
+        '',
+        f"  accepted (served)               : {report['accepted']}",
+        f"  quarantined (below threshold)   : {report['quarantined']}",
+        f"  mean score                      : {report['avg_score']}",
+        f"  re-scored from stored signals   : {report['rescored_from_stored']}"
+        f" of {report['sampled']}",
+        '',
+        '  score distribution:',
+    ]
+    for band, count in report['histogram'].items():
+        lines.append(f'    {band:>6} : {"#" * min(count, 60)} {count}')
+    worst = sorted((e for e in report['entries'] if e['score'] is not None),
+                   key=lambda e: e['score'])[:10]
+    if worst:
+        lines += ['', '  lowest-scoring (what quarantine would hold back):']
+        for e in worst:
+            lines.append(f"    {e['score']:3}  {e['type']:<14} {e['value']}"
+                         f"   {','.join(f'{k}+{v}' for k, v in e['breakdown'].items())}")
+    return '\n'.join(lines)
+
+
 def main() -> None:
     """Application entry point.
 
@@ -7316,6 +8056,28 @@ def main() -> None:
     that polls /taxii2/ on its own (configured with taxii.auth). Only the
     optional background pollers start, and both are off by default.
     """
+    parser = argparse.ArgumentParser(
+        description='TAXII 2.1 server.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        '--score-sample', type=int, metavar='N',
+        help='Backtest the scoring pipeline over N stored community objects '
+             'and print the outcome, then exit. Reads only: no polling, no '
+             'network calls, no writes. Use it to tune scoring.weights and '
+             'scoring.threshold before enabling the pipeline.')
+    parser.add_argument(
+        '--score-collection', metavar='ID',
+        help='Restrict --score-sample to one collection.')
+    args = parser.parse_args()
+
+    if args.score_sample is not None:
+        if args.score_sample <= 0:
+            parser.error('--score-sample must be a positive integer')
+        print(_format_score_report(
+            score_sample(args.score_sample, args.score_collection)))
+        return
+
     start_background_jobs()
 
     server_cfg = CONFIG.get('server', {}) or {}

@@ -262,7 +262,7 @@
         <thead>
           <tr>
             <th style="width:32px"><input type="checkbox" id="chkAll" title="Select all matching"></th>
-            <th>Type</th><th>Source</th><th>Value</th><th>Labels</th><th>Confidence</th><th>Status</th><th>ID</th><th></th>
+            <th>Type</th><th>Source</th><th>Value</th><th>Labels</th><th>Source conf.</th><th>Score</th><th>Status</th><th>ID</th><th></th>
           </tr>
         </thead>
         <tbody id="tbody"></tbody>
@@ -1042,6 +1042,17 @@ function rowElement(o) {
   conf.style.width = "80px";
   cConf.appendChild(conf);
 
+  // Computed score: the column to the left is the FEED's own confidence claim;
+  // this is the pipeline's cross-source score, and it is what the server emits
+  // as the STIX `indicator.confidence` for consumers. "—" means never scored
+  // (manual intel, or it predates scoring being enabled).
+  const cScore = document.createElement("td");
+  cScore.className = "mono";
+  cScore.textContent = (o.score === null || o.score === undefined)
+    ? "—" : String(o.score);
+  cScore.title = "Computed score = base + cross-source corroboration + "
+    + "per-source signals. Served to TAXII consumers as indicator.confidence.";
+
   const cStatus = document.createElement("td");
   cStatus.className = "status";
   if (o.kind === "existing") {
@@ -1094,7 +1105,7 @@ function rowElement(o) {
   del.addEventListener("click", () => removeRow(tr));
   cDel.appendChild(del);
 
-  tr.append(cChk, cType, cSrc, cVal, cLbl, cConf, cStatus, cId, cDel);
+  tr.append(cChk, cType, cSrc, cVal, cLbl, cConf, cScore, cStatus, cId, cDel);
   tr.dataset.key = o._key || o.id;
   // Keep the model in sync as the user edits. 'change' fires on blur/commit.
   // A commit must NOT rebuild the table: rebuilding on blur destroys the row

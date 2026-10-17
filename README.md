@@ -1350,6 +1350,121 @@ interpreted as code:
 Each successful import is logged with the object count, target collection and
 client IP (`Import via /feed/import-csv from …`).
 
+## Scoring Pipeline (Phase 1 — offline)
+
+A second, **ingest-time** filter for community intel. Where the
+[intel filter](#intel-filter-filtering-between-server-and-vision-one) above
+decides what is *served*, this decides which **collection** an indicator is
+filed into in the first place, using a computed 0–100 score:
+
+```
+OTX / TAXII puller
+      │
+      ▼
+Layer 2: pulse metadata / age ────────────(fail)───▶ pulse skipped entirely
+      │
+      ▼
+Score 0–100 from local signals
+      │
+      ├── score ≥ threshold ──▶ comm_intel  ──▶ served to consumers
+      └── score < threshold ──▶ quarantine  ──▶ stored, never served
+```
+
+**Off by default.** While `scoring.enabled: false` every poller behaves
+exactly as before, so this is safe to leave in the config and switch on
+deliberately.
+
+### Relationship to the known-legitimate filter
+
+Keeping benign values out of the feed is **not** this pipeline's job. The
+[intel filter](#intel-filter-filtering-between-server-and-vision-one) already
+does it at read time via `intel_filter.benign_values` / `benign_domains` /
+`benign_cidrs` and the dashboard-editable `benign_values` table. Scoring
+deliberately does not duplicate that decision — it only decides *which
+collection* an indicator is filed into, so there is a single source of truth
+for "is this legitimate?" and benign values stay stored (and auditable) rather
+than being dropped at ingest.
+
+### The score
+
+The score is a **transparent weighted sum of observable signals**. Every
+ingested sighting is recorded in `ioc_observations`, so the score can count
+**independent sources** rather than the single merged row:
+
+| Signal | Default | Meaning |
+|---|---|---|
+| `base` | 30 | floor, so nothing scores a spurious zero |
+| `corroborated_2` / `_3` / `_4` | 10 / 20 / 30 | same value seen by ≥2 / ≥3 / ≥4 **distinct sources** (OTX, ThreatFox, Feodo, URLhaus, …) |
+| `pulse_recent_7d` / `pulse_recent_30d` | 15 / 8 | how fresh the OTX pulse is |
+| `pulse_has_adversary` | 10 | the OTX pulse names a threat actor |
+| `pulse_has_tags` | 5 | |
+| `pulse_large` | 5 | OTX pulse has ≥ `large_pulse_min` indicators |
+| `otx_multi_pulse` | 10 | same value in ≥2 distinct OTX pulses |
+| `threatfox_conf_high` / `_mid` | 20 / 10 | ThreatFox `confidence_level` ≥75 / ≥50 |
+| `feodo_c2` | 30 | present in Feodo's curated botnet-C2 list |
+| `urlhaus` | 15 | present in URLhaus |
+
+Cross-source corroboration is the strongest signal and the reason the
+`ioc_observations` table exists: a value reported by OTX *and* ThreatFox *and*
+Feodo is a much stronger indicator than one reported once, and the merged
+`stix_objects` row cannot express that (its id is derived from the value, so the
+second source is lost). `observation_key` dedupes within a source, so
+re-polling the same pulse refreshes `last_seen` instead of inflating the count.
+
+All weights are configurable under `scoring.weights`, and the **per-signal
+breakdown is stored on every object** (`score_breakdown`), so a quarantine
+decision can always be explained after the fact — "why was this held back?"
+has an answer.
+
+**What consumers see.** The computed score is served as the STIX
+`indicator.confidence` when one exists, falling back to the source's own number
+for unscored objects (manual intel, or scoring was off at ingest). The source's
+claim is kept separately — they are different things, and conflating them is
+what let OTX's flat 70 leak into the feed. OTX itself exposes no per-indicator
+confidence, which is why its stored `confidence` is a constant and is not an
+input to the score.
+
+### Tuning it before you trust it
+
+```bash
+python server.py --score-sample 200              # backtest over stored intel
+python server.py --score-sample 200 --score-collection comm_intel
+```
+
+Reads only — no polling, no network calls, no writes. It reports the drop
+count, the score distribution, and the lowest-scoring objects with their
+breakdowns, so you can set `threshold` and `weights` against your real data
+rather than by guesswork.
+
+> The report distinguishes *re-scored from stored signals*: objects scored at
+> ingest carry their breakdown, so re-scoring under new weights is exact.
+> Objects ingested before scoring was enabled have no stored signals, so only
+> the row-derivable signals apply — the report says how many of each, rather
+> than quietly reporting optimistic numbers.
+
+### Operational notes
+
+- **Quarantine is a normal collection** (`scoring.quarantine_collection`,
+  default `quarantine`) that is deliberately **not** a member of the
+  `threat_intel` aggregate, so it is invisible to TAXII consumers by
+  construction. Pick it in the dashboard's collection selector to review what
+> was held back. Two misconfigurations are checked at startup (an unknown
+> quarantine id, or one that *is* a member of an aggregate, which would serve
+> quarantined intel) and logged as errors.
+- **`score` is NULL, not 0, when an object was never scored** (manual intel, or
+  scoring was off at ingest). "Unscored" stays distinguishable from "scored as
+  badly as possible" — the dashboard shows `—` rather than `0`.
+- **Cross-source corroboration is now real.** `stix_id` is derived from the
+  indicator value, so the same IOC from two sources merges into one row — which
+  is why sightings are recorded separately in `ioc_observations` before the
+  merge. The score counts distinct *sources* from that table; multiple pulses
+  of the same feed are scored separately (`otx_multi_pulse`) rather than
+  pretending to be independent corroboration.
+- **Still deferred:** the VirusTotal verifier (Phase 2b — quota-bound, so it
+  only checks values whose source-based score is in a decision band, reusing
+  `vt_cache`), RDAP domain age, and Phase 3 weight tuning. `score_indicator`
+  keeps its now-unused `pulse`/`extra` seam for that.
+
 ## Intel Filter (filtering between server and Vision One)
 
 A read-time **gate** sits in front of the `/taxii2/` collection Vision One
