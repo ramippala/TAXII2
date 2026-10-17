@@ -7647,7 +7647,9 @@ class AbuseChPuller:
         """URLhaus recent malicious URLs (+ their host, as a domain/IP)."""
         url = (self.config.get('urlhaus_url')
                or 'https://urlhaus-api.abuse.ch/v1/urls/recent/')
-        data = self._request_json(url, {})
+        # This endpoint is GET + Auth-Key; passing a body makes _request_json
+        # POST, which URLhaus rejects with 405 (and the feed silently empties).
+        data = self._request_json(url)
         if not isinstance(data, dict):
             return []
         out: List[Dict[str, Any]] = []
