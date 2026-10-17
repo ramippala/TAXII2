@@ -262,7 +262,7 @@
         <thead>
           <tr>
             <th style="width:32px"><input type="checkbox" id="chkAll" title="Select all matching"></th>
-            <th>Type</th><th>Source</th><th>Value</th><th>Labels</th><th>Source conf.</th><th>Score</th><th>Status</th><th>ID</th><th></th>
+            <th>Type</th><th>Source</th><th>Value</th><th>Labels</th><th title="Feed's own confidence claim. Editable for manual entries; not what consumers see — see Score.">Confidence</th><th>Score</th><th>Status</th><th>ID</th><th></th>
           </tr>
         </thead>
         <tbody id="tbody"></tbody>
@@ -1037,10 +1037,20 @@ function rowElement(o) {
   cLbl.appendChild(lbl);
 
   const cConf = document.createElement("td");
-  const conf = document.createElement("input");
-  conf.type = "number"; conf.min = 1; conf.max = 100; conf.value = o.confidence ?? 0;
-  conf.style.width = "80px";
-  cConf.appendChild(conf);
+  // The feed's own confidence claim is only editable for MANUAL entries (the
+  // save flow requires it). For community rows it is not what consumers see —
+  // the computed Score column is — so show it as inert text instead.
+  const editableConf = (o.kind === "new") || (o.source === "manual");
+  if (editableConf) {
+    const conf = document.createElement("input");
+    conf.type = "number"; conf.min = 1; conf.max = 100; conf.value = o.confidence ?? 0;
+    conf.style.width = "80px";
+    cConf.appendChild(conf);
+  } else {
+    cConf.className = "muted";
+    cConf.textContent = "—";
+    cConf.title = `Feed's own claim: ${o.confidence ?? "n/a"} — not served; see Score`;
+  }
 
   // Computed score: the column to the left is the FEED's own confidence claim;
   // this is the pipeline's cross-source score, and it is what the server emits
@@ -1097,6 +1107,7 @@ function rowElement(o) {
   const cId = document.createElement("td");
   cId.className = "mono"; cId.textContent = o.id || autoId(sel.value, inp.value || "");
   tr.dataset.id = o.id || cId.textContent;
+  tr.dataset.confidence = String(o.confidence ?? 0);
   tr.dataset.newId = o.kind === "new" ? "1" : "";
 
   const cDel = document.createElement("td");
@@ -1124,7 +1135,8 @@ function rowElement(o) {
   inp.addEventListener("input", () => { if (tr.dataset.newId) { tr.dataset.id = autoId(sel.value, inp.value.trim()); syncIdCell(tr); } });
   inp.addEventListener("change", sync);
   lbl.addEventListener("change", sync);
-  conf.addEventListener("change", sync);
+  // Only manual/new rows render an editable confidence input.
+  if (editableConf) cConf.querySelector("input").addEventListener("change", sync);
   return tr;
 }
 
@@ -1182,7 +1194,13 @@ function rowFromTr(tr) {
     type: tr.children[1].querySelector("select").value,
     value: tr.children[3].querySelector("input").value.trim(),
     labels: tr.children[4].querySelector("input").value.split(",").map(s => s.trim()).filter(Boolean),
-    confidence: parseInt(tr.children[5].querySelector("input").value || "0", 10),
+    confidence: (() => {
+      // Community rows render an inert cell (no input); fall back to the
+      // value captured at render time so a save does not throw.
+      const input = tr.children[5].querySelector("input");
+      if (input) return parseInt(input.value || "0", 10);
+      return parseInt(tr.dataset.confidence || "0", 10);
+    })(),
     checked: tr.children[0].querySelector("input").checked,
   };
 }

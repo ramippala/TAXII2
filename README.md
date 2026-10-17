@@ -1460,10 +1460,21 @@ rather than by guesswork.
   merge. The score counts distinct *sources* from that table; multiple pulses
   of the same feed are scored separately (`otx_multi_pulse`) rather than
   pretending to be independent corroboration.
-- **Still deferred:** the VirusTotal verifier (Phase 2b — quota-bound, so it
-  only checks values whose source-based score is in a decision band, reusing
-  `vt_cache`), RDAP domain age, and Phase 3 weight tuning. `score_indicator`
-  keeps its now-unused `pulse`/`extra` seam for that.
+- **VirusTotal is the independent verifier (Phase 2b).** Corroboration counts
+  *mentions*; VT supplies a *verdict*. Because the free tier is 4 requests/min
+  and 500/day, a background pass (`scoring.vt_verify`) checks only values whose
+  score is in a decision band (`min_score`/`max_score`), **closest to the
+  threshold first** — where a verdict can actually change the outcome. Verified
+  values get a `virustotal` observation, the object is re-scored, and it is
+  moved between `comm_intel` and `quarantine` as needed. A VT *clean* verdict is
+  the one signal that can **lower** a score (`vt_clean` is negative) and rescue
+  a value two feeds reported but no vendor flags. VT is deliberately **not**
+  counted as a corroborating source — it is a verdict, not another sighting.
+  Enable by setting `VIRUSTOTAL_API_KEY` in `.env`; without it the verifier is
+  a no-op. Run a pass on demand: `POST /ui/vt/verify {"limit": N}` (admin).
+- **Still deferred:** RDAP domain age, and Phase 3 weight tuning. The
+  `extra=` argument of `score_from_summary()` is the seam for additional
+  signals.
 
 ## Intel Filter (filtering between server and Vision One)
 

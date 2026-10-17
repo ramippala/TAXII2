@@ -200,10 +200,9 @@ lifecycle:
 # ---------------------------------------------------------------------------
 scoring:
   enabled: true                 # TEST RUN
-  # 50 for this test: Feodo C2 scores 60 and high-confidence ThreatFox 50, so
-  # they are served; mid-confidence ThreatFox (40) is held in quarantine.
-  # Raise to 75 for "corroboration or nothing", lower for a fuller feed.
-  threshold: 50
+  # 75 for this run: the question is whether base=50 + real signals can reach
+  # it. (Feodo C2 = 80 would pass; ThreatFox-high = 70 still would not.)
+  threshold: 75
   quarantine_collection: 'quarantine'
 
   # Pulse metadata / age. A pulse failing these is skipped before its
@@ -218,7 +217,7 @@ scoring:
   # `confidence` is deliberately not used — every automated path writes a
   # constant for it, so it discriminates nothing.)
   weights:
-    base: 30
+    base: 50                    # TEST: raised from 30 to see if 75 is reachable
     pulse_recent_7d: 15         # OTX pulse modified within a week
     pulse_recent_30d: 8         # ...within a month
     pulse_has_adversary: 10
@@ -236,6 +235,23 @@ scoring:
     threatfox_conf_mid: 10      # ... >= 50
     feodo_c2: 30                # in Feodo's curated botnet-C2 list
     urlhaus: 15                 # present in URLhaus
+    # VirusTotal verdict (Phase 2b). The only signal that can LOWER a score —
+    # an independent verification, not another feed "mentioning" the value.
+    vt_malicious_5: 25          # >= 5 vendors flag it malicious
+    vt_malicious_1: 12          # >= 1 vendor
+    vt_suspicious: 6
+    vt_clean: -20               # 0 malicious/suspicious, some harmless
+
+  # VirusTotal verification. The free tier is 4 requests/min and 500/day, so
+  # quota is spent only on values near the decision line — where a verdict can
+  # actually change the outcome — closest to the threshold first. Verified
+  # values are re-scored and moved between served/quarantine as needed.
+  vt_verify:
+    enabled: true
+    min_score: 40              # below this, already clearly quarantined
+    max_score: 85              # above this, already clearly served
+    per_run: 10                # values checked per pass
+    interval: 900              # seconds between background passes
 
 intel_filter:
   # Which source tags are "community" and therefore gated. Manual is never
@@ -387,7 +403,7 @@ sso:
 # ---------------------------------------------------------------------------
 
 otx:
-  enabled: false               # set true to start pulling community intel from OTX
+  enabled: true                # TEST: pull fresh OTX (abuse.ch is off)
   base_url: 'https://otx.alienvault.com'   # OTX API base (no trailing slash)
   # Optional free OTX API key — put the real value in .env (OTX_API_KEY=...)
   # so it never lands in version control. Unset = anonymous read-only browsing
@@ -400,7 +416,7 @@ otx:
   max_pulses: 25               # recently-updated pulses inspected per poll
   min_indicator_count: 1       # skip pulses with fewer indicators than this
   max_indicators_per_pulse: 1000
-  max_indicators_per_poll: 5000
+  max_indicators_per_poll: 150   # small per-poll budget
   object_types: ['ipv4-addr', 'domain-name', 'file-hash']
   # Which collection on THIS server the pulled intel lands in. Defaults to
   # comm_intel (the community leaf). Pointing this at an aggregate is
@@ -416,15 +432,14 @@ otx:
 # gated like any other community intel.
 # ---------------------------------------------------------------------------
 abuse_ch:
-  enabled: true                # TEST RUN: small pull, re-evaluate after
+  enabled: true                # all sources on; small per-poll budget
   # Put the real key in .env (ABUSE_CH_AUTH_KEY=...) so it stays out of VCS.
   auth_key: '${ABUSE_CH_AUTH_KEY:-}'
-  # Feodo first (only a handful of IOCs today) so the global per-poll cap does
-  # not starve it — ThreatFox alone returns ~2,000 and would consume the cap
-  # before the later feeds ran. URLhaus is left off for this small test.
-  feeds: ['feodo', 'threatfox']
+  # All three feeds. The per-poll cap is split evenly across them, so no feed
+  # can starve the others (ThreatFox alone returns ~2,000).
+  feeds: ['threatfox', 'feodo', 'urlhaus']
   poll_interval: 3600          # seconds between background poll cycles
-  max_objects_per_poll: 50     # small test pull
+  max_objects_per_poll: 150    # total per poll, ~50 per feed
   threatfox_days: 1            # ThreatFox look-back window (get_iocs days)
   ingest_collection: comm_intel
 
@@ -438,14 +453,18 @@ abuse_ch:
 # good candidate for the known-legitimate filter above.
 # ---------------------------------------------------------------------------
 virus_total:
-  enabled: false
+  # Phase 2b verifier: no-op until VIRUSTOTAL_API_KEY is set in .env.
+  enabled: true
   # Put the real key in .env (VIRUSTOTAL_API_KEY=...) so it stays out of VCS.
   api_key: '${VIRUSTOTAL_API_KEY:-}'
   base_url: 'https://www.virustotal.com/api/v3'
   cache_ttl: 86400             # reuse a cached verdict for this many seconds
   timeout: 20
   min_interval: 15             # seconds between outbound calls (free tier: 4/min)
-  daily_limit: 500             # outbound calls per rolling 24h (free tier)
+  # Free tier: 4 lookups/min, 500/day, 15.5K/month — and it "must not be used
+  # in business workflows, commercial products or services". Keep a margin
+  # below the daily cap: the persisted vt_cache makes this survive restarts.
+  daily_limit: 400             # outbound calls per rolling 24h (< free 500)
 
 # ---------------------------------------------------------------------------
 # THIRD-PARTY TAXII 2.1 PULLERS — pull objects FROM other TAXII servers.

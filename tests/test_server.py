@@ -48,6 +48,11 @@ from server import (
 )
 import server as _server
 
+# Pin scoring OFF for the suite so poller tests are deterministic regardless of
+# what config.yaml currently says (it is toggled on for live test deployments).
+# TestScoringPipeline turns it on for its own cases.
+_server.SCORING_ENABLED = False
+
 
 def _reset_db():
     """Purge feed rows, API keys and dashboard users between tests."""
@@ -4001,6 +4006,9 @@ class TestScoringPipeline(unittest.TestCase):
         self._saved = (_server.SCORING_ENABLED, _server.SCORING_THRESHOLD,
                        dict(_server.SCORE_WEIGHTS), dict(_server.SCORING_CFG))
         _server.SCORING_ENABLED = True
+        # Pin the built-in weights so these tests do not change meaning when
+        # config.yaml tunes base/threshold for a live experiment.
+        _server.SCORE_WEIGHTS = dict(_server.DEFAULT_SCORE_WEIGHTS)
 
     def tearDown(self):
         (_server.SCORING_ENABLED, _server.SCORING_THRESHOLD,
@@ -4082,6 +4090,93 @@ class TestScoringPipeline(unittest.TestCase):
             None, extra={'vt_detections': 25})
         self.assertEqual(parts['vt_detections'], 25)
         self.assertEqual(score, _server.SCORE_WEIGHTS['base'] + 25)
+
+    # --- VirusTotal verifier (Phase 2b) ------------------------------------
+
+    def test_vt_malicious_verdict_raises_the_score(self):
+        summary = self._summary(sources={'otx'}, vt_checked=True,
+                                vt_malicious=10)
+        score, parts = _server.score_from_summary(summary)
+        self.assertIn('vt_malicious_5', parts)
+        self.assertEqual(score, _server.SCORE_WEIGHTS['base']
+                         + _server.SCORE_WEIGHTS['vt_malicious_5'])
+
+    def test_vt_clean_verdict_lowers_the_score(self):
+        summary = self._summary(sources={'otx', 'threatfox'},
+                                vt_checked=True, vt_malicious=0,
+                                vt_suspicious=0, vt_harmless=40)
+        score, parts = _server.score_from_summary(summary)
+        self.assertIn('vt_clean', parts)
+        self.assertLess(parts['vt_clean'], 0)
+        # It offsets corroboration rather than adding to it.
+        self.assertLess(score, _server.SCORE_WEIGHTS['base']
+                        + _server.SCORE_WEIGHTS['corroborated_2'])
+
+    def test_virustotal_is_not_a_corroborating_source(self):
+        """VT is a verdict, not a feed sighting — it must not add corroboration."""
+        summary = self._summary(sources={'otx', 'virustotal'},
+                                vt_checked=True, vt_harmless=5)
+        _score, parts = _server.score_from_summary(summary)
+        self.assertNotIn('corroborated_2', parts)
+
+    def _fake_vt(self, result, configured=True):
+        class _FakeVT:
+            def __init__(self):
+                self.configured = configured
+                self.calls = []
+
+            def lookup(self, value, kind=None, force=False):
+                self.calls.append(value)
+                return dict(result)
+        return _FakeVT()
+
+    def _seed_row(self, value, score, collection, source='abuse_ch'):
+        obj = {'id': f'ipv4-addr--{value.replace(".", "-")}',
+               'type': 'ipv4-addr',
+               'object': {'ipv4-addr': {'value': value}}}
+        _server.ingest_objects([obj], mode='merge', source=source,
+                               collection=collection,
+                               scores={obj['id']: (score, {'base': 30})})
+        return obj['id']
+
+    def test_vt_verification_rescores_and_promotes(self):
+        _server.SCORING_THRESHOLD = 50
+        sid = self._seed_row('45.13.22.9', 60, 'quarantine')
+        fake = self._fake_vt({'value': '45.13.22.9', 'kind': 'ip',
+                              'malicious': 10, 'suspicious': 0,
+                              'harmless': 0, 'verdict': 'malicious'})
+        self._saved_vt = getattr(_server, 'vt_client', None)
+        _server.vt_client = fake
+        try:
+            report = _server.vt_verify_pass(limit=5)
+        finally:
+            _server.vt_client = self._saved_vt
+
+        self.assertEqual(report['checked'], 1)
+        self.assertEqual(report['moved_served'], 1)
+        self.assertEqual(fake.calls, ['45.13.22.9'])
+        session = _server.create_session()
+        try:
+            row = session.query(_server.STIXObject).filter_by(stix_id=sid).one()
+            self.assertEqual(row.collection_id, 'comm_intel')
+            self.assertGreaterEqual(row.score, _server.SCORING_THRESHOLD)
+            obs = session.query(_server.IocObservation).filter_by(
+                source='virustotal', value='45.13.22.9').first()
+            self.assertIsNotNone(obs)
+        finally:
+            session.close()
+
+    def test_vt_verification_is_a_noop_when_unconfigured(self):
+        self._seed_row('91.214.124.7', 60, 'quarantine')
+        fake = self._fake_vt({'malicious': 1}, configured=False)
+        saved = getattr(_server, 'vt_client', None)
+        _server.vt_client = fake
+        try:
+            report = _server.vt_verify_pass(limit=5)
+        finally:
+            _server.vt_client = saved
+        self.assertFalse(report['enabled'])
+        self.assertEqual(fake.calls, [])
 
     # --- routing -----------------------------------------------------------
 

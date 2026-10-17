@@ -2627,32 +2627,46 @@ def ingest_objects(stix_objects: List[Dict[str, Any]], mode: str = 'replace',
         session.close()
 
 
-def purge_all(collection: Optional[str] = None) -> int:
+def purge_all(collection: Optional[str] = None,
+              source: Optional[str] = None) -> int:
     """Purge threat intelligence data (memory + DB).
 
-    With ``collection=None`` wipes EVERYTHING (all collections, all
-    sources). With a collection id, wipes only that collection's objects —
-    and for an *aggregate*, the union of its members. The aggregate is the
-    primary collection (what the dashboard's "Purge all" targets by default),
-    so rejecting it here would silently turn that button into a no-op;
-    unlike ``collection=None`` it still spares non-member collections.
+    ``collection`` limits by collection — and for an *aggregate*, the union of
+    its members. ``source`` limits by provenance (``'otx'``, ``'abuse_ch'``,
+    ``'manual'``, ...). With neither, wipes EVERYTHING.
+
+    Purging a source also deletes that source's ``ioc_observations``: sightings
+    are the evidence the score counts, so leaving them behind would keep
+    corroborating objects whose data was just removed.
+
     Returns the number of rows purged.
     """
     ids = _collection_ids_for(collection)
     session = create_session()
     try:
         with memory_lock:
+            q = session.query(STIXObject)
             if ids:
-                rows = session.query(STIXObject).filter(
-                    STIXObject.collection_id.in_(ids)).all()
-                for s in [s for s in memory_store
-                          if memory_store[s].collection in ids]:
-                    memory_store.pop(s, None)
-            else:
-                rows = session.query(STIXObject).all()
-                memory_store.clear()
-            for r in rows:
-                session.delete(r)
+                q = q.filter(STIXObject.collection_id.in_(ids))
+            if source:
+                q = q.filter(STIXObject.source == source)
+            rows = q.all()
+            for row in rows:
+                session.delete(row)
+            # Mirror the deletion in the cache.
+            for stix_id in list(memory_store):
+                obj = memory_store[stix_id]
+                if ids and obj.collection not in ids:
+                    continue
+                if source and obj.source != source:
+                    continue
+                memory_store.pop(stix_id, None)
+            if source:
+                session.query(IocObservation).filter(
+                    IocObservation.source == source).delete()
+            elif not ids:
+                # Full wipe: the observations describe nothing any more.
+                session.query(IocObservation).delete()
             session.commit()
             return len(rows)
     finally:
@@ -3379,6 +3393,13 @@ DEFAULT_SCORE_WEIGHTS: Dict[str, int] = {
     'threatfox_conf_mid': 10,   # ... >= 50
     'feodo_c2': 30,             # present in Feodo's curated botnet-C2 list
     'urlhaus': 15,              # present in URLhaus
+    # VirusTotal verdict (Phase 2b verifier). Negative when VT says clean —
+    # this is the only signal that can LOWER a score, and it is an independent
+    # verification rather than another feed "mentioning" the value.
+    'vt_malicious_5': 25,       # >= 5 vendors flag it malicious
+    'vt_malicious_1': 12,       # >= 1 vendor
+    'vt_suspicious': 6,         # suspicious but no malicious verdict
+    'vt_clean': -20,            # no malicious/suspicious, some harmless
 }
 SCORE_WEIGHTS: Dict[str, int] = {
     **DEFAULT_SCORE_WEIGHTS,
@@ -3546,7 +3567,8 @@ def _new_obs_summary() -> Dict[str, Any]:
     return {'sources': set(), 'otx_pulses': set(), 'otx_adversary': False,
             'otx_tags': False, 'otx_latest': None, 'otx_indicator_count': 0,
             'threatfox_conf': 0, 'feodo': False, 'urlhaus': False,
-            'latest': None}
+            'vt_checked': False, 'vt_malicious': 0, 'vt_suspicious': 0,
+            'vt_harmless': 0, 'latest': None}
 
 
 def _merge_observation(summary: Dict[str, Dict[str, Any]],
@@ -3590,6 +3612,17 @@ def _merge_observation(summary: Dict[str, Dict[str, Any]],
         entry['feodo'] = True
     elif source == 'urlhaus':
         entry['urlhaus'] = True
+    elif source == 'virustotal':
+        entry['vt_checked'] = True
+        try:
+            entry['vt_malicious'] = max(int(entry.get('vt_malicious') or 0),
+                                        int(detail.get('malicious') or 0))
+            entry['vt_suspicious'] = max(int(entry.get('vt_suspicious') or 0),
+                                         int(detail.get('suspicious') or 0))
+            entry['vt_harmless'] = max(int(entry.get('vt_harmless') or 0),
+                                       int(detail.get('harmless') or 0))
+        except (TypeError, ValueError):
+            pass
     seen = obs.get('last_seen') or obs.get('observed_at')
     if isinstance(seen, datetime) and (entry['latest'] is None or seen > entry['latest']):
         entry['latest'] = seen
@@ -3641,7 +3674,10 @@ def score_from_summary(entry: Optional[Dict[str, Any]],
 
     add('base', weights['base'])
     entry = entry or _new_obs_summary()
-    sources = entry.get('sources') or set()
+    # VirusTotal is a VERDICT, not a feed sighting: counting it as a
+    # corroborating source would double-count it (it already earns the vt_*
+    # components below) and would let a clean verdict add corroboration.
+    sources = {s for s in (entry.get('sources') or set()) if s != 'virustotal'}
     if len(sources) >= 4:
         add('corroborated_4', weights['corroborated_4'])
     elif len(sources) == 3:
@@ -3675,10 +3711,214 @@ def score_from_summary(entry: Optional[Dict[str, Any]],
         add('feodo_c2', weights['feodo_c2'])
     if entry.get('urlhaus'):
         add('urlhaus', weights['urlhaus'])
+    # VirusTotal verdict — the independent verification layer. A clean result
+    # is the one signal allowed to subtract, which is what lets VT rescue a
+    # value that two feeds reported but no vendor flags.
+    if entry.get('vt_checked'):
+        malicious = int(entry.get('vt_malicious') or 0)
+        suspicious = int(entry.get('vt_suspicious') or 0)
+        harmless = int(entry.get('vt_harmless') or 0)
+        if malicious >= 5:
+            add('vt_malicious_5', weights['vt_malicious_5'])
+        elif malicious >= 1:
+            add('vt_malicious_1', weights['vt_malicious_1'])
+        elif suspicious:
+            add('vt_suspicious', weights['vt_suspicious'])
+        elif harmless:
+            add('vt_clean', weights['vt_clean'])
     for key, points in (extra or {}).items():
         add(key, int(points))
 
     return max(0, min(100, sum(parts.values()))), parts
+
+
+# --- VirusTotal verifier (Phase 2b) ----------------------------------------
+# Corroboration counts *mentions*; VT supplies an independent *verdict*. The
+# pass below verifies only values already near the decision line — where a VT
+# result can change the outcome — so the free tier (4/min, 500/day) is spent
+# where it matters rather than on the whole feed.
+
+def _record_vt_observation(value: str, result: Dict[str, Any]) -> None:
+    """Persist a VT verdict as an observation so it feeds the next score."""
+    if not isinstance(result, dict) or result.get('error'):
+        return
+    v = _normalise_obs_value(value)
+    if not v:
+        return
+    try:
+        record_observations([{
+            'value': v,
+            'object_type': str(result.get('kind') or 'unknown'),
+            'source': 'virustotal',
+            'observation_key': 'vt:' + v,
+            'raw_confidence': None,
+            'detail': {
+                'malicious': int(result.get('malicious') or 0),
+                'suspicious': int(result.get('suspicious') or 0),
+                'harmless': int(result.get('harmless') or 0),
+                'verdict': result.get('verdict'),
+                'not_found': bool(result.get('not_found')),
+            },
+        }])
+    except Exception as exc:      # never let analytics break a lookup
+        logger.error("Could not record VirusTotal observation: %s", exc)
+
+
+def _reroute_scored_row(session, row: 'STIXObject', score: int,
+                        breakdown: Dict[str, int]) -> Tuple[bool, Optional[str]]:
+    """Persist a recomputed score and move the row across the serving line.
+
+    Community rows live in either the served community collection or
+    quarantine; crossing the threshold moves them. Manual rows are never moved
+    (they are a human's explicit input).
+    """
+    target: Optional[str] = row.collection_id
+    if (row.source or 'manual') != 'manual':
+        target = (DEFAULT_COMMUNITY_COLLECTION_ID
+                  if score >= SCORING_THRESHOLD
+                  else SCORING_QUARANTINE_COLLECTION)
+    row.score = int(score)
+    row.score_breakdown = json.dumps(breakdown, sort_keys=True)
+    row.scored_at = datetime.utcnow()
+    moved = bool(target and row.collection_id != target)
+    if moved:
+        row.collection_id = target
+    with memory_lock:
+        obj = memory_store.get(row.stix_id)
+        if obj is not None:
+            obj.score = int(score)
+            obj.score_breakdown = row.score_breakdown
+            if moved:
+                obj.collection = target
+    return moved, target
+
+
+def vt_verify_pass(limit: Optional[int] = None) -> Dict[str, Any]:
+    """Verify borderline objects with VirusTotal, re-score and re-route them.
+
+    Safe no-op unless VT is configured and scoring is enabled. Bounded per run
+    and by the client's own daily/interval limits; a rate-limit response ends
+    the pass rather than retrying a doomed sequence.
+    """
+    cfg = (SCORING_CFG.get('vt_verify') or {})
+    report: Dict[str, Any] = {
+        'enabled': bool(getattr(vt_client, 'configured', False)
+                        and SCORING_ENABLED and cfg.get('enabled', True)),
+        'checked': 0, 'moved_served': 0, 'moved_quarantine': 0,
+        'skipped_verified': 0, 'errors': 0, 'rate_limited': False,
+    }
+    if not report['enabled']:
+        return report
+    band_min = int(cfg.get('min_score', 40))
+    band_max = int(cfg.get('max_score', 85))
+    per_run = int(limit if limit and limit > 0 else cfg.get('per_run', 10))
+    session = create_session()
+    try:
+        # Closest to the threshold first: that is where a verdict changes the
+        # decision, so it is the most informative use of a scarce API call.
+        candidates = (session.query(STIXObject)
+                      .filter(STIXObject.source.isnot(None),
+                              STIXObject.source != 'manual',
+                              STIXObject.score.isnot(None),
+                              STIXObject.score >= band_min,
+                              STIXObject.score <= band_max)
+                      .order_by(func.abs(STIXObject.score - SCORING_THRESHOLD))
+                      .limit(max(per_run * 4, per_run)).all())
+        values: List[str] = []
+        for row in candidates:
+            v = _normalise_obs_value(row.ip_address or row.domain
+                                     or row.hash_value or row.value or '')
+            if v and v not in values:
+                values.append(v)
+        verified = set()
+        for start in range(0, len(values), 500):
+            chunk = values[start:start + 500]
+            for obs in session.query(IocObservation).filter(
+                    IocObservation.source == 'virustotal',
+                    IocObservation.value.in_(chunk)):
+                verified.add(obs.value)
+        checked = 0
+        for row in candidates:
+            if checked >= per_run:
+                break
+            v = _normalise_obs_value(row.ip_address or row.domain
+                                     or row.hash_value or row.value or '')
+            if not v:
+                continue
+            if v in verified:
+                report['skipped_verified'] += 1
+                continue
+            result = vt_client.lookup(v)
+            if result.get('error') and 'rate limit' in str(
+                    result.get('error') or '').lower():
+                # The free tier allows 4/min, so a burst of per_run lookups is
+                # always rate-limited. Wait out the window and retry rather
+                # than ending the pass after a single value.
+                wait = result.get('retry_after')
+                try:
+                    wait = float(wait) if wait is not None else vt_client.min_interval
+                except (TypeError, ValueError):
+                    wait = vt_client.min_interval
+                time.sleep(max(0.0, min(wait + 0.25, 60.0)))
+                result = vt_client.lookup(v)
+            if result.get('error'):
+                report['errors'] += 1
+                err = str(result.get('error') or '').lower()
+                if 'daily limit' in err:
+                    report['rate_limited'] = True
+                    break
+                continue
+            _record_vt_observation(v, result)
+            verified.add(v)
+            checked += 1
+            report['checked'] += 1
+            summary = observation_summaries([v]).get(v)
+            score, breakdown = score_from_summary(summary)
+            moved, target = _reroute_scored_row(session, row, score, breakdown)
+            if moved:
+                if target == SCORING_QUARANTINE_COLLECTION:
+                    report['moved_quarantine'] += 1
+                else:
+                    report['moved_served'] += 1
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        logger.error("VirusTotal verification failed: %s", exc)
+        report['errors'] += 1
+    finally:
+        session.close()
+    if report['checked']:
+        logger.info(
+            "VirusTotal verifier: checked=%d, moved_to_served=%d, "
+            "moved_to_quarantine=%d, errors=%d",
+            report['checked'], report['moved_served'],
+            report['moved_quarantine'], report['errors'])
+    return report
+
+
+def start_vt_verifier() -> None:
+    """Start the background VT verification thread (no-op if not configured)."""
+    cfg = (SCORING_CFG.get('vt_verify') or {})
+    if not cfg.get('enabled', True) or not SCORING_ENABLED:
+        return
+    if not getattr(vt_client, 'configured', False):
+        logger.info(
+            "VirusTotal verifier idle — set virus_total.enabled and "
+            "VIRUSTOTAL_API_KEY to activate independent verification")
+        return
+    interval = int(cfg.get('interval', 900) or 900)
+
+    def _loop() -> None:
+        while True:
+            try:
+                vt_verify_pass()
+            except Exception:      # pragma: no cover - loop guard
+                pass
+            time.sleep(interval)
+
+    threading.Thread(target=_loop, name='VtVerifier', daemon=True).start()
+    logger.info("VirusTotal verifier started (interval=%ss, per_run=%s)",
+                interval, cfg.get('per_run', 10))
 
 
 def _indicator_value(descriptor: Dict[str, Any]) -> Tuple[str, str]:
@@ -4927,26 +5167,41 @@ def purge_data():
     cid, err = _collection_param(request.args.get('collection'))
     if err:
         return jsonify({'error': err}), 400
+    # Optional provenance filter, e.g. ?source=otx to drop one feed's data
+    # while keeping the rest. Combined with ?collection= if both are given.
+    source = (request.args.get('source') or '').strip() or None
     if not _write_allowed():
         # Writes (ingest, purge, delete, revoke, community pull) are the
         # dashboard's job — TAXII credentials are read-only.
         return jsonify({'error': 'Unauthorized'}), 401
     try:
-        purged = purge_all(collection=cid)
+        purged = purge_all(collection=cid, source=source)
     except Exception as exc:
         logger.error("Purge error: %s", exc)
         return jsonify({'error': 'could not purge the feed'}), 500
+    if not cid and not source:
+        scope_text = 'ALL collections'
+        message = 'All data purged successfully'
+    elif cid and not source:
+        scope_text = f"collection '{cid}'"
+        message = f"Collection '{cid}' purged successfully"
+    elif source and not cid:
+        scope_text = f"source '{source}'"
+        message = f"Source '{source}' purged successfully"
+    else:
+        scope_text = f"collection '{cid}' + source '{source}'"
+        message = (f"Collection '{cid}' and source '{source}' "
+                   f"purged successfully")
     logger.info("Purge via /feed/purge: %d object(s) from %s by %s",
-                purged, f"'{cid}'" if cid else 'ALL collections', _actor())
-    _audit('feed.purge', target=cid or 'ALL', collection=cid, count=purged,
-           detail='all collections' if not cid else f"collection '{cid}'")
+                purged, scope_text, _actor())
+    _audit('feed.purge', target=cid or source or 'ALL', collection=cid,
+           count=purged, detail=scope_text)
+    body = {'purged': purged, 'message': message}
     if cid:
-        return jsonify({
-            'message': f"Collection '{cid}' purged successfully",
-            'collection': cid,
-            'purged': purged,
-        }), 200
-    return jsonify({'message': 'All data purged successfully', 'purged': purged}), 200
+        body['collection'] = cid
+    if source:
+        body['source'] = source
+    return jsonify(body), 200
 
 
 @app.route('/auth', methods=['POST'])
@@ -5828,6 +6083,31 @@ def ui_vt_lookup():
     logger.info("VirusTotal lookup %s (%s) by %s: %s", result.get('value'),
                 result.get('kind'), _actor(), result.get('verdict'))
     return jsonify(result), 200
+
+
+@app.route('/ui/vt/verify', methods=['POST'])
+def ui_vt_verify():
+    """POST /ui/vt/verify — run a bounded VT verification pass now (admin).
+
+    Verifies values near the decision threshold, re-scores them and moves any
+    that cross the line between served and quarantine. Bounded by
+    ``scoring.vt_verify.per_run`` unless an explicit ``limit`` is passed.
+    """
+    if not _admin_allowed():
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json(silent=True) or {}
+    raw = data.get('limit')
+    limit = None
+    if raw not in (None, ''):
+        try:
+            limit = int(raw)
+            if limit <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return jsonify({'error': f'limit must be a positive integer, got {raw!r}'}), 400
+    report = vt_verify_pass(limit=limit)
+    _audit('vt.verify', count=report.get('checked'), detail=str(report))
+    return jsonify(report), 200
 
 
 @app.route('/community/pullers', methods=['GET'])
@@ -7403,6 +7683,10 @@ class AbuseChPuller:
             'urlhaus': self.fetch_urlhaus,
         }
         candidates: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        # Split the per-poll budget across feeds. A single global cap lets the
+        # first feed (ThreatFox returns ~2k) consume it entirely and starve the
+        # others, so every enabled feed gets a fair share instead.
+        feed_share = max(1, cap // max(1, len(self.feeds)))
         for feed in self.feeds:
             if len(candidates) >= cap:
                 break
@@ -7415,6 +7699,7 @@ class AbuseChPuller:
                 logger.error("abuse.ch feed '%s' failed: %s", feed, exc)
                 items = []
             logger.info("abuse.ch feed '%s' returned %s IOC(s)", feed, len(items))
+            taken = 0
             for item in items:
                 # The feed name IS the source for corroboration: ThreatFox,
                 # Feodo and URLhaus are independent sightings of the same
@@ -7426,7 +7711,8 @@ class AbuseChPuller:
                     'raw_confidence': item.get('confidence'),
                     'pulse': None,
                 }))
-                if len(candidates) >= cap:
+                taken += 1
+                if taken >= feed_share or len(candidates) >= cap:
                     break
 
         if not candidates:
@@ -7640,20 +7926,41 @@ class VirusTotalClient:
 
     # --- rate limiting -----------------------------------------------------
 
+    def _persisted_calls_24h(self) -> int:
+        """VT lookups recorded in the cache during the last 24h.
+
+        The in-memory ``_calls`` list resets on restart, which would let a
+        redeploy spend the daily quota again. Every real VT request writes a
+        ``vt_cache`` row (cache hits do not), so counting those with a recent
+        ``fetched`` timestamp makes the daily cap survive restarts.
+        """
+        cutoff = datetime.utcnow() - timedelta(days=1)
+        session = create_session()
+        try:
+            return session.query(VtCache).filter(
+                VtCache.fetched >= cutoff).count()
+        except Exception:            # never let quota bookkeeping fail a call
+            return 0
+        finally:
+            session.close()
+
     def quota_used(self) -> int:
-        """Outbound calls in the last rolling 24h (resets on restart)."""
+        """Outbound calls in the rolling 24h (persisted + this process)."""
         cutoff = datetime.utcnow() - timedelta(days=1)
         with self._lock:
             self._calls = [t for t in self._calls if t >= cutoff]
-            return len(self._calls)
+            recent = len(self._calls)
+        return max(recent, self._persisted_calls_24h())
 
     def _rate_ok(self) -> Tuple[bool, Optional[float]]:
         """(allowed, wait_seconds). Records the call when allowed."""
         now = datetime.utcnow()
         cutoff = now - timedelta(days=1)
+        # Persisted count is read outside the lock (it touches the DB).
+        persisted = self._persisted_calls_24h()
         with self._lock:
             self._calls = [t for t in self._calls if t >= cutoff]
-            if len(self._calls) >= self.daily_limit:
+            if max(len(self._calls), persisted) >= self.daily_limit:
                 return False, None
             if self._calls:
                 elapsed = (now - self._calls[-1]).total_seconds()
@@ -7775,7 +8082,8 @@ class VirusTotalClient:
                        f'({self.daily_limit} per 24h)')
             else:
                 msg = f'VirusTotal rate limit — try again in {wait}s'
-            return {'error': msg, 'value': raw, 'kind': vt_kind}
+            return {'error': msg, 'value': raw, 'kind': vt_kind,
+                    'retry_after': wait}
 
         url = self._endpoint(vt_kind, raw)
         status, body = self._http_get(url)
@@ -7912,6 +8220,10 @@ def start_background_jobs() -> None:
         abuse_ch_poller.start()
     if self_check_poller.enabled and self_check_poller.base_url:
         self_check_poller.start()
+
+    # Independent verification: spends the scarce VT quota only on values near
+    # the decision threshold. No-op unless virus_total is configured.
+    start_vt_verifier()
 
 
 def _serve(host: str, port: int, debug: bool, server_cfg: Dict[str, Any]) -> None:
