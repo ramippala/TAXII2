@@ -4441,6 +4441,38 @@ class TestEligibleEndpoint(unittest.TestCase):
         self.assertIsNone(by_value['45.13.22.9']['vt'])
         self.assertEqual(body['vt_verified_count'], 1)
 
+    def test_below_buckets_track_the_threshold(self):
+        # One manual row (intentionally unscored), one well above both
+        # thresholds, three below 75, and one (78) that is eligible at 75 but
+        # falls below when the threshold is raised to 80.
+        self._ingest('45.13.22.9', 'manual', 'gt_intel')
+        self._ingest('91.214.124.7', 'otx', 'comm_intel', score=90)
+        self._ingest('185.220.101.1', 'otx', 'comm_intel', score=40)
+        self._ingest('185.220.101.2', 'otx', 'comm_intel', score=70)
+        self._ingest('185.220.101.3', 'otx', 'comm_intel', score=74)
+        self._ingest('185.220.101.4', 'otx', 'comm_intel', score=78)
+
+        body = self.client.get('/ui/eligible', headers=self.auth).get_json()
+        self.assertEqual(body['threshold'], 75)
+        self.assertEqual(body['below_threshold_count'], 3)   # 40, 70, 74
+        self.assertEqual(body['unscored_count'], 1)          # manual row
+        self.assertEqual([b['label'] for b in body['below_buckets']],
+                         ['0–14', '15–29', '30–44', '45–59', '60–74'])
+        counts = {b['label']: b['count'] for b in body['below_buckets']}
+        self.assertEqual(counts['30–44'], 1)                 # 40
+        self.assertEqual(counts['60–74'], 2)                 # 70, 74
+
+        # Raise the threshold: 78 becomes ineligible and the bands move to
+        # below 80 (the chart must follow scoring.threshold dynamically).
+        _server.SCORING_THRESHOLD = 80
+        body = self.client.get('/ui/eligible', headers=self.auth).get_json()
+        self.assertEqual(body['threshold'], 80)
+        self.assertEqual(body['below_threshold_count'], 4)   # + 78
+        self.assertEqual(body['below_buckets'][-1]['label'], '64–79')
+        counts = {b['label']: b['count'] for b in body['below_buckets']}
+        self.assertEqual(counts['64–79'], 3)                 # 70, 74, 78
+        self.assertNotIn('10.0.0.4', {o['value'] for o in body['objects']})
+
     def test_eligible_requires_auth(self):
         self.assertEqual(self.client.get('/ui/eligible').status_code, 401)
 

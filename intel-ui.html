@@ -439,6 +439,13 @@
     </div>
 
     <div class="panel">
+      <h2>Below threshold <span style="text-transform:none;letter-spacing:0;font-weight:400"
+          class="mono" id="eligBelowThreshold"></span></h2>
+      <div class="dist" id="eligBelowDist"></div>
+      <div class="hint" id="eligBelowCaption" style="margin-top:8px"></div>
+    </div>
+
+    <div class="panel">
       <div class="elig-toolbar">
         <input type="search" id="eligSearch" placeholder="Search value, label, type or source…" autocomplete="off">
         <select id="eligSource"><option value="">All sources</option></select>
@@ -2324,6 +2331,9 @@ let eligThreshold = 75;
 let eligCounts = { served: 0, below: 0, withheld: 0, revoked: 0, vtVerified: 0 };
 let eligPage = 1;
 let eligPageSize = 25;
+let eligBelowBuckets = [];   // server-computed bands below the current threshold
+let eligBelowCount = 0;
+let eligUnscored = 0;
 
 async function loadEligible() {
   try {
@@ -2332,8 +2342,11 @@ async function loadEligible() {
       eligData = [];
       $("eligKpis").innerHTML = "";
       $("eligDist").innerHTML = "";
+      $("eligBelowDist").innerHTML = "";
       $("eligDistCaption").textContent =
         `Could not load eligible feed (HTTP ${r.status}).`;
+      $("eligBelowCaption").textContent =
+        `Could not load below-threshold data (HTTP ${r.status}).`;
       renderEligibleTable();
       return;
     }
@@ -2347,14 +2360,21 @@ async function loadEligible() {
       revoked: b.revoked_count || 0,
       vtVerified: b.vt_verified_count || 0,
     };
+    eligBelowBuckets = b.below_buckets || [];
+    eligBelowCount = b.below_threshold_count || 0;
+    eligUnscored = b.unscored_count || 0;
     $("eligDistThreshold").textContent = `· threshold ${eligThreshold}`;
     renderEligKpis();
+    renderEligBelowDist();
     populateEligSources();
     eligPage = 1;
     renderEligibleTable();
   } catch (e) {
     eligData = [];
     $("eligDistCaption").textContent = "Could not load eligible feed: " + e.message;
+    $("eligBelowDist").innerHTML = "";
+    $("eligBelowCaption").textContent =
+      "Could not load below-threshold data: " + e.message;
     renderEligibleTable();
   }
 }
@@ -2366,7 +2386,7 @@ function renderEligKpis() {
     { cls: "neutral", ic: "⊞", val: eligCounts.served, lbl: "in served collections",
       title: "Everything TAXII would deliver, including below-threshold legacy rows" },
     { cls: "warn",    ic: "!", val: eligCounts.below, lbl: "below threshold",
-      title: "In a served collection but scored under older settings" },
+      title: `Scored below the current threshold (${eligThreshold}) — still served by TAXII, not eligible under today's policy` },
     { cls: "serious", ic: "⊘", val: eligCounts.withheld, lbl: "withheld by filter",
       title: "Known-legitimate / freshness / blocklist" },
     { cls: "crit",    ic: "×", val: eligCounts.revoked, lbl: "revoked",
@@ -2575,10 +2595,46 @@ function renderEligDist(rows) {
     root.appendChild(col);
   });
   const manualNote = unscored
-    ? ` ${unscored} manual/unscored object(s) not plotted.` : "";
+    ? ` ${unscored} unscored object(s) not plotted.` : "";
   $("eligDistCaption").textContent =
     "Scored eligible objects in the current view. Colour is an ordinal score "
     + "ramp; the number on each bar is the count." + manualNote;
+}
+
+// Below-threshold chart. Bands/counts are computed by the server from the
+// CURRENT scoring.threshold, so the labels move automatically (75 -> 80).
+// One-hue warm ordinal ramp, validated against the dashboard's dark surface.
+const ELIG_BELOW_RAMP = ["#f8d8bf", "#f2b98f", "#eb9a60", "#d95926", "#a63f17"];
+
+function renderEligBelowDist() {
+  const root = $("eligBelowDist");
+  const cap = $("eligBelowCaption");
+  root.innerHTML = "";
+  $("eligBelowThreshold").textContent = `· below ${eligThreshold}`;
+  if (!eligBelowBuckets.length || !eligBelowCount) {
+    cap.textContent = `No scored objects are below the current threshold `
+      + `(${eligThreshold}).`;
+    return;
+  }
+  const max = Math.max(1, ...eligBelowBuckets.map(b => b.count));
+  eligBelowBuckets.forEach((b, i) => {
+    const col = document.createElement("div"); col.className = "col";
+    const n = document.createElement("div"); n.className = "n";
+    n.textContent = String(b.count);
+    const bar = document.createElement("div"); bar.className = "bar";
+    bar.style.height = Math.round((b.count / max) * 64) + "px";
+    bar.style.background = ELIG_BELOW_RAMP[Math.min(i, ELIG_BELOW_RAMP.length - 1)];
+    bar.title = `${b.label}: ${b.count} object(s) — score below ${eligThreshold}`;
+    const label = document.createElement("div"); label.className = "cap";
+    label.textContent = b.label;
+    col.append(n, bar, label);
+    root.appendChild(col);
+  });
+  const note = eligUnscored
+    ? ` ${eligUnscored} unscored object(s) not plotted.` : "";
+  cap.textContent = `${eligBelowCount} scored object(s) are in a served `
+    + `collection but below the current threshold (${eligThreshold}). `
+    + `Bands update automatically when scoring.threshold changes.` + note;
 }
 
 function setEligPage(p) { eligPage = p; renderEligibleTable(); }

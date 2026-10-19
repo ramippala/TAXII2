@@ -412,20 +412,45 @@ sso:
 # ---------------------------------------------------------------------------
 
 otx:
-  enabled: true                # TEST: pull fresh OTX (abuse.ch is off)
+  enabled: true
   base_url: 'https://otx.alienvault.com'   # OTX API base (no trailing slash)
   # Optional free OTX API key — put the real value in .env (OTX_API_KEY=...)
   # so it never lands in version control. Unset = anonymous read-only browsing
   # (works, but stricter rate limits).
   api_key: '${OTX_API_KEY:-}'
-  poll_interval: 86400         # seconds between background poll cycles
-                               # (86400 = once a day; 3600 = hourly; 300 = 5 min)
-                               # NB: the first poll runs at startup, then every
-                               # interval — a restart triggers one early poll.
-  max_pulses: 25               # recently-updated pulses inspected per poll
+  poll_interval: 900           # 15 min (the first poll runs at startup; a
+                               # restart triggers one early poll)
+  max_pulses: 50               # recent pulses per poll (this OTX endpoint
+                               # caps at 100 regardless of a higher value)
   min_indicator_count: 1       # skip pulses with fewer indicators than this
-  max_indicators_per_pulse: 1000
-  max_indicators_per_poll: 150   # small per-poll budget
+  max_indicators_per_pulse: 5000
+  max_indicators_per_poll: 2000  # recent-feed budget; watched pulses are
+                                 # exempt so they can never be starved
+  # Targeted watchlist: pulse IDs re-checked every poll regardless of age.
+  # OTX's "most recently modified" list is dominated by high-volume honeypot
+  # feeds, so vendor advisories and campaign dumps fall out of it within hours
+  # to days. Seeded with the pulses behind the Oct-2026 C2 set
+  # (EbeeSep2026, ESAF-SOC advisory, Cisco FMC/Qilin, ScreenConnect,
+  # IOC BLOCKING, botnet list). Watched pulses are fetched before the recent
+  # feed and re-fetched only when their `modified` timestamp changes.
+  watch_pulse_ids:
+    - '6aa1fecc9112809bc60fd48b'   # EbeeSep2026 Pt2
+    - '6aa1fe34f0d93bdfc184ee3a'   # EbeeSep2026 Pt1
+    - '6a9fa47d4ae8a2093d45d02c'   # TI Advisory No-ESAF-SOC-TI-2026-786
+    - '6aa7b44b82031007eb198dd3'   # asvdj... campaign
+    - '6aa9c9e30457be3b4ef2be90'   # asdfghj
+    - '6a998a76dc0d91eac0c4dcee'   # ScreenConnect (CyberHunter_NL)
+    - '6a9a36826203fe7d846ab8ed'   # IOC - Rogue ScreenConnect
+    - '6a9eb45f42544c9e25b28e1e'   # Rogue ScreenConnect clients
+    - '6a992d01f9c5b93e1a1c58b6'   # ScreenConnect (AlienVault)
+    - '6aa1c7ebed78db36621e8eee'   # Cisco FMC exploitation
+    - '6aa2b71500f30e67b4ecce72'   # Cisco firewall root access
+    - '6aa4fafcf49c34d3e48e4a8b'   # Cisco FMC web shells / Qilin
+    - '6aa20bc5170b25fcecc7d7cd'   # IOC Cisco FMC
+    - '6aa2116aed72b4e58962bc3b'   # Cisco FMC (aziel415)
+    - '6aadcf6f34d245c85878c0f3'   # IOC BLOCKING
+    - '6ad593e6da124de9b5ae9afb'   # Malware Filter - Botnet List 18-10-2026
+    - '6aaecaf714d79111d40ea180'   # ShadowBrieferFeed KREMLIN
   object_types: ['ipv4-addr', 'domain-name', 'file-hash']
   # Which collection on THIS server the pulled intel lands in. Defaults to
   # comm_intel (the community leaf). Pointing this at an aggregate is
@@ -441,15 +466,15 @@ otx:
 # gated like any other community intel.
 # ---------------------------------------------------------------------------
 abuse_ch:
-  enabled: true                # all sources on; small per-poll budget
+  enabled: true
   # Put the real key in .env (ABUSE_CH_AUTH_KEY=...) so it stays out of VCS.
   auth_key: '${ABUSE_CH_AUTH_KEY:-}'
   # All three feeds. The per-poll cap is split evenly across them, so no feed
   # can starve the others (ThreatFox alone returns ~2,000).
   feeds: ['threatfox', 'feodo', 'urlhaus']
-  poll_interval: 3600          # seconds between background poll cycles
-  max_objects_per_poll: 150    # total per poll, ~50 per feed
-  threatfox_days: 1            # ThreatFox look-back window (get_iocs days)
+  poll_interval: 900           # 15 min (was 3600) — lower C2 detection latency
+  max_objects_per_poll: 500    # total per poll (~166 per feed; was 150 total)
+  threatfox_days: 7            # ThreatFox look-back window (was 1 day)
   ingest_collection: comm_intel
 
 # ---------------------------------------------------------------------------

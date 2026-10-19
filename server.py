@@ -5461,6 +5461,34 @@ def ui_collections():
     }), 200
 
 
+def _below_threshold_buckets(threshold: int, scores: List[int]) -> List[Dict[str, Any]]:
+    """Equal-width score bands covering ``[0, threshold-1]``.
+
+    Labels are derived from the CURRENT threshold, so the dashboard's
+    below-threshold chart follows ``scoring.threshold`` automatically: change
+    75 -> 80 and the bands (and the rows counted) move to below 80.
+    """
+    try:
+        t = int(threshold)
+    except (TypeError, ValueError):
+        t = 75
+    if t <= 0:
+        return []
+    width = max(1, -(-t // 5))          # ceil(t/5) -> five bands (fewer if tiny)
+    buckets: List[Dict[str, Any]] = []
+    lo = 0
+    while lo < t:
+        hi = min(lo + width - 1, t - 1)
+        buckets.append({
+            'lo': lo,
+            'hi': hi,
+            'label': f'{lo}–{hi}',
+            'count': sum(1 for s in scores if lo <= s <= hi),
+        })
+        lo = hi + 1
+    return buckets
+
+
 @app.route('/ui/eligible', methods=['GET'])
 def ui_eligible():
     """GET /ui/eligible — what the TAXII feed will actually deliver.
@@ -5493,6 +5521,7 @@ def ui_eligible():
         rows = rows[:_MAX_OBJECTS_JSON]
         eligible: List[Tuple[Any, Any, str]] = []
         withheld = below = revoked = served_total = 0
+        below_scores: List[int] = []
         for row in rows:
             obj = _row_to_threat_intel(row)
             verdict = gate_verdict(obj, row)
@@ -5509,6 +5538,7 @@ def ui_eligible():
             manual = (row.source or 'manual') == 'manual'
             if not manual and row.score is not None and row.score < SCORING_THRESHOLD:
                 below += 1
+                below_scores.append(int(row.score))
                 continue
             value = (obj.ip_address or obj.domain or obj.hash_value
                      or obj.value or obj.name
@@ -5564,6 +5594,11 @@ def ui_eligible():
         'served_count': served_total,
         'withheld_count': withheld,
         'below_threshold_count': below,
+        # Score bands below the CURRENT threshold, for the dashboard's
+        # dynamic below-threshold chart (labels move with scoring.threshold).
+        'below_buckets': _below_threshold_buckets(SCORING_THRESHOLD, below_scores),
+        # Eligible rows with no score (manual intel, or a legacy/unscored row).
+        'unscored_count': sum(1 for o in objects if o.get('score') is None),
         'revoked_count': revoked,
         'vt_verified_count': sum(1 for o in objects if o.get('vt')),
         'truncated': truncated,
@@ -6886,6 +6921,7 @@ class OtxPoller:
         min_indicator_count: 1                 # skip pulses below this
         max_indicators_per_pulse: 1000         # cap indicators per pulse
         max_indicators_per_poll: 5000          # total cap per poll
+        watch_pulse_ids: []                    # OTX pulse ids re-checked every poll
         object_types: [ipv4-addr, domain-name, file-hash]
         ingest_collection: comm_intel          # OUR collection to write into
     """
@@ -6901,6 +6937,19 @@ class OtxPoller:
         self.min_indicator_count = int(self.config.get('min_indicator_count', 1))
         self.max_indicators_per_pulse = int(self.config.get('max_indicators_per_pulse', 1000))
         self.max_indicators_per_poll = int(self.config.get('max_indicators_per_poll', 5000))
+        # Targeted pulse watchlist. The global "most recently modified" list
+        # is dominated by high-volume honeypot feeds, so vendor advisories and
+        # campaign dumps fall out of it within hours. These pulse ids are
+        # re-checked every poll regardless of age.
+        self.watch_pulse_ids = [
+            str(pid).strip()
+            for pid in (self.config.get('watch_pulse_ids') or [])
+            if str(pid).strip()
+        ]
+        self._watch_set = set(self.watch_pulse_ids)
+        # pulse id -> last 'modified' we ingested. Watched pulses are large
+        # campaign dumps that rarely change; re-fetch only when they do.
+        self._watch_modified: Dict[str, str] = {}
         self.object_types = self.config.get(
             'object_types', ['ipv4-addr', 'domain-name', 'file-hash']
         )
@@ -6940,13 +6989,31 @@ class OtxPoller:
             return None
 
     def fetch_recent_pulses(self) -> List[Dict[str, Any]]:
-        """List recently updated public pulses (newest first)."""
+        """Recently updated public pulses, plus configured watch pulses first.
+
+        OTX's global "most recently modified" list is dominated by high-volume
+        honeypot feeds, so a pulse that matters (vendor advisory, campaign
+        dump) drops out of it within hours to days. ``watch_pulse_ids`` pins
+        specific pulses to re-check every cycle. They are returned FIRST so
+        the per-poll indicator cap can never starve them behind the recent
+        feed.
+        """
+        watched: List[Dict[str, Any]] = []
+        seen = set()
+        for pulse_id in self.watch_pulse_ids:
+            meta = self._get_json(
+                f'{self.base_url}/otxapi/pulses/{pulse_id}/')
+            if isinstance(meta, dict) and meta.get('id'):
+                watched.append(meta)
+                seen.add(str(meta['id']))
         url = (f'{self.base_url}/otxapi/pulses/?sort=-modified'
                f'&limit={min(self.max_pulses, 100)}')
         data = self._get_json(url)
         if not isinstance(data, dict):
-            return []
-        return [p for p in data.get('results', []) if isinstance(p, dict)]
+            return watched
+        recent = [p for p in data.get('results', [])
+                  if isinstance(p, dict) and str(p.get('id')) not in seen]
+        return watched + recent
 
     def fetch_pulse_indicators(self, pulse_id: str) -> List[Dict[str, Any]]:
         """Fetch (a capped page of) a pulse's indicators."""
@@ -7043,11 +7110,24 @@ class OtxPoller:
         candidates: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
         pulses_skipped = 0
         for pulse in self.fetch_recent_pulses():
-            if len(candidates) >= cap:
-                break
             pulse_id = pulse.get('id') or ''
             if not pulse_id:
                 continue
+            # Watched pulses are exempt from the recent-feed cap: they are
+            # the high-value, low-volume set and must never be starved by
+            # honeypot feeds. The cap still bounds the recent feed.
+            is_watched = pulse_id in self._watch_set
+            if not is_watched and len(candidates) >= cap:
+                break
+            # A watched pulse rarely changes; fetch its indicators only when
+            # its metadata actually moved (the first poll after a restart
+            # fetches all of them). Recent pulses are always fetched.
+            watched_modified = None
+            if is_watched:
+                watched_modified = str(pulse.get('modified') or '')
+                if (watched_modified
+                        and self._watch_modified.get(pulse_id) == watched_modified):
+                    continue
             if int(pulse.get('indicator_count') or 0) < self.min_indicator_count:
                 continue
             # Layer 2 (pulse metadata / age) before fetching the indicators —
@@ -7065,8 +7145,12 @@ class OtxPoller:
                         'pulse': pulse,
                         'raw_confidence': None,   # OTX has no per-IOC confidence
                     }))
-                    if len(candidates) >= cap:
+                    if not is_watched and len(candidates) >= cap:
                         break
+            # Watched pulses are exempt from the cap, so the fetched page was
+            # fully consumed (up to max_indicators_per_pulse).
+            if watched_modified is not None:
+                self._watch_modified[pulse_id] = watched_modified
 
         accepted, quarantined, report, scores, observations = route_by_score(
             candidates)
