@@ -191,7 +191,11 @@
   .kpi.serious::after{ background: #ec835a; } .kpi.serious .val,.kpi.serious .ic{ color: #ec835a; }
   .kpi.crit::after   { background: #d03b3b; } .kpi.crit .val,   .kpi.crit .ic   { color: #d03b3b; }
 
-  /* Score distribution: one ordinal blue ramp, direct labels on every bar. */
+  .dist-head { font-size: 12px; font-weight: 600; color: var(--muted);
+               text-transform: uppercase; letter-spacing: .04em;
+               margin: 14px 0 2px; }
+  .dist-head .mono { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  /* Score distribution: one ordinal ramp, direct labels on every bar. */
   .dist { display: flex; align-items: flex-end; gap: 14px; height: 104px;
           padding: 0 4px; margin: 4px 0 2px; }
   .dist .col { flex: 1; min-width: 0; display: flex; flex-direction: column;
@@ -434,13 +438,12 @@
     <div class="panel">
       <h2>Score distribution <span style="text-transform:none;letter-spacing:0;font-weight:400"
           class="mono" id="eligDistThreshold"></span></h2>
+      <h3 class="dist-head">Eligible for delivery
+        <span class="mono" id="eligDistEligibleLabel"></span></h3>
       <div class="dist" id="eligDist"></div>
       <div class="hint" id="eligDistCaption" style="margin-top:8px"></div>
-    </div>
-
-    <div class="panel">
-      <h2>Below threshold <span style="text-transform:none;letter-spacing:0;font-weight:400"
-          class="mono" id="eligBelowThreshold"></span></h2>
+      <h3 class="dist-head">Ineligible — below threshold
+        <span class="mono" id="eligBelowThreshold"></span></h3>
       <div class="dist" id="eligBelowDist"></div>
       <div class="hint" id="eligBelowCaption" style="margin-top:8px"></div>
     </div>
@@ -2562,43 +2565,54 @@ function eligScoreClass(score) {
   return "s75";
 }
 
-// Ordinal blue ramp, validated against the dark surface. One series, so the
-// title names it and every bar is directly labelled — no legend needed.
-const ELIG_BUCKETS = [
-  { label: "75–79", lo: 75, hi: 79, color: "#86b6ef" },
-  { label: "80–84", lo: 80, hi: 84, color: "#5598e7" },
-  { label: "85–89", lo: 85, hi: 89, color: "#3987e5" },
-  { label: "90–94", lo: 90, hi: 94, color: "#2a78d6" },
-  { label: "95–100", lo: 95, hi: 100, color: "#256abf" },
-];
+// Ordinal blue ramp, validated against the dark surface. Bands start at the
+// CURRENT threshold, so raising it removes the bands beneath it (no 75–79
+// once the threshold is 80). One series, so every bar is directly labelled.
+const ELIG_RAMP = ["#86b6ef", "#5598e7", "#3987e5", "#2a78d6", "#256abf"];
+
+function eligScoreBuckets(threshold) {
+  const t = Math.max(0, Math.min(100, Number(threshold) || 0));
+  const bands = [];
+  let lo = t;
+  while (lo <= 100) {
+    let hi = Math.min(lo + 4, 100);
+    if (100 - hi === 1) hi = 100;      // absorb a 1-wide top band
+    bands.push({ label: `${lo}–${hi}`, lo, hi });
+    lo = hi + 1;
+  }
+  return bands;
+}
 
 function renderEligDist(rows) {
-  const counts = ELIG_BUCKETS.map(() => 0);
-  let unscored = 0;
+  const bands = eligScoreBuckets(eligThreshold);
+  const counts = bands.map(() => 0);
+  let unplotted = 0;
   rows.forEach(o => {
-    if (o.score === null || o.score === undefined) { unscored += 1; return; }
-    const i = ELIG_BUCKETS.findIndex(b => o.score >= b.lo && o.score <= b.hi);
+    if (o.score === null || o.score === undefined) { unplotted += 1; return; }
+    const i = bands.findIndex(b => o.score >= b.lo && o.score <= b.hi);
     if (i >= 0) counts[i] += 1;
+    else unplotted += 1;               // e.g. manual row below the threshold
   });
   const max = Math.max(1, ...counts);
   const root = $("eligDist");
   root.innerHTML = "";
-  ELIG_BUCKETS.forEach((b, i) => {
+  bands.forEach((b, i) => {
     const col = document.createElement("div"); col.className = "col";
     const n = document.createElement("div"); n.className = "n"; n.textContent = String(counts[i]);
     const bar = document.createElement("div"); bar.className = "bar";
     bar.style.height = Math.round((counts[i] / max) * 64) + "px";
-    bar.style.background = b.color;
-    bar.title = `${b.label}: ${counts[i]} object(s)`;
+    bar.style.background = ELIG_RAMP[Math.min(i, ELIG_RAMP.length - 1)];
+    bar.title = `${b.label}: ${counts[i]} object(s) (threshold ${eligThreshold})`;
     const cap = document.createElement("div"); cap.className = "cap"; cap.textContent = b.label;
     col.append(n, bar, cap);
     root.appendChild(col);
   });
-  const manualNote = unscored
-    ? ` ${unscored} unscored object(s) not plotted.` : "";
+  $("eligDistEligibleLabel").textContent = `· ≥ ${eligThreshold}`;
+  const note = unplotted
+    ? ` ${unplotted} unscored/out-of-band object(s) not plotted.` : "";
   $("eligDistCaption").textContent =
-    "Scored eligible objects in the current view. Colour is an ordinal score "
-    + "ramp; the number on each bar is the count." + manualNote;
+    `Scored eligible objects in the current view. Bands start at the current `
+    + `threshold (${eligThreshold}); the number on each bar is the count.` + note;
 }
 
 // Below-threshold chart. Bands/counts are computed by the server from the

@@ -202,7 +202,7 @@ scoring:
   enabled: true                 # TEST RUN
   # 75 for this run: the question is whether base=50 + real signals can reach
   # it. (Feodo C2 = 80 would pass; ThreatFox-high = 70 still would not.)
-  threshold: 75
+  threshold: 80
   quarantine_collection: 'quarantine'
 
   # ThreatFox confidence_level == 100 is delivery-ready by policy: floor its
