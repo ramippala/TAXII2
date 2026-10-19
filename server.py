@@ -4507,10 +4507,17 @@ def taxii_collections():
     RBAC: lists only the collections the authenticated principal's
     credentials may read (each collection has its own credentials).
     """
-    if not _taxii_check_auth():
-        return _taxii_unauthorized()
     user, pw = _request_taxii_credentials()
+    if not _taxii_check_auth():
+        logger.warning(
+            "TAXII Get Collections denied (bad credentials): user=%r ip=%s",
+            user, _client_ip())
+        return _taxii_unauthorized()
     readable = _collections_readable_by(user, pw)
+    logger.info(
+        "TAXII Get Collections: user=%r key=%s -> [%s] ip=%s",
+        user, (_api_key_for(pw) or {}).get('prefix') or '-',
+        ', '.join(c.id for c in readable), _client_ip())
     base = _taxii_base_url()
     collections = [_collection_resource(base, c) for c in readable]
     return _taxii_response({
@@ -4544,13 +4551,28 @@ def taxii_objects(collection_id: str):
     """TAXII 2.1 Get Objects (5.3) / Add Objects (5.4) for a collection."""
     # Authorize BEFORE resolving the collection: an unauthenticated caller must
     # not be able to tell a real collection id (401) from an unknown one (404).
+    client_user, client_pass = _request_taxii_credentials()
     if not _taxii_check_auth():
+        logger.warning(
+            "TAXII Get Objects denied (bad credentials): collection=%r "
+            "user=%r ip=%s",
+            collection_id, client_user, _client_ip())
         return _taxii_unauthorized()
     cfg = TAXII_COLLECTION_MAP.get(collection_id)
     if cfg is None:
+        logger.warning(
+            "TAXII Get Objects: unknown collection=%r user=%r ip=%s",
+            collection_id, client_user, _client_ip())
         return _taxii_error(404, 'Not Found',
                             f'Collection {collection_id} not found.')
     if not _taxii_collection_auth(collection_id):
+        readable = [c.id for c in _collections_readable_by(client_user, client_pass)]
+        logger.warning(
+            "TAXII Get Objects denied (collection out of scope): requested=%r "
+            "user=%r key=%s readable=%s ip=%s",
+            collection_id, client_user,
+            (_api_key_for(client_pass) or {}).get('prefix') or '-',
+            readable, _client_ip())
         return _taxii_unauthorized()
 
     if request.method == 'POST':
@@ -4629,6 +4651,19 @@ def taxii_objects(collection_id: str):
             'the next cursor' if next_cursor else
             ('added_after' if since else 'no cursor and no added_after'),
         )
+
+    # One line per poll: exactly what the consumer asked for and what it got.
+    # This answers "why is my feed empty?" — wrong collection (logged above),
+    # a match[type] the server has no stored rows for, or an added_after cursor
+    # newer than every stored object (whose modified timestamps are old).
+    logger.info(
+        "TAXII Get Objects: collection=%r key=%s user=%r match[type]=%s "
+        "match[id]=%d added_after=%s limit=%s next=%s -> %d object(s), more=%s",
+        collection_id, (key or {}).get('prefix') or '-', client_user,
+        match_types or '-', len(match_ids or []), since or '-',
+        effective_limit if effective_limit is not None else '-',
+        'yes' if next_cursor else 'no',
+        len(bundle.get('objects') or []), bool(more))
 
     if TAXII_OBJECTS_SHAPE == 'bundle':
         # OTX-compatible shape: the STIX bundle at the top level with
